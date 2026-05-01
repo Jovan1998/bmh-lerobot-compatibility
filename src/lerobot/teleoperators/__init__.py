@@ -18,4 +18,8 @@ from .config import TeleoperatorConfig
 from .teleoperator import Teleoperator
 from .utils import TeleopEvents, make_teleoperator_from_config
 
+# BMH-101 network teleoperators
+from .so_network_leader import SONetworkLeader, SONetworkLeaderConfig  # noqa: F401
+from .bi_so_network_leader import BiSONetworkLeader, BiSONetworkLeaderConfig  # noqa: F401
+
 __all__ = ["Teleoperator", "TeleoperatorConfig", "TeleopEvents", "make_teleoperator_from_config"]

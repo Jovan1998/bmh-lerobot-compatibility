@@ -99,6 +99,14 @@ def make_teleoperator_from_config(config: TeleoperatorConfig) -> "Teleoperator":
         from .openarm_mini import OpenArmMini
 
         return OpenArmMini(config)
+    elif config.type == "so_network_leader":
+        from .so_network_leader import SONetworkLeader
+
+        return SONetworkLeader(config)
+    elif config.type == "bi_so_network_leader":
+        from .bi_so_network_leader import BiSONetworkLeader
+
+        return BiSONetworkLeader(config)
     else:
         try:
             return cast("Teleoperator", make_device_from_device_class(config))

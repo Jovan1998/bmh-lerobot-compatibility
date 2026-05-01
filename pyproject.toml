@@ -152,6 +152,8 @@ openarms = ["lerobot[damiao]"]
 gamepad = ["lerobot[pygame-dep]", "hidapi>=0.14.0,<0.15.0"]
 hopejr = ["lerobot[feetech]", "lerobot[pygame-dep]"]
 lekiwi = ["lerobot[feetech]", "lerobot[pyzmq-dep]"]
+# BMH-101 network teleoperation (so_network_leader, bi_so_network_leader)
+bmh_network = ["lerobot[feetech]", "lerobot[pyzmq-dep]"]
 unitree_g1 = [
     # "unitree-sdk2==1.0.1",
     "lerobot[pyzmq-dep]",
