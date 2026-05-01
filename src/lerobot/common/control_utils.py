@@ -18,6 +18,8 @@ from __future__ import annotations
 # Utilities
 ########################################################################################
 import logging
+import os
+import signal
 import traceback
 from contextlib import nullcontext
 from copy import copy
@@ -142,9 +144,41 @@ def init_keyboard_listener():
     events["rerecord_episode"] = False
     events["stop_recording"] = False
 
+    # Headless fallback: Unix signals stand in for arrow / esc keys when no
+    # display is attached (e.g. recording on a Pi over SSH). Trigger from any
+    # SSH session with:
+    #   kill -USR1 <pid>   # next episode (right arrow)
+    #   kill -USR2 <pid>   # rerecord last episode (left arrow)
+    #   kill -TERM <pid>   # stop recording (escape) — graceful, NOT SIGKILL
+    def _handle_next_episode(signum, frame):
+        print("SIGUSR1 received. Exiting loop (next episode)...")
+        events["exit_early"] = True
+
+    def _handle_rerecord(signum, frame):
+        print("SIGUSR2 received. Exiting loop and rerecording last episode...")
+        events["rerecord_episode"] = True
+        events["exit_early"] = True
+
+    def _handle_stop(signum, frame):
+        print("SIGTERM received. Stopping data recording...")
+        events["stop_recording"] = True
+        events["exit_early"] = True
+
+    signal.signal(signal.SIGUSR1, _handle_next_episode)
+    signal.signal(signal.SIGUSR2, _handle_rerecord)
+    signal.signal(signal.SIGTERM, _handle_stop)
+
     if is_headless():
         logging.warning(
-            "Headless environment detected. On-screen cameras display and keyboard inputs will not be available."
+            "Headless environment detected. Keyboard input is not available — "
+            "use Unix signals from another shell instead (PID is %d):\n"
+            "  kill -USR1 %d   # next episode (right arrow)\n"
+            "  kill -USR2 %d   # rerecord last episode (left arrow)\n"
+            "  kill -TERM %d   # stop recording (escape)",
+            os.getpid(),
+            os.getpid(),
+            os.getpid(),
+            os.getpid(),
         )
         listener = None
         return listener, events
