@@ -56,8 +56,8 @@ def main():
     parser.add_argument("--left_zmq_port", type=int, default=5555, help="ZMQ port for left arm stream")
     parser.add_argument("--right_zmq_port", type=int, default=5557, help="ZMQ port for right arm stream")
     parser.add_argument("--fps", type=int, default=60, help="Target loop frequency in Hz")
-    parser.add_argument("--left_id", type=str, default="bmh_leader_left", help="Calibration ID for left arm")
-    parser.add_argument("--right_id", type=str, default="bmh_leader_right", help="Calibration ID for right arm")
+    parser.add_argument("--left_id", type=str, default="so_leader_left", help="Calibration ID for left arm")
+    parser.add_argument("--right_id", type=str, default="so_leader_right", help="Calibration ID for right arm")
     args = parser.parse_args()
 
     if not args.left_port and not args.right_port:
