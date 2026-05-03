@@ -51,18 +51,6 @@ lerobot-teleoperate \
     --teleop.right_arm_config.remote_ip=192.168.0.200 \
     --teleop.right_arm_config.port_zmq=5557
 
-# Record dataset
-lerobot-record \
-    --robot.type=bi_so_follower \
-    --robot.id=bmh_follower \
-    --teleop.type=bi_so_network_leader \
-    --teleop.left_arm_config.remote_ip=192.168.0.100 \
-    --teleop.left_arm_config.port_zmq=5555 \
-    --teleop.right_arm_config.remote_ip=192.168.0.100 \
-    --teleop.right_arm_config.port_zmq=5557 \
-    --dataset.repo_id=my_dataset \
-    --dataset.root=/local/data
-
 
 lerobot-record \
     --robot.type=bi_so_follower \
