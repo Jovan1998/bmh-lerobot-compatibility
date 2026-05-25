@@ -83,15 +83,17 @@ class BiSoBimanualAdapter:
     back into a 12-key `{left_*, right_*}` dict that `bi_so_follower.send_action()`
     accepts.
 
-    The state-modality key convention is `left_arm` (5,) / `left_gripper` (1,) /
-    `right_arm` (5,) / `right_gripper` (1,), mirroring how eval_so100.py splits
-    a single arm into `single_arm` + `gripper`. The action chunk returned by
-    the server is expected to use the same modality keys; `validate_modality()`
-    confirms this at startup against `PolicyClient.get_modality_config()` and
-    raises a clear error if the trained model uses a different layout.
+    The state-modality key convention is `left_single_arm` (5,) /
+    `left_gripper` (1,) / `right_single_arm` (5,) / `right_gripper` (1,),
+    mirroring how eval_so100.py splits a single arm into `single_arm` +
+    `gripper`, with `left_` / `right_` prefixes for the bimanual layout.
+    The action chunk returned by the server is expected to use the same
+    modality keys; `validate_modality()` confirms this at startup against
+    `PolicyClient.get_modality_config()` and raises a clear error if the
+    trained model uses a different layout.
     """
 
-    STATE_KEYS = ("left_arm", "left_gripper", "right_arm", "right_gripper")
+    STATE_KEYS = ("left_single_arm", "left_gripper", "right_single_arm", "right_gripper")
 
     def __init__(self, policy_client: PolicyClient):
         self.policy = policy_client
@@ -104,9 +106,9 @@ class BiSoBimanualAdapter:
         left_state = np.array([obs[f"left_{k}"] for k in SO_JOINT_NAMES], dtype=np.float32)
         right_state = np.array([obs[f"right_{k}"] for k in SO_JOINT_NAMES], dtype=np.float32)
         model_obs["state"] = {
-            "left_arm": left_state[:5],
+            "left_single_arm": left_state[:5],
             "left_gripper": left_state[5:6],
-            "right_arm": right_state[:5],
+            "right_single_arm": right_state[:5],
             "right_gripper": right_state[5:6],
         }
 
@@ -117,9 +119,9 @@ class BiSoBimanualAdapter:
         return model_obs
 
     def decode_action_chunk(self, chunk: dict, t: int) -> dict[str, float]:
-        left_arm = chunk["left_arm"][0][t]      # (5,)
+        left_arm = chunk["left_single_arm"][0][t]      # (5,)
         left_gripper = chunk["left_gripper"][0][t]  # (1,)
-        right_arm = chunk["right_arm"][0][t]    # (5,)
+        right_arm = chunk["right_single_arm"][0][t]    # (5,)
         right_gripper = chunk["right_gripper"][0][t]  # (1,)
 
         left = np.concatenate([left_arm, left_gripper], axis=0)    # (6,)
