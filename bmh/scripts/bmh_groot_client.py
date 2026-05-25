@@ -55,13 +55,16 @@ SO_JOINT_NAMES = [
     "gripper.pos",
 ]
 
-# Camera keys exposed by `bi_so_follower.get_observation()` for the BMH-101
-# camera wiring used at recording time (front + left_wrist attached to the
-# left arm; right_wrist attached to the right arm). The bi_so_follower wrapper
-# prefixes each per-arm camera with `left_` / `right_`, which is why the
-# `left_left_wrist` / `right_right_wrist` names look doubled — that's the
-# literal observation key, not a typo.
-BIMANUAL_CAMERA_KEYS = ["left_front", "left_left_wrist", "right_right_wrist"]
+# Maps GR00T video modality key (as trained — bare `front` / `left_wrist` /
+# `right_wrist`) to the corresponding key in `bi_so_follower.get_observation()`,
+# which prefixes each per-arm camera with `left_` / `right_`. That's why the
+# `left_left_wrist` / `right_right_wrist` source names look doubled — that's
+# the literal observation key, not a typo.
+BIMANUAL_CAMERA_KEYS = {
+    "front": "left_front",
+    "left_wrist": "left_left_wrist",
+    "right_wrist": "right_right_wrist",
+}
 
 
 def recursive_add_extra_dim(obs: dict) -> dict:
@@ -101,7 +104,10 @@ class BiSoBimanualAdapter:
     def obs_to_policy_inputs(self, obs: dict[str, Any]) -> dict:
         model_obs: dict[str, Any] = {}
 
-        model_obs["video"] = {k: obs[k] for k in BIMANUAL_CAMERA_KEYS}
+        model_obs["video"] = {
+            server_key: obs[obs_key]
+            for server_key, obs_key in BIMANUAL_CAMERA_KEYS.items()
+        }
 
         left_state = np.array([obs[f"left_{k}"] for k in SO_JOINT_NAMES], dtype=np.float32)
         right_state = np.array([obs[f"right_{k}"] for k in SO_JOINT_NAMES], dtype=np.float32)
