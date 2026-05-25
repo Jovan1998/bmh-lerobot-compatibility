@@ -34,8 +34,7 @@ from lerobot.robots import (  # noqa: F401
     RobotConfig,
     bi_so_follower,
     make_robot_from_config,
-    so100_follower,
-    so101_follower,
+    so_follower,
 )
 from lerobot.utils.utils import init_logging
 
