@@ -138,7 +138,7 @@ class BiSoBimanualAdapter:
                 raise RuntimeError(f"JPEG encode failed for camera {cam_key!r}")
             model_obs["video"][cam_key] = buf.tobytes()
         total = sum(len(v) for v in model_obs["video"].values())
-        logger.debug(
+        logger.info(
             "video sent: %d cams, %.1f KiB total (Q=%d)",
             len(model_obs["video"]), total / 1024, self.jpeg_quality,
         )
