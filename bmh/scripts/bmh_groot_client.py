@@ -161,7 +161,10 @@ class BiSoBimanualAdapter:
 
     def get_action(self, obs: dict) -> list[dict[str, float]]:
         model_input = self.obs_to_policy_inputs(obs)
+        tic = time.perf_counter()
         action_chunk, _info = self.policy.get_action(model_input)
+        rtt_ms = (time.perf_counter() - tic) * 1000.0
+        logger.info("policy round-trip: %.1f ms", rtt_ms)
 
         any_key = next(iter(action_chunk.keys()))
         horizon = action_chunk[any_key].shape[1]
@@ -258,16 +261,23 @@ def main(cfg: BmhInferenceConfig) -> None:
     logger.info('Running inference with instruction: "%s"', cfg.lang_instruction)
     period = 1.0 / cfg.fps
 
+    last_action_time: float | None = None
     try:
         while True:
             obs = robot.get_observation()
             obs["lang"] = cfg.lang_instruction
 
             actions = adapter.get_action(obs)
-            for i, action_dict in enumerate(actions[: cfg.action_horizon]):
+            batch = actions[: cfg.action_horizon]
+            for i, action_dict in enumerate(batch):
                 tic = time.perf_counter()
+                if i == 0 and last_action_time is not None:
+                    gap_ms = (tic - last_action_time) * 1000.0
+                    logger.info("inter-batch gap: %.1f ms", gap_ms)
                 robot.send_action(action_dict)
                 logger.info("action[%d] sent", i)
+                if i == len(batch) - 1:
+                    last_action_time = time.perf_counter()
                 sleep = period - (time.perf_counter() - tic)
                 if sleep > 0:
                     time.sleep(sleep)
