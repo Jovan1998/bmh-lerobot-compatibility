@@ -19,6 +19,8 @@ adapted for the BMH-101 bimanual robot (bi_so_follower in the BMH LeRobot fork).
 """
 
 import logging
+import queue
+import threading
 import time
 from dataclasses import asdict, dataclass
 from pprint import pformat
@@ -204,6 +206,35 @@ class BiSoBimanualAdapter:
         logger.info("Modality check passed (state keys: %s).", self.STATE_KEYS)
 
 
+def _inference_worker(
+    adapter: BiSoBimanualAdapter,
+    obs_queue: "queue.Queue[dict[str, Any] | None]",
+    chunk_queue: "queue.Queue[list[dict[str, float]] | None]",
+    action_horizon: int,
+    stop_event: threading.Event,
+) -> None:
+    """Owns the PolicyClient (ZMQ REQ is single-thread).
+
+    Pulls one observation at a time from `obs_queue`, runs inference, and
+    pushes the truncated action chunk to `chunk_queue`. A `None` observation
+    is the shutdown sentinel. On failure, pushes `None` to signal the main
+    thread, then continues to honor `stop_event`.
+    """
+    while not stop_event.is_set():
+        try:
+            obs = obs_queue.get(timeout=0.1)
+        except queue.Empty:
+            continue
+        if obs is None:
+            break
+        try:
+            chunk = adapter.get_action(obs)[:action_horizon]
+            chunk_queue.put(chunk)
+        except Exception:
+            logger.exception("inference worker: get_action failed")
+            chunk_queue.put(None)
+
+
 @dataclass
 class BmhInferenceConfig:
     """CLI configuration for `bmh-groot-client`."""
@@ -217,6 +248,11 @@ class BmhInferenceConfig:
     timeout_ms: int = 15000
     jpeg_quality: int = 85
     api_token: str = ""
+    # Fire the next inference request when this many actions remain in the
+    # current chunk. 0 fires on the very last action (≈ sync); larger values
+    # give the server more time to respond at the cost of staler observations.
+    # Must be in [0, action_horizon).
+    prefetch_at: int = 3
 
 
 @draccus.wrap()
@@ -228,6 +264,11 @@ def main(cfg: BmhInferenceConfig) -> None:
         raise SystemExit("--lang_instruction must not be empty.")
     if not 1 <= cfg.jpeg_quality <= 100:
         raise SystemExit("--jpeg_quality must be in [1, 100].")
+    if not 0 <= cfg.prefetch_at < cfg.action_horizon:
+        raise SystemExit(
+            f"--prefetch_at must be in [0, action_horizon={cfg.action_horizon}); "
+            f"got {cfg.prefetch_at}."
+        )
 
     robot = make_robot_from_config(cfg.robot)
     robot.connect()
@@ -261,29 +302,87 @@ def main(cfg: BmhInferenceConfig) -> None:
     logger.info('Running inference with instruction: "%s"', cfg.lang_instruction)
     period = 1.0 / cfg.fps
 
-    last_action_time: float | None = None
+    # Bootstrap: one synchronous inference on the main thread to seed the
+    # first chunk. After this, the worker thread is the sole owner of the
+    # PolicyClient.
+    bootstrap_obs = robot.get_observation()
+    bootstrap_obs["lang"] = cfg.lang_instruction
+    current_chunk: list[dict[str, float]] = adapter.get_action(bootstrap_obs)[: cfg.action_horizon]
+    idx = 0
+    inflight = False
+    last_action: dict[str, float] | None = None
+    chunk_exhausted_at: float | None = None
+
+    obs_queue: queue.Queue[dict[str, Any] | None] = queue.Queue(maxsize=1)
+    chunk_queue: queue.Queue[list[dict[str, float]] | None] = queue.Queue(maxsize=1)
+    stop_event = threading.Event()
+    worker = threading.Thread(
+        target=_inference_worker,
+        args=(adapter, obs_queue, chunk_queue, cfg.action_horizon, stop_event),
+        name="bmh-inference-worker",
+        daemon=True,
+    )
+    worker.start()
+
     try:
         while True:
-            obs = robot.get_observation()
-            obs["lang"] = cfg.lang_instruction
+            tick_start = time.perf_counter()
 
-            actions = adapter.get_action(obs)
-            batch = actions[: cfg.action_horizon]
-            for i, action_dict in enumerate(batch):
-                tic = time.perf_counter()
-                if i == 0 and last_action_time is not None:
-                    gap_ms = (tic - last_action_time) * 1000.0
-                    logger.info("inter-batch gap: %.1f ms", gap_ms)
-                robot.send_action(action_dict)
-                logger.info("action[%d] sent", i)
-                if i == len(batch) - 1:
-                    last_action_time = time.perf_counter()
-                sleep = period - (time.perf_counter() - tic)
-                if sleep > 0:
-                    time.sleep(sleep)
+            # 1. Try to swap in a freshly arrived chunk (hard swap).
+            try:
+                new_chunk = chunk_queue.get_nowait()
+            except queue.Empty:
+                pass
+            else:
+                if new_chunk is None:
+                    raise RuntimeError("inference worker reported failure; aborting")
+                leftover = max(len(current_chunk) - idx, 0)
+                logger.info("chunk swap: leftover=%d", leftover)
+                current_chunk = new_chunk
+                idx = 0
+                inflight = False
+                chunk_exhausted_at = None
+
+            # 2. Send an action (or hold position if we ran out).
+            if idx < len(current_chunk):
+                action = current_chunk[idx]
+                robot.send_action(action)
+                last_action = action
+                idx += 1
+                chunk_exhausted_at = None
+            else:
+                if chunk_exhausted_at is None:
+                    chunk_exhausted_at = tick_start
+                gap_ms = (tick_start - chunk_exhausted_at) * 1000.0
+                if last_action is not None:
+                    robot.send_action(last_action)
+                logger.warning("late chunk: gap=%.1f ms (holding position)", gap_ms)
+
+            # 3. Fire prefetch if the trigger condition is met and nothing is
+            # currently in flight.
+            remaining = len(current_chunk) - idx
+            if not inflight and remaining == cfg.prefetch_at:
+                obs = robot.get_observation()
+                obs["lang"] = cfg.lang_instruction
+                obs_queue.put(obs)
+                inflight = True
+                logger.debug("inference fired at remaining=%d", remaining)
+
+            # 4. Sleep to next tick.
+            sleep = period - (time.perf_counter() - tick_start)
+            if sleep > 0:
+                time.sleep(sleep)
     except KeyboardInterrupt:
         logger.info("Shutting down inference loop…")
     finally:
+        stop_event.set()
+        try:
+            obs_queue.put_nowait(None)
+        except queue.Full:
+            pass
+        worker.join(timeout=2.0)
+        if worker.is_alive():
+            logger.warning("inference worker did not exit within 2 s")
         try:
             robot.disconnect()
         except Exception as e:
