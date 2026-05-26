@@ -24,6 +24,7 @@ from dataclasses import asdict, dataclass
 from pprint import pformat
 from typing import Any
 
+import cv2
 import draccus
 import numpy as np
 
@@ -98,8 +99,9 @@ class BiSoBimanualAdapter:
 
     STATE_KEYS = ("left_single_arm", "left_gripper", "right_single_arm", "right_gripper")
 
-    def __init__(self, policy_client: PolicyClient):
+    def __init__(self, policy_client: PolicyClient, jpeg_quality: int):
         self.policy = policy_client
+        self.jpeg_quality = jpeg_quality
 
     def obs_to_policy_inputs(self, obs: dict[str, Any]) -> dict:
         model_obs: dict[str, Any] = {}
@@ -108,14 +110,6 @@ class BiSoBimanualAdapter:
             server_key: obs[obs_key]
             for server_key, obs_key in BIMANUAL_CAMERA_KEYS.items()
         }
-        total_bytes = 0
-        for k, arr in model_obs["video"].items():
-            logger.info(
-                "video[%s]: shape=%s dtype=%s size=%.1f KiB",
-                k, arr.shape, arr.dtype, arr.nbytes / 1024,
-            )
-            total_bytes += arr.nbytes
-        logger.info("video total: %.1f KiB", total_bytes / 1024)
 
         left_state = np.array([obs[f"left_{k}"] for k in SO_JOINT_NAMES], dtype=np.float32)
         right_state = np.array([obs[f"right_{k}"] for k in SO_JOINT_NAMES], dtype=np.float32)
@@ -130,6 +124,24 @@ class BiSoBimanualAdapter:
 
         model_obs = recursive_add_extra_dim(model_obs)
         model_obs = recursive_add_extra_dim(model_obs)
+
+        # JPEG-encode each camera frame in place. The runner-side proxy decodes
+        # bytes back to (1, 1, H, W, 3) uint8 RGB; if it ever receives a raw
+        # array instead it passes it through, so this is a safe one-sided rollout.
+        for cam_key, arr in model_obs["video"].items():
+            frame = arr[0, 0]  # (H, W, 3) RGB uint8
+            bgr = cv2.cvtColor(frame, cv2.COLOR_RGB2BGR)
+            ok, buf = cv2.imencode(
+                ".jpg", bgr, [cv2.IMWRITE_JPEG_QUALITY, self.jpeg_quality]
+            )
+            if not ok:
+                raise RuntimeError(f"JPEG encode failed for camera {cam_key!r}")
+            model_obs["video"][cam_key] = buf.tobytes()
+        total = sum(len(v) for v in model_obs["video"].values())
+        logger.debug(
+            "video sent: %d cams, %.1f KiB total (Q=%d)",
+            len(model_obs["video"]), total / 1024, self.jpeg_quality,
+        )
         return model_obs
 
     def decode_action_chunk(self, chunk: dict, t: int) -> dict[str, float]:
@@ -200,6 +212,8 @@ class BmhInferenceConfig:
     action_horizon: int = 8
     fps: int = 30
     timeout_ms: int = 15000
+    jpeg_quality: int = 85
+    api_token: str = ""
 
 
 @draccus.wrap()
@@ -209,6 +223,8 @@ def main(cfg: BmhInferenceConfig) -> None:
 
     if not cfg.lang_instruction.strip():
         raise SystemExit("--lang_instruction must not be empty.")
+    if not 1 <= cfg.jpeg_quality <= 100:
+        raise SystemExit("--jpeg_quality must be in [1, 100].")
 
     robot = make_robot_from_config(cfg.robot)
     robot.connect()
@@ -218,6 +234,7 @@ def main(cfg: BmhInferenceConfig) -> None:
         host=cfg.policy_host,
         port=cfg.policy_port,
         timeout_ms=cfg.timeout_ms,
+        api_token=cfg.api_token or None,
     )
     if not client.ping():
         robot.disconnect()
@@ -226,7 +243,7 @@ def main(cfg: BmhInferenceConfig) -> None:
         )
     logger.info("Connected to GR00T server at %s:%s", cfg.policy_host, cfg.policy_port)
 
-    adapter = BiSoBimanualAdapter(client)
+    adapter = BiSoBimanualAdapter(client, jpeg_quality=cfg.jpeg_quality)
     try:
         modality_cfg = client.get_modality_config()
         adapter.validate_modality(modality_cfg)
