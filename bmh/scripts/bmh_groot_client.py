@@ -108,6 +108,14 @@ class BiSoBimanualAdapter:
             server_key: obs[obs_key]
             for server_key, obs_key in BIMANUAL_CAMERA_KEYS.items()
         }
+        total_bytes = 0
+        for k, arr in model_obs["video"].items():
+            logger.info(
+                "video[%s]: shape=%s dtype=%s size=%.1f KiB",
+                k, arr.shape, arr.dtype, arr.nbytes / 1024,
+            )
+            total_bytes += arr.nbytes
+        logger.info("video total: %.1f KiB", total_bytes / 1024)
 
         left_state = np.array([obs[f"left_{k}"] for k in SO_JOINT_NAMES], dtype=np.float32)
         right_state = np.array([obs[f"right_{k}"] for k in SO_JOINT_NAMES], dtype=np.float32)
