@@ -354,8 +354,12 @@ class DatasetWriter:
             f"Batch encoding {self._batch_encoding_size} videos for episodes {start_episode} to {end_episode - 1}"
         )
 
-        chunk_idx = self._meta.episodes[start_episode]["data/chunk_index"]
-        file_idx = self._meta.episodes[start_episode]["data/file_index"]
+        # Newly recorded episodes live in the metadata buffer / open parquet writer,
+        # not in `self._meta.episodes`. Flush + reload so absolute-index lookups work.
+        self._meta.flush_and_reload_episodes()
+
+        chunk_idx = self._meta.episodes[start_episode]["meta/episodes/chunk_index"]
+        file_idx = self._meta.episodes[start_episode]["meta/episodes/file_index"]
         episode_df_path = self._root / DEFAULT_EPISODES_PATH.format(
             chunk_index=chunk_idx, file_index=file_idx
         )
@@ -365,14 +369,14 @@ class DatasetWriter:
             logger.info(f"Encoding videos for episode {ep_idx}")
 
             if (
-                self._meta.episodes[ep_idx]["data/chunk_index"] != chunk_idx
-                or self._meta.episodes[ep_idx]["data/file_index"] != file_idx
+                self._meta.episodes[ep_idx]["meta/episodes/chunk_index"] != chunk_idx
+                or self._meta.episodes[ep_idx]["meta/episodes/file_index"] != file_idx
             ):
                 episode_df.to_parquet(episode_df_path)
                 self._meta.episodes = load_episodes(self._root)
 
-                chunk_idx = self._meta.episodes[ep_idx]["data/chunk_index"]
-                file_idx = self._meta.episodes[ep_idx]["data/file_index"]
+                chunk_idx = self._meta.episodes[ep_idx]["meta/episodes/chunk_index"]
+                file_idx = self._meta.episodes[ep_idx]["meta/episodes/file_index"]
                 episode_df_path = self._root / DEFAULT_EPISODES_PATH.format(
                     chunk_index=chunk_idx, file_index=file_idx
                 )

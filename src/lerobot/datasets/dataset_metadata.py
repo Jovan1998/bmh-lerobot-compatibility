@@ -155,6 +155,18 @@ class LeRobotDatasetMetadata:
             writer.close()
             self._pq_writer = None
 
+    def flush_and_reload_episodes(self) -> None:
+        """Flush buffered episodes to disk, close the writer, and refresh
+        ``self.episodes`` so it includes every episode recorded so far.
+
+        Resets ``latest_episode`` so the next ``_save_episode_metadata`` call
+        rolls over to a fresh episodes-metadata parquet file (a new file index)
+        instead of truncating the one we just closed.
+        """
+        self._close_writer()
+        self.latest_episode = None
+        self.episodes = load_episodes(self.root)
+
     def finalize(self) -> None:
         """Flush metadata buffer and close the parquet writer.
 
