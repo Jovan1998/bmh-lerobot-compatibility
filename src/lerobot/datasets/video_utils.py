@@ -59,7 +59,7 @@ def _get_codec_options(
     vcodec: str,
     g: int | None = 2,
     crf: int | None = 30,
-    preset: int | None = None,
+    preset: int | str | None = None,
 ) -> dict:
     """Build codec-specific options dict for video encoding."""
     options = {}
@@ -83,9 +83,11 @@ def _get_codec_options(
         elif vcodec in ("h264_qsv",):
             options["global_quality"] = str(crf)
 
-    # Preset (only for libsvtav1)
+    # Preset: libsvtav1 takes int 0–13; libx264/libx265 take strings ('ultrafast'…'veryslow').
     if vcodec == "libsvtav1":
         options["preset"] = str(preset) if preset is not None else "12"
+    elif vcodec in ("h264", "hevc") and preset is not None:
+        options["preset"] = str(preset)
 
     return options
 
@@ -407,7 +409,7 @@ def encode_video_frames(
     fast_decode: int = 0,
     log_level: int | None = av.logging.WARNING,
     overwrite: bool = False,
-    preset: int | None = None,
+    preset: int | str | None = None,
     encoder_threads: int | None = None,
 ) -> None:
     """More info on ffmpeg arguments tuning on `benchmark/video/README.md`"""
@@ -593,7 +595,7 @@ class _CameraEncoderThread(threading.Thread):
         pix_fmt: str,
         g: int | None,
         crf: int | None,
-        preset: int | None,
+        preset: int | str | None,
         frame_queue: queue.Queue,
         result_queue: queue.Queue,
         stop_event: threading.Event,
@@ -728,7 +730,7 @@ class StreamingVideoEncoder:
         pix_fmt: str = "yuv420p",
         g: int | None = 2,
         crf: int | None = 30,
-        preset: int | None = None,
+        preset: int | str | None = None,
         queue_maxsize: int = 30,
         encoder_threads: int | None = None,
     ):

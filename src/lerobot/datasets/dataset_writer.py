@@ -67,12 +67,22 @@ def _encode_video_worker(
     fps: int,
     vcodec: str = "libsvtav1",
     encoder_threads: int | None = None,
+    crf: int | None = None,
+    preset: int | str | None = None,
+    g: int | None = None,
 ) -> Path:
     temp_path = Path(tempfile.mkdtemp(dir=root)) / f"{video_key}_{episode_index:03d}.mp4"
     fpath = DEFAULT_IMAGE_PATH.format(image_key=video_key, episode_index=episode_index, frame_index=0)
     img_dir = (root / fpath).parent
+    kwargs: dict = {}
+    if crf is not None:
+        kwargs["crf"] = crf
+    if preset is not None:
+        kwargs["preset"] = preset
+    if g is not None:
+        kwargs["g"] = g
     encode_video_frames(
-        img_dir, temp_path, fps, vcodec=vcodec, overwrite=True, encoder_threads=encoder_threads
+        img_dir, temp_path, fps, vcodec=vcodec, overwrite=True, encoder_threads=encoder_threads, **kwargs
     )
     shutil.rmtree(img_dir)
     return temp_path
@@ -94,6 +104,9 @@ class DatasetWriter:
         batch_encoding_size: int,
         streaming_encoder: StreamingVideoEncoder | None = None,
         initial_frames: int = 0,
+        crf: int | None = None,
+        preset: int | str | None = None,
+        g: int | None = None,
     ):
         """Initialize the writer with metadata, codec, and encoding config.
 
@@ -108,6 +121,9 @@ class DatasetWriter:
             streaming_encoder: Optional pre-built :class:`StreamingVideoEncoder`
                 for real-time encoding. ``None`` disables streaming mode.
             initial_frames: Starting frame count (non-zero when resuming).
+            crf: Constant rate factor for encoding. ``None`` keeps encoder default.
+            preset: Encoder speed/quality preset. ``None`` keeps encoder default.
+            g: GOP size (keyframe interval in frames). ``None`` keeps encoder default.
         """
         self._meta = meta
         self._root = root
@@ -115,6 +131,9 @@ class DatasetWriter:
         self._encoder_threads = encoder_threads
         self._batch_encoding_size = batch_encoding_size
         self._streaming_encoder = streaming_encoder
+        self._crf = crf
+        self._preset = preset
+        self._g = g
 
         # Writer state
         self.image_writer: AsyncImageWriter | None = None
@@ -286,6 +305,9 @@ class DatasetWriter:
                             self._meta.fps,
                             self._vcodec,
                             self._encoder_threads,
+                            self._crf,
+                            self._preset,
+                            self._g,
                         ): video_key
                         for video_key in self._meta.video_keys
                     }
@@ -564,7 +586,15 @@ class DatasetWriter:
     def _encode_temporary_episode_video(self, video_key: str, episode_index: int) -> Path:
         """Use ffmpeg to convert frames stored as png into mp4 videos."""
         return _encode_video_worker(
-            video_key, episode_index, self._root, self._meta.fps, self._vcodec, self._encoder_threads
+            video_key,
+            episode_index,
+            self._root,
+            self._meta.fps,
+            self._vcodec,
+            self._encoder_threads,
+            self._crf,
+            self._preset,
+            self._g,
         )
 
     def close_writer(self) -> None:

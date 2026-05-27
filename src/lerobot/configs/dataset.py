@@ -68,6 +68,16 @@ class DatasetRecordConfig:
     # Number of threads per encoder instance. None = auto (codec default).
     # Lower values reduce CPU usage, maps to 'lp' (via svtav1-params) for libsvtav1 and 'threads' for h264/hevc..
     encoder_threads: int | None = None
+    # Constant rate factor: lower = higher quality, bigger files. Scales differ per codec
+    # (libsvtav1 30 ≈ visually transparent; libx264 18 ≈ visually lossless, 23 ≈ default, 30 ≈ heavy compression).
+    # None lets encode_video_frames apply its default (30).
+    crf: int | None = None
+    # Encoder speed/quality preset. For libsvtav1, an int 0–13 (higher = faster). For libx264/libx265,
+    # a string like 'ultrafast', 'veryfast', 'fast', 'medium', 'slow'. None lets the encoder use its default.
+    preset: int | str | None = None
+    # GOP size (keyframe interval, in frames). Smaller = more keyframes = faster seek, bigger files.
+    # None lets encode_video_frames apply its default (2).
+    g: int | None = None
 
     def stamp_repo_id(self) -> None:
         """Append a date-time tag to ``repo_id`` so each recording session gets a unique name.

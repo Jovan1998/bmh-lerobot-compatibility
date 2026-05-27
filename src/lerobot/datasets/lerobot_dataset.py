@@ -62,6 +62,9 @@ class LeRobotDataset(torch.utils.data.Dataset):
         streaming_encoding: bool = False,
         encoder_queue_maxsize: int = 30,
         encoder_threads: int | None = None,
+        crf: int | None = None,
+        preset: int | str | None = None,
+        g: int | None = None,
     ):
         """
         2 modes are available for instantiating this class, depending on 2 different use cases:
@@ -187,6 +190,14 @@ class LeRobotDataset(torch.utils.data.Dataset):
             encoder_threads (int | None, optional): Number of threads per encoder instance. None lets the
                 codec auto-detect (default). Lower values reduce CPU usage per encoder. Maps to 'lp' (via svtav1-params) for
                 libsvtav1 and 'threads' for h264/hevc.
+            crf (int | None, optional): Constant rate factor for encoding. Lower = higher quality, bigger files.
+                Scales differ per codec (libsvtav1 30 ≈ visually transparent; libx264 18 ≈ visually lossless,
+                23 ≈ default, 30 ≈ heavy compression). None keeps the encoder default.
+            preset (int | str | None, optional): Encoder speed/quality preset. For libsvtav1, int 0–13 (higher
+                = faster). For libx264/libx265, a string like 'ultrafast', 'veryfast', 'fast', 'medium', 'slow'.
+                None keeps the encoder default.
+            g (int | None, optional): GOP size (keyframe interval in frames). Smaller = more keyframes = faster
+                seek, bigger files. None keeps the encoder default.
 
         Note:
             Write-mode parameters (``streaming_encoding``, ``batch_encoding_size``) passed to
@@ -207,6 +218,9 @@ class LeRobotDataset(torch.utils.data.Dataset):
         self._batch_encoding_size = batch_encoding_size
         self._vcodec = resolve_vcodec(vcodec)
         self._encoder_threads = encoder_threads
+        self._crf = crf
+        self._preset = preset
+        self._g = g
 
         if self._requested_root is not None:
             self._requested_root.mkdir(exist_ok=True, parents=True)
@@ -251,7 +265,7 @@ class LeRobotDataset(torch.utils.data.Dataset):
             streaming_enc = None
             if streaming_encoding and len(self.meta.video_keys) > 0:
                 streaming_enc = self._build_streaming_encoder(
-                    self.meta.fps, self._vcodec, encoder_queue_maxsize, encoder_threads
+                    self.meta.fps, self._vcodec, encoder_queue_maxsize, encoder_threads, crf, preset, g
                 )
             self.writer = DatasetWriter(
                 meta=self.meta,
@@ -261,6 +275,9 @@ class LeRobotDataset(torch.utils.data.Dataset):
                 batch_encoding_size=batch_encoding_size,
                 streaming_encoder=streaming_enc,
                 initial_frames=self.meta.total_frames,
+                crf=crf,
+                preset=preset,
+                g=g,
             )
         else:
             self.writer = None
@@ -301,14 +318,17 @@ class LeRobotDataset(torch.utils.data.Dataset):
         vcodec: str,
         encoder_queue_maxsize: int,
         encoder_threads: int | None,
+        crf: int | None = None,
+        preset: int | str | None = None,
+        g: int | None = None,
     ) -> StreamingVideoEncoder:
         return StreamingVideoEncoder(
             fps=fps,
             vcodec=vcodec,
             pix_fmt="yuv420p",
-            g=2,
-            crf=30,
-            preset=None,
+            g=2 if g is None else g,
+            crf=30 if crf is None else crf,
+            preset=preset,
             queue_maxsize=encoder_queue_maxsize,
             encoder_threads=encoder_threads,
         )
@@ -630,6 +650,9 @@ class LeRobotDataset(torch.utils.data.Dataset):
         streaming_encoding: bool = False,
         encoder_queue_maxsize: int = 30,
         encoder_threads: int | None = None,
+        crf: int | None = None,
+        preset: int | str | None = None,
+        g: int | None = None,
         video_files_size_in_mb: int | None = None,
         data_files_size_in_mb: int | None = None,
     ) -> "LeRobotDataset":
@@ -665,6 +688,10 @@ class LeRobotDataset(torch.utils.data.Dataset):
             encoder_queue_maxsize: Max buffered frames per camera when using
                 streaming encoding.
             encoder_threads: Threads per encoder instance. ``None`` for auto.
+            crf: Constant rate factor. ``None`` keeps encoder default.
+            preset: Encoder speed/quality preset (int for libsvtav1, str for libx264/libx265).
+                ``None`` keeps encoder default.
+            g: GOP size (keyframe interval in frames). ``None`` keeps encoder default.
 
         Returns:
             A new :class:`LeRobotDataset` in write mode.
@@ -695,6 +722,9 @@ class LeRobotDataset(torch.utils.data.Dataset):
         obj._batch_encoding_size = batch_encoding_size
         obj._vcodec = vcodec
         obj._encoder_threads = encoder_threads
+        obj._crf = crf
+        obj._preset = preset
+        obj._g = g
 
         # Reader is lazily created on first access (write-only mode)
         obj.reader = None
@@ -702,7 +732,9 @@ class LeRobotDataset(torch.utils.data.Dataset):
         # Create writer
         streaming_enc = None
         if streaming_encoding and len(obj.meta.video_keys) > 0:
-            streaming_enc = cls._build_streaming_encoder(fps, vcodec, encoder_queue_maxsize, encoder_threads)
+            streaming_enc = cls._build_streaming_encoder(
+                fps, vcodec, encoder_queue_maxsize, encoder_threads, crf, preset, g
+            )
         obj.writer = DatasetWriter(
             meta=obj.meta,
             root=obj.root,
@@ -710,6 +742,9 @@ class LeRobotDataset(torch.utils.data.Dataset):
             encoder_threads=encoder_threads,
             batch_encoding_size=batch_encoding_size,
             streaming_encoder=streaming_enc,
+            crf=crf,
+            preset=preset,
+            g=g,
         )
 
         if image_writer_processes or image_writer_threads:
@@ -735,6 +770,9 @@ class LeRobotDataset(torch.utils.data.Dataset):
         streaming_encoding: bool = False,
         encoder_queue_maxsize: int = 30,
         encoder_threads: int | None = None,
+        crf: int | None = None,
+        preset: int | str | None = None,
+        g: int | None = None,
     ) -> "LeRobotDataset":
         """Resume recording on an existing dataset.
 
@@ -764,6 +802,10 @@ class LeRobotDataset(torch.utils.data.Dataset):
                 capture.
             encoder_queue_maxsize: Max buffered frames per camera for streaming.
             encoder_threads: Threads per encoder instance. ``None`` for auto.
+            crf: Constant rate factor. ``None`` keeps encoder default.
+            preset: Encoder speed/quality preset (int for libsvtav1, str for libx264/libx265).
+                ``None`` keeps encoder default.
+            g: GOP size (keyframe interval in frames). ``None`` keeps encoder default.
 
         Returns:
             A :class:`LeRobotDataset` in write mode, ready to append episodes.
@@ -788,6 +830,9 @@ class LeRobotDataset(torch.utils.data.Dataset):
         obj._batch_encoding_size = batch_encoding_size
         obj._vcodec = vcodec
         obj._encoder_threads = encoder_threads
+        obj._crf = crf
+        obj._preset = preset
+        obj._g = g
 
         if obj._requested_root is not None:
             obj._requested_root.mkdir(exist_ok=True, parents=True)
@@ -805,7 +850,7 @@ class LeRobotDataset(torch.utils.data.Dataset):
         streaming_enc = None
         if streaming_encoding and len(obj.meta.video_keys) > 0:
             streaming_enc = cls._build_streaming_encoder(
-                obj.meta.fps, vcodec, encoder_queue_maxsize, encoder_threads
+                obj.meta.fps, vcodec, encoder_queue_maxsize, encoder_threads, crf, preset, g
             )
         obj.writer = DatasetWriter(
             meta=obj.meta,
@@ -815,6 +860,9 @@ class LeRobotDataset(torch.utils.data.Dataset):
             batch_encoding_size=batch_encoding_size,
             streaming_encoder=streaming_enc,
             initial_frames=obj.meta.total_frames,
+            crf=crf,
+            preset=preset,
+            g=g,
         )
 
         if image_writer_processes or image_writer_threads:
