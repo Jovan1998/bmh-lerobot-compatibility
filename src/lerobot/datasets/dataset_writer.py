@@ -363,7 +363,10 @@ class DatasetWriter:
         episode_df_path = self._root / DEFAULT_EPISODES_PATH.format(
             chunk_index=chunk_idx, file_index=file_idx
         )
-        episode_df = pd.read_parquet(episode_df_path)
+        # Index by episode_index so combine_first aligns with video_ep_df's index
+        # (otherwise pd.read_parquet's RangeIndex creates phantom rows for batches
+        # that don't start at episode 0).
+        episode_df = pd.read_parquet(episode_df_path).set_index("episode_index", drop=False)
 
         for ep_idx in range(start_episode, end_episode):
             logger.info(f"Encoding videos for episode {ep_idx}")
@@ -372,7 +375,7 @@ class DatasetWriter:
                 self._meta.episodes[ep_idx]["meta/episodes/chunk_index"] != chunk_idx
                 or self._meta.episodes[ep_idx]["meta/episodes/file_index"] != file_idx
             ):
-                episode_df.to_parquet(episode_df_path)
+                episode_df.to_parquet(episode_df_path, index=False)
                 self._meta.episodes = load_episodes(self._root)
 
                 chunk_idx = self._meta.episodes[ep_idx]["meta/episodes/chunk_index"]
@@ -380,7 +383,9 @@ class DatasetWriter:
                 episode_df_path = self._root / DEFAULT_EPISODES_PATH.format(
                     chunk_index=chunk_idx, file_index=file_idx
                 )
-                episode_df = pd.read_parquet(episode_df_path)
+                episode_df = pd.read_parquet(episode_df_path).set_index(
+                    "episode_index", drop=False
+                )
 
             video_ep_metadata = {}
             for video_key in self._meta.video_keys:
@@ -391,7 +396,7 @@ class DatasetWriter:
             )
 
             episode_df = episode_df.combine_first(video_ep_df)
-            episode_df.to_parquet(episode_df_path)
+            episode_df.to_parquet(episode_df_path, index=False)
             self._meta.episodes = load_episodes(self._root)
 
     def _save_episode_data(self, episode_buffer: dict) -> dict:
