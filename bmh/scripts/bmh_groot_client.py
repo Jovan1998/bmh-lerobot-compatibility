@@ -246,7 +246,7 @@ class BmhInferenceConfig:
     action_horizon: int = 8
     fps: int = 30
     timeout_ms: int = 15000
-    jpeg_quality: int = 85
+    jpeg_quality: int = 95
     api_token: str = ""
     # Fire the next inference request when this many actions remain in the
     # current chunk. 0 fires on the very last action (≈ sync); larger values
