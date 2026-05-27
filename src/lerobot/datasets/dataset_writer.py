@@ -479,12 +479,19 @@ class DatasetWriter:
             or f"videos/{video_key}/chunk_index" not in self._meta.latest_episode
         ):
             chunk_idx, file_idx = 0, 0
-            if self._meta.episodes is not None and len(self._meta.episodes) > 0:
-                old_chunk_idx = self._meta.episodes[-1][f"videos/{video_key}/chunk_index"]
-                old_file_idx = self._meta.episodes[-1][f"videos/{video_key}/file_index"]
-                chunk_idx, file_idx = update_chunk_file_indices(
-                    old_chunk_idx, old_file_idx, self._meta.chunks_size
-                )
+            videos_chunk_col = f"videos/{video_key}/chunk_index"
+            if (
+                self._meta.episodes is not None
+                and episode_index > 0
+                and videos_chunk_col in self._meta.episodes.column_names
+            ):
+                prev_ep = self._meta.episodes[episode_index - 1]
+                if prev_ep[videos_chunk_col] is not None:
+                    chunk_idx, file_idx = update_chunk_file_indices(
+                        prev_ep[videos_chunk_col],
+                        prev_ep[f"videos/{video_key}/file_index"],
+                        self._meta.chunks_size,
+                    )
             latest_duration_in_s = 0.0
             new_path = self._root / self._meta.video_path.format(
                 video_key=video_key, chunk_index=chunk_idx, file_index=file_idx
