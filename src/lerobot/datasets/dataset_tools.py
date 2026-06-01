@@ -835,27 +835,29 @@ def _smart_cut_trim_video(
     pts_shift = frame_pts[start_frame]
     end_pts = frame_pts[end_frame] if end_frame < len(frame_pts) else None
 
-    # --- Pass 2: write output. The output stream clones the source's codec
-    # parameters so stream-copied packets need no rewriting; the prefix
-    # encoder is configured to match so its packets decode against the same
-    # extradata.
+    # --- Pass 2: write output. We create a single output stream as a
+    # libsvtav1 encoder stream and route both kinds of packets through it:
+    # the prefix encoder writes via ``out_stream.encode(frame)``, and the
+    # suffix's stream-copied packets are attached to the same stream via
+    # ``packet.stream = out_stream`` before muxing. The muxer treats both as
+    # AV1 bitstream into one AV1 track. We cannot use
+    # ``add_stream_from_template`` because PyAV looks up the source's
+    # decoder name (``libdav1d``) as an encoder, which doesn't exist.
     out_container = av.open(str(output_path), mode="w")
     in_container = av.open(str(input_path))
     v_in = in_container.streams.video[0]
-    out_stream = out_container.add_stream_from_template(v_in)
 
     src_pix_fmt = v_in.codec_context.pix_fmt or "yuv420p"
-    prefix_encoder = av.codec.CodecContext.create(vcodec, "w")
-    prefix_encoder.width = v_in.codec_context.width
-    prefix_encoder.height = v_in.codec_context.height
-    prefix_encoder.pix_fmt = src_pix_fmt
-    prefix_encoder.framerate = Fraction(int(fps), 1)
-    prefix_encoder.time_base = v_in.time_base
+    fps_fraction = Fraction(fps).limit_denominator(1000)
+    out_stream = out_container.add_stream(vcodec, rate=fps_fraction)
+    out_stream.width = v_in.codec_context.width
+    out_stream.height = v_in.codec_context.height
+    out_stream.pix_fmt = src_pix_fmt
+    out_stream.time_base = v_in.time_base
     # Make the prefix one self-contained GOP so it ends right before
     # next_kf, where the suffix stream-copy takes over.
-    prefix_encoder.gop_size = max(1, next_kf - start_frame)
-    prefix_encoder.options = {"crf": "25"}
-    prefix_encoder.open()
+    out_stream.codec_context.gop_size = max(1, next_kf - start_frame)
+    out_stream.codec_context.options = {"crf": "25"}
 
     # Phase A: re-encode [start_frame, next_kf).
     src_idx = 0
@@ -869,13 +871,11 @@ def _smart_cut_trim_video(
                 break
             if src_idx >= start_frame:
                 frame.pts = int(frame.pts) - pts_shift
-                for out_pkt in prefix_encoder.encode(frame):
-                    out_pkt.stream = out_stream
+                for out_pkt in out_stream.encode(frame):
                     out_container.mux(out_pkt)
             src_idx += 1
 
-    for out_pkt in prefix_encoder.encode(None):
-        out_pkt.stream = out_stream
+    for out_pkt in out_stream.encode(None):
         out_container.mux(out_pkt)
 
     in_container.close()
