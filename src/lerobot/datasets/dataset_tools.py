@@ -770,6 +770,140 @@ def _copy_and_reindex_data(
     return episode_data_metadata
 
 
+def _smart_cut_trim_video(
+    input_path: Path,
+    output_path: Path,
+    start_frame: int,
+    end_frame: int,
+    fps: float,
+    vcodec: str = "libsvtav1",
+) -> None:
+    """Frame-accurate near-lossless trim via prefix re-encode + suffix stream-copy.
+
+    Re-encodes only the leading partial GOP — frames [start_frame,
+    next_keyframe) — with a fresh encoder configured to match the source.
+    Stream-copies the remaining source packets covering frames
+    [next_keyframe, end_frame), preserving bit-for-bit the original encoded
+    bytes. The output contains exactly end_frame - start_frame frames and
+    starts at PTS 0.
+
+    The re-encoded prefix is at most GOP-1 frames long. For SVT-AV1 sources
+    with the small GOPs we record at, that's a handful of frames; everything
+    else is bit-identical to the source. Falls back to a full re-encode
+    only when there is no usable keyframe inside the kept range.
+    """
+    from fractions import Fraction
+
+    import av
+
+    if start_frame >= end_frame:
+        raise ValueError(f"Invalid trim range: [{start_frame}, {end_frame})")
+
+    # --- Pass 1: enumerate frames in [0, end_frame] to recover the display-
+    # order PTS and keyframe flag for each frame index. We need both to map
+    # frame_index -> packet PTS (for the stream-copy phase) and to locate the
+    # first keyframe at or after start_frame (the cut point between re-encode
+    # and stream-copy).
+    in_container = av.open(str(input_path))
+    v_in = in_container.streams.video[0]
+
+    frame_pts: list[int] = []
+    frame_is_kf: list[bool] = []
+    for packet in in_container.demux(v_in):
+        for frame in packet.decode():
+            if frame is None or frame.pts is None:
+                continue
+            frame_pts.append(int(frame.pts))
+            frame_is_kf.append(bool(frame.key_frame))
+            if len(frame_pts) > end_frame:
+                break
+        if len(frame_pts) > end_frame:
+            break
+    in_container.close()
+
+    if len(frame_pts) < end_frame:
+        raise ValueError(
+            f"Source has only {len(frame_pts)} frames; cannot trim to end_frame={end_frame}"
+        )
+
+    next_kf = end_frame
+    for i in range(start_frame + 1, end_frame):
+        if frame_is_kf[i]:
+            next_kf = i
+            break
+
+    pts_shift = frame_pts[start_frame]
+    end_pts = frame_pts[end_frame] if end_frame < len(frame_pts) else None
+
+    # --- Pass 2: write output. The output stream clones the source's codec
+    # parameters so stream-copied packets need no rewriting; the prefix
+    # encoder is configured to match so its packets decode against the same
+    # extradata.
+    out_container = av.open(str(output_path), mode="w")
+    in_container = av.open(str(input_path))
+    v_in = in_container.streams.video[0]
+    out_stream = out_container.add_stream(template=v_in)
+
+    src_pix_fmt = v_in.codec_context.pix_fmt or "yuv420p"
+    prefix_encoder = av.codec.CodecContext.create(vcodec, "w")
+    prefix_encoder.width = v_in.codec_context.width
+    prefix_encoder.height = v_in.codec_context.height
+    prefix_encoder.pix_fmt = src_pix_fmt
+    prefix_encoder.framerate = Fraction(int(fps), 1)
+    prefix_encoder.time_base = v_in.time_base
+    # Make the prefix one self-contained GOP so it ends right before
+    # next_kf, where the suffix stream-copy takes over.
+    prefix_encoder.gop_size = max(1, next_kf - start_frame)
+    prefix_encoder.options = {"crf": "25"}
+    prefix_encoder.open()
+
+    # Phase A: re-encode [start_frame, next_kf).
+    src_idx = 0
+    for packet in in_container.demux(v_in):
+        if src_idx >= next_kf:
+            break
+        for frame in packet.decode():
+            if frame is None:
+                continue
+            if src_idx >= next_kf:
+                break
+            if src_idx >= start_frame:
+                frame.pts = int(frame.pts) - pts_shift
+                for out_pkt in prefix_encoder.encode(frame):
+                    out_pkt.stream = out_stream
+                    out_container.mux(out_pkt)
+            src_idx += 1
+
+    for out_pkt in prefix_encoder.encode(None):
+        out_pkt.stream = out_stream
+        out_container.mux(out_pkt)
+
+    in_container.close()
+
+    # Phase B: stream-copy [next_kf, end_frame). Re-open so demux starts
+    # from a clean state; we skip until we reach the keyframe packet at
+    # next_kf, then mux every packet until end_frame.
+    if next_kf < end_frame:
+        in_container = av.open(str(input_path))
+        v_in = in_container.streams.video[0]
+
+        suffix_start_pts = frame_pts[next_kf]
+        for packet in in_container.demux(v_in):
+            if packet.pts is None or packet.dts is None:
+                continue
+            if packet.pts < suffix_start_pts:
+                continue
+            if end_pts is not None and packet.pts >= end_pts:
+                break
+            packet.pts = int(packet.pts) - pts_shift
+            packet.dts = int(packet.dts) - pts_shift
+            packet.stream = out_stream
+            out_container.mux(packet)
+        in_container.close()
+
+    out_container.close()
+
+
 def _keep_episodes_from_video_with_av(
     input_path: Path,
     output_path: Path,
@@ -942,41 +1076,64 @@ def _copy_and_reindex_videos(
                 else set()
             )
 
-            if all_in_file_set == episodes_to_keep_set:
-                # No episodes are dropped from this file, so we never need to
-                # rewrite the video bitstream. Even when one episode is being
-                # windowed (trimmed), we keep the source MP4 byte-for-byte and
-                # point the trimmed episode's from/to timestamps at the kept
-                # sub-range inside the unchanged file. Readers seek to those
-                # offsets and only decode the kept frames; the discarded
-                # frames stay in the file but are never referenced. This makes
-                # trim lossless and turns it into a plain file copy.
-                assert src_dataset.meta.video_path is not None
-                src_video_path = src_dataset.root / src_dataset.meta.video_path.format(
-                    video_key=video_key, chunk_index=src_chunk_idx, file_index=src_file_idx
-                )
-                dst_video_path = dst_meta.root / dst_meta.video_path.format(
-                    video_key=video_key, chunk_index=src_chunk_idx, file_index=src_file_idx
-                )
-                dst_video_path.parent.mkdir(parents=True, exist_ok=True)
-                shutil.copy(src_video_path, dst_video_path)
+            assert src_dataset.meta.video_path is not None
+            src_video_path = src_dataset.root / src_dataset.meta.video_path.format(
+                video_key=video_key, chunk_index=src_chunk_idx, file_index=src_file_idx
+            )
+            dst_video_path = dst_meta.root / dst_meta.video_path.format(
+                video_key=video_key, chunk_index=src_chunk_idx, file_index=src_file_idx
+            )
+            dst_video_path.parent.mkdir(parents=True, exist_ok=True)
 
+            if all_in_file_set == episodes_to_keep_set and not windowed_in_file:
+                # Untouched file: byte-copy and reuse original timestamps.
+                shutil.copy(src_video_path, dst_video_path)
                 for old_idx in episodes_in_file:
                     new_idx = episode_mapping[old_idx]
                     src_ep = src_dataset.meta.episodes[old_idx]
-                    orig_from_ts = float(src_ep[f"videos/{video_key}/from_timestamp"])
-                    orig_to_ts = float(src_ep[f"videos/{video_key}/to_timestamp"])
-                    if old_idx in windowed_in_file:
-                        start, end = episode_frame_window[old_idx]
-                        from_ts = orig_from_ts + start / src_dataset.meta.fps
-                        to_ts = orig_from_ts + end / src_dataset.meta.fps
-                    else:
-                        from_ts = orig_from_ts
-                        to_ts = orig_to_ts
                     episodes_video_metadata[new_idx][f"videos/{video_key}/chunk_index"] = src_chunk_idx
                     episodes_video_metadata[new_idx][f"videos/{video_key}/file_index"] = src_file_idx
-                    episodes_video_metadata[new_idx][f"videos/{video_key}/from_timestamp"] = from_ts
-                    episodes_video_metadata[new_idx][f"videos/{video_key}/to_timestamp"] = to_ts
+                    episodes_video_metadata[new_idx][f"videos/{video_key}/from_timestamp"] = float(
+                        src_ep[f"videos/{video_key}/from_timestamp"]
+                    )
+                    episodes_video_metadata[new_idx][f"videos/{video_key}/to_timestamp"] = float(
+                        src_ep[f"videos/{video_key}/to_timestamp"]
+                    )
+            elif (
+                all_in_file_set == episodes_to_keep_set
+                and len(episodes_in_file) == 1
+                and len(windowed_in_file) == 1
+            ):
+                # Single windowed episode alone in this file (BMH trim case).
+                # Smart-cut: re-encode only the small leading partial GOP and
+                # stream-copy the rest, so the discarded frames physically
+                # leave the file while the kept range stays bit-identical
+                # past the first keyframe.
+                old_idx = next(iter(episodes_in_file))
+                new_idx = episode_mapping[old_idx]
+                src_ep = src_dataset.meta.episodes[old_idx]
+                orig_from_frame = round(
+                    src_ep[f"videos/{video_key}/from_timestamp"] * src_dataset.meta.fps
+                )
+                start, end = episode_frame_window[old_idx]
+                logging.info(
+                    f"Smart-cut trimming {video_key} (chunk {src_chunk_idx}, "
+                    f"file {src_file_idx}) to frames [{start}, {end})"
+                )
+                _smart_cut_trim_video(
+                    src_video_path,
+                    dst_video_path,
+                    orig_from_frame + start,
+                    orig_from_frame + end,
+                    src_dataset.meta.fps,
+                    vcodec,
+                )
+                episodes_video_metadata[new_idx][f"videos/{video_key}/chunk_index"] = src_chunk_idx
+                episodes_video_metadata[new_idx][f"videos/{video_key}/file_index"] = src_file_idx
+                episodes_video_metadata[new_idx][f"videos/{video_key}/from_timestamp"] = 0.0
+                episodes_video_metadata[new_idx][f"videos/{video_key}/to_timestamp"] = (
+                    end - start
+                ) / src_dataset.meta.fps
             else:
                 # Build list of frame ranges to keep, in sorted order.
                 sorted_keep_episodes = sorted(episodes_in_file, key=lambda x: episode_mapping[x])
@@ -999,16 +1156,6 @@ def _copy_and_reindex_videos(
                         )
                         from_frame, to_frame = orig_from_frame, orig_to_frame
                     episodes_to_keep_ranges.append((from_frame, to_frame))
-
-                # Use PyAV filters to efficiently re-encode only the desired segments.
-                assert src_dataset.meta.video_path is not None
-                src_video_path = src_dataset.root / src_dataset.meta.video_path.format(
-                    video_key=video_key, chunk_index=src_chunk_idx, file_index=src_file_idx
-                )
-                dst_video_path = dst_meta.root / dst_meta.video_path.format(
-                    video_key=video_key, chunk_index=src_chunk_idx, file_index=src_file_idx
-                )
-                dst_video_path.parent.mkdir(parents=True, exist_ok=True)
 
                 logging.info(
                     f"Re-encoding {video_key} (chunk {src_chunk_idx}, file {src_file_idx}) "
