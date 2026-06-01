@@ -209,6 +209,10 @@ def trim_episode(
     episode_frame_window = {episode_index: (start_frame, end_frame)}
     trimmed_length = end_frame - start_frame
 
+    # Buffer all episodes in a single flush so the parquet writer's schema is
+    # inferred once over the full dataset. Otherwise the writer's schema is
+    # locked in by the first 10-episode batch (which contains the trimmed
+    # episode with recomputed-stats values) and a later batch can mismatch.
     new_meta = LeRobotDatasetMetadata.create(
         repo_id=repo_id,
         fps=dataset.meta.fps,
@@ -216,6 +220,7 @@ def trim_episode(
         robot_type=dataset.meta.robot_type,
         root=output_dir,
         use_videos=len(dataset.meta.video_keys) > 0,
+        metadata_buffer_size=dataset.meta.total_episodes + 1,
     )
 
     video_metadata = None
