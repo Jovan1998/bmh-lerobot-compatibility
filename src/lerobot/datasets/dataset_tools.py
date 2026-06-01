@@ -842,7 +842,7 @@ def _smart_cut_trim_video(
     out_container = av.open(str(output_path), mode="w")
     in_container = av.open(str(input_path))
     v_in = in_container.streams.video[0]
-    out_stream = out_container.add_stream(template=v_in)
+    out_stream = out_container.add_stream_from_template(v_in)
 
     src_pix_fmt = v_in.codec_context.pix_fmt or "yuv420p"
     prefix_encoder = av.codec.CodecContext.create(vcodec, "w")
