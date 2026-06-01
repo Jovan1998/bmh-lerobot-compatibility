@@ -953,12 +953,12 @@ def _copy_and_reindex_videos(
                     src_ep = src_dataset.meta.episodes[old_idx]
                     episodes_video_metadata[new_idx][f"videos/{video_key}/chunk_index"] = src_chunk_idx
                     episodes_video_metadata[new_idx][f"videos/{video_key}/file_index"] = src_file_idx
-                    episodes_video_metadata[new_idx][f"videos/{video_key}/from_timestamp"] = src_ep[
-                        f"videos/{video_key}/from_timestamp"
-                    ]
-                    episodes_video_metadata[new_idx][f"videos/{video_key}/to_timestamp"] = src_ep[
-                        f"videos/{video_key}/to_timestamp"
-                    ]
+                    episodes_video_metadata[new_idx][f"videos/{video_key}/from_timestamp"] = float(
+                        src_ep[f"videos/{video_key}/from_timestamp"]
+                    )
+                    episodes_video_metadata[new_idx][f"videos/{video_key}/to_timestamp"] = float(
+                        src_ep[f"videos/{video_key}/to_timestamp"]
+                    )
             else:
                 # Build list of frame ranges to keep, in sorted order.
                 sorted_keep_episodes = sorted(episodes_in_file, key=lambda x: episode_mapping[x])
@@ -1018,8 +1018,10 @@ def _copy_and_reindex_videos(
 
                     episodes_video_metadata[new_idx][f"videos/{video_key}/chunk_index"] = src_chunk_idx
                     episodes_video_metadata[new_idx][f"videos/{video_key}/file_index"] = src_file_idx
-                    episodes_video_metadata[new_idx][f"videos/{video_key}/from_timestamp"] = cumulative_ts
-                    episodes_video_metadata[new_idx][f"videos/{video_key}/to_timestamp"] = (
+                    episodes_video_metadata[new_idx][f"videos/{video_key}/from_timestamp"] = float(
+                        cumulative_ts
+                    )
+                    episodes_video_metadata[new_idx][f"videos/{video_key}/to_timestamp"] = float(
                         cumulative_ts + ep_duration
                     )
 
