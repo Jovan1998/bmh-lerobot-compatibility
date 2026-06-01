@@ -150,6 +150,163 @@ def delete_episodes(
     return new_dataset
 
 
+def trim_episode(
+    dataset: LeRobotDataset,
+    episode_index: int,
+    start_frame: int,
+    end_frame: int,
+    output_dir: str | Path | None = None,
+    repo_id: str | None = None,
+) -> LeRobotDataset:
+    """Trim a single episode in a LeRobotDataset and create a new dataset.
+
+    Keeps only frames ``[start_frame, end_frame)`` of the named episode. The
+    episode count and per-episode index stay the same; only the trimmed
+    episode's length, data/video timestamps, per-episode stats, and the
+    global ``dataset_from_index`` / ``dataset_to_index`` of all downstream
+    episodes change.
+
+    Args:
+        dataset: The source LeRobotDataset.
+        episode_index: Index of the episode to trim.
+        start_frame: First kept frame (inclusive), in the episode's 0-based
+            ``frame_index`` space.
+        end_frame: One past the last kept frame (exclusive).
+        output_dir: Root directory where the edited dataset will be stored.
+            Defaults to ``$HF_LEROBOT_HOME/repo_id`` when omitted.
+        repo_id: Edited dataset identifier.
+    """
+    if not isinstance(episode_index, int) or episode_index < 0:
+        raise ValueError(f"Invalid episode index: {episode_index}")
+    if episode_index >= dataset.meta.total_episodes:
+        raise ValueError(
+            f"Episode index {episode_index} out of range (have {dataset.meta.total_episodes} episodes)"
+        )
+
+    src_episode = dataset.meta.episodes[episode_index]
+    original_length = int(src_episode["length"])
+    if start_frame < 0 or end_frame > original_length or start_frame >= end_frame:
+        raise ValueError(
+            f"Invalid trim range [{start_frame}, {end_frame}) for episode {episode_index} "
+            f"with length {original_length}"
+        )
+    if end_frame - start_frame < 2:
+        raise ValueError(
+            f"Trim would leave fewer than 2 frames in episode {episode_index} "
+            f"(start={start_frame}, end={end_frame})"
+        )
+
+    logging.info(
+        f"Trimming episode {episode_index} to frames [{start_frame}, {end_frame}) "
+        f"(was {original_length} frames)"
+    )
+
+    if repo_id is None:
+        repo_id = f"{dataset.repo_id}_modified"
+    output_dir = Path(output_dir) if output_dir is not None else HF_LEROBOT_HOME / repo_id
+
+    episode_mapping = {i: i for i in range(dataset.meta.total_episodes)}
+    episode_frame_window = {episode_index: (start_frame, end_frame)}
+    trimmed_length = end_frame - start_frame
+
+    new_meta = LeRobotDatasetMetadata.create(
+        repo_id=repo_id,
+        fps=dataset.meta.fps,
+        features=dataset.meta.features,
+        robot_type=dataset.meta.robot_type,
+        root=output_dir,
+        use_videos=len(dataset.meta.video_keys) > 0,
+    )
+
+    video_metadata = None
+    if dataset.meta.video_keys:
+        video_metadata = _copy_and_reindex_videos(
+            dataset, new_meta, episode_mapping, episode_frame_window=episode_frame_window
+        )
+
+    data_metadata = _copy_and_reindex_data(
+        dataset, new_meta, episode_mapping, episode_frame_window=episode_frame_window
+    )
+
+    trimmed_stats = _compute_numeric_episode_stats(
+        dst_meta=new_meta,
+        features=dataset.meta.features,
+        chunk_index=data_metadata[episode_index]["data/chunk_index"],
+        file_index=data_metadata[episode_index]["data/file_index"],
+        episode_index=episode_index,
+    )
+
+    _copy_and_reindex_episodes_metadata(
+        dataset,
+        new_meta,
+        episode_mapping,
+        data_metadata,
+        video_metadata,
+        length_overrides={episode_index: trimmed_length},
+        stats_overrides={episode_index: trimmed_stats},
+    )
+
+    new_dataset = LeRobotDataset(
+        repo_id=repo_id,
+        root=output_dir,
+        image_transforms=dataset.image_transforms,
+        delta_timestamps=dataset.delta_timestamps,
+        tolerance_s=dataset.tolerance_s,
+    )
+
+    logging.info(
+        f"Trimmed episode {episode_index}: {original_length} -> {trimmed_length} frames"
+    )
+    return new_dataset
+
+
+def _compute_numeric_episode_stats(
+    dst_meta: LeRobotDatasetMetadata,
+    features: dict,
+    chunk_index: int,
+    file_index: int,
+    episode_index: int,
+) -> dict[str, dict]:
+    """Recompute per-episode stats for the trimmed episode's numeric features.
+
+    Reads the newly-written data parquet (which already contains only the
+    surviving rows for the trimmed episode), filters to that episode, and runs
+    ``compute_episode_stats`` over the non-image/video columns. Image/video
+    stats are intentionally not recomputed — the underlying pixel
+    distributions are unchanged by trimming a frame range, and reading frames
+    back from disk to redo them would be expensive.
+    """
+    parquet_path = dst_meta.root / DEFAULT_DATA_PATH.format(
+        chunk_index=chunk_index, file_index=file_index
+    )
+    df = pd.read_parquet(parquet_path)
+    ep_df = df[df["episode_index"] == episode_index]
+
+    numeric_features = {
+        k: v
+        for k, v in features.items()
+        if v["dtype"] not in ["image", "video", "string"]
+        and k not in {"index", "episode_index", "task_index", "frame_index", "timestamp"}
+    }
+
+    episode_data: dict[str, np.ndarray] = {}
+    for key in numeric_features:
+        if key not in ep_df.columns:
+            continue
+        values = ep_df[key].values
+        if len(values) == 0:
+            continue
+        if hasattr(values[0], "__len__"):
+            episode_data[key] = np.stack(values)
+        else:
+            episode_data[key] = np.array(values)
+
+    if not episode_data:
+        return {}
+
+    return compute_episode_stats(episode_data, numeric_features)
+
+
 def split_dataset(
     dataset: LeRobotDataset,
     splits: dict[str, float | list[int]],
@@ -481,6 +638,7 @@ def _copy_and_reindex_data(
     src_dataset: LeRobotDataset,
     dst_meta: LeRobotDatasetMetadata,
     episode_mapping: dict[int, int],
+    episode_frame_window: dict[int, tuple[int, int]] | None = None,
 ) -> dict[int, dict]:
     """Copy and filter data files, only modifying files with deleted episodes.
 
@@ -488,6 +646,11 @@ def _copy_and_reindex_data(
         src_dataset: Source dataset to copy from
         dst_meta: Destination metadata object
         episode_mapping: Mapping from old episode indices to new indices
+        episode_frame_window: Optional per-episode half-open frame window keyed
+            by old episode index — ``(start_frame, end_frame)`` is interpreted
+            in the episode's own 0-based ``frame_index`` space. Rows outside
+            the window are dropped; surviving ``frame_index`` and ``timestamp``
+            are renumbered to be 0-based within the trimmed episode.
 
     Returns:
         dict mapping episode index to its data file metadata (chunk_index, file_index, etc.)
@@ -522,13 +685,23 @@ def _copy_and_reindex_data(
         if new_task_idx is not None:
             task_mapping[old_task_idx] = new_task_idx
 
+    fps = src_dataset.meta.fps
+
     for src_path in tqdm(sorted(file_to_episodes.keys()), desc="Processing data files"):
         df = pd.read_parquet(src_dataset.root / src_path)
 
         all_episodes_in_file = set(df["episode_index"].unique())
         episodes_to_keep = file_to_episodes[src_path]
 
-        if all_episodes_in_file == episodes_to_keep:
+        # If any kept episode in this file has a frame window, we can't
+        # take the all-rows pass-through path — we must filter at row level.
+        windowed_in_file = (
+            {ep for ep in episodes_to_keep if ep in episode_frame_window}
+            if episode_frame_window
+            else set()
+        )
+
+        if all_episodes_in_file == episodes_to_keep and not windowed_in_file:
             df["episode_index"] = df["episode_index"].replace(episode_mapping)
             df["index"] = range(global_index, global_index + len(df))
             df["task_index"] = df["task_index"].replace(task_mapping)
@@ -539,10 +712,29 @@ def _copy_and_reindex_data(
             file_idx = src_ep["data/file_index"]
         else:
             mask = df["episode_index"].isin(list(episode_mapping.keys()))
+            # Apply per-episode frame windows on top of the episode-level mask.
+            for ep_old_idx in windowed_in_file:
+                start, end = episode_frame_window[ep_old_idx]
+                ep_mask = df["episode_index"] == ep_old_idx
+                in_window = (df["frame_index"] >= start) & (df["frame_index"] < end)
+                # For windowed episodes: drop rows outside the window; for all
+                # other episodes (and all other rows): leave the existing mask.
+                mask = mask & ((~ep_mask) | in_window)
+
             df = df[mask].copy().reset_index(drop=True)
 
             if len(df) == 0:
                 continue
+
+            # Renumber frame_index (and timestamp, if present) to be 0-based
+            # within the trimmed episode. Must run before episode_index remap
+            # so we can still locate the trimmed rows by their old index.
+            for ep_old_idx in windowed_in_file:
+                start, _ = episode_frame_window[ep_old_idx]
+                ep_mask = df["episode_index"] == ep_old_idx
+                df.loc[ep_mask, "frame_index"] = df.loc[ep_mask, "frame_index"] - start
+                if "timestamp" in df.columns:
+                    df.loc[ep_mask, "timestamp"] = df.loc[ep_mask, "frame_index"] / fps
 
             df["episode_index"] = df["episode_index"].replace(episode_mapping)
             df["index"] = range(global_index, global_index + len(df))
@@ -689,6 +881,7 @@ def _copy_and_reindex_videos(
     episode_mapping: dict[int, int],
     vcodec: str = "libsvtav1",
     pix_fmt: str = "yuv420p",
+    episode_frame_window: dict[int, tuple[int, int]] | None = None,
 ) -> dict[int, dict]:
     """Copy and filter video files, only re-encoding files with deleted episodes.
 
@@ -738,7 +931,13 @@ def _copy_and_reindex_videos(
             episodes_to_keep_set = set(episodes_in_file)
             all_in_file_set = set(all_episodes_in_file)
 
-            if all_in_file_set == episodes_to_keep_set:
+            windowed_in_file = (
+                {ep for ep in episodes_in_file if ep in episode_frame_window}
+                if episode_frame_window
+                else set()
+            )
+
+            if all_in_file_set == episodes_to_keep_set and not windowed_in_file:
                 assert src_dataset.meta.video_path is not None
                 src_video_path = src_dataset.root / src_dataset.meta.video_path.format(
                     video_key=video_key, chunk_index=src_chunk_idx, file_index=src_file_idx
@@ -766,11 +965,21 @@ def _copy_and_reindex_videos(
                 episodes_to_keep_ranges: list[tuple[int, int]] = []
                 for old_idx in sorted_keep_episodes:
                     src_ep = src_dataset.meta.episodes[old_idx]
-                    from_frame = round(src_ep[f"videos/{video_key}/from_timestamp"] * src_dataset.meta.fps)
-                    to_frame = round(src_ep[f"videos/{video_key}/to_timestamp"] * src_dataset.meta.fps)
-                    assert src_ep["length"] == to_frame - from_frame, (
-                        f"Episode length mismatch: {src_ep['length']} vs {to_frame - from_frame}"
+                    orig_from_frame = round(
+                        src_ep[f"videos/{video_key}/from_timestamp"] * src_dataset.meta.fps
                     )
+                    orig_to_frame = round(
+                        src_ep[f"videos/{video_key}/to_timestamp"] * src_dataset.meta.fps
+                    )
+                    if old_idx in windowed_in_file:
+                        start, end = episode_frame_window[old_idx]
+                        from_frame = orig_from_frame + start
+                        to_frame = orig_from_frame + end
+                    else:
+                        assert src_ep["length"] == orig_to_frame - orig_from_frame, (
+                            f"Episode length mismatch: {src_ep['length']} vs {orig_to_frame - orig_from_frame}"
+                        )
+                        from_frame, to_frame = orig_from_frame, orig_to_frame
                     episodes_to_keep_ranges.append((from_frame, to_frame))
 
                 # Use PyAV filters to efficiently re-encode only the desired segments.
@@ -800,7 +1009,11 @@ def _copy_and_reindex_videos(
                 for old_idx in sorted_keep_episodes:
                     new_idx = episode_mapping[old_idx]
                     src_ep = src_dataset.meta.episodes[old_idx]
-                    ep_length = src_ep["length"]
+                    if old_idx in windowed_in_file:
+                        start, end = episode_frame_window[old_idx]
+                        ep_length = end - start
+                    else:
+                        ep_length = src_ep["length"]
                     ep_duration = ep_length / src_dataset.meta.fps
 
                     episodes_video_metadata[new_idx][f"videos/{video_key}/chunk_index"] = src_chunk_idx
@@ -821,6 +1034,8 @@ def _copy_and_reindex_episodes_metadata(
     episode_mapping: dict[int, int],
     data_metadata: dict[int, dict],
     video_metadata: dict[int, dict] | None = None,
+    length_overrides: dict[int, int] | None = None,
+    stats_overrides: dict[int, dict] | None = None,
 ) -> None:
     """Copy and reindex episodes metadata using provided data and video metadata.
 
@@ -830,6 +1045,15 @@ def _copy_and_reindex_episodes_metadata(
         episode_mapping: Mapping from old episode indices to new indices
         data_metadata: Dict mapping new episode index to its data file metadata
         video_metadata: Optional dict mapping new episode index to its video metadata
+        length_overrides: Optional dict keyed by new episode index supplying a
+            length to use instead of the source episode's stored length.
+            Used by trim, where the surviving frame range is shorter than the
+            original episode.
+        stats_overrides: Optional dict keyed by new episode index supplying
+            recomputed numeric (non-image/video) stats for that episode. Image
+            and video stats are still sourced from the original episode, since
+            trimming a frame range doesn't materially change per-pixel
+            distributions.
     """
     if src_dataset.meta.episodes is None:
         src_dataset.meta.episodes = load_episodes(src_dataset.meta.root)
@@ -882,18 +1106,30 @@ def _copy_and_reindex_episodes_metadata(
 
                     episode_stats[feature_name][stat_name] = value
 
+        # Apply per-feature numeric stats overrides (used by trim) while
+        # keeping image/video stats from the original episode.
+        if stats_overrides and new_idx in stats_overrides:
+            for feature_name, stat_dict in stats_overrides[new_idx].items():
+                episode_stats[feature_name] = stat_dict
+
         all_stats.append(episode_stats)
+
+        ep_length = (
+            length_overrides[new_idx]
+            if length_overrides is not None and new_idx in length_overrides
+            else src_episode["length"]
+        )
 
         episode_dict = {
             "episode_index": new_idx,
             "tasks": src_episode["tasks"],
-            "length": src_episode["length"],
+            "length": ep_length,
         }
         episode_dict.update(episode_meta)
         episode_dict.update(flatten_dict({"stats": episode_stats}))
         dst_meta._save_episode_metadata(episode_dict)
 
-        total_frames += src_episode["length"]
+        total_frames += ep_length
 
     dst_meta.finalize()
 

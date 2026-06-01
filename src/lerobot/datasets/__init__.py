@@ -33,6 +33,7 @@ from .dataset_tools import (
     recompute_stats,
     remove_feature,
     split_dataset,
+    trim_episode,
 )
 from .factory import make_dataset, resolve_delta_timestamps
 from .image_writer import safe_stop_image_writer
@@ -78,5 +79,6 @@ __all__ = [
     "resolve_delta_timestamps",
     "safe_stop_image_writer",
     "split_dataset",
+    "trim_episode",
     "write_stats",
 ]

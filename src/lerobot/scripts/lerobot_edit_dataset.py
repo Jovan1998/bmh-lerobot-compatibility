@@ -202,6 +202,7 @@ from lerobot.datasets import (
     recompute_stats,
     remove_feature,
     split_dataset,
+    trim_episode,
 )
 from lerobot.utils.constants import HF_LEROBOT_HOME
 from lerobot.utils.utils import init_logging
@@ -218,6 +219,14 @@ class OperationConfig(draccus.ChoiceRegistry, abc.ABC):
 @dataclass
 class DeleteEpisodesConfig(OperationConfig):
     episode_indices: list[int] | None = None
+
+
+@OperationConfig.register_subclass("trim_episode")
+@dataclass
+class TrimEpisodeConfig(OperationConfig):
+    episode_index: int = 0
+    start_frame: int = 0
+    end_frame: int = 0  # half-open
 
 
 @OperationConfig.register_subclass("split")
@@ -354,6 +363,49 @@ def handle_delete_episodes(cfg: EditDatasetConfig) -> None:
     new_dataset = delete_episodes(
         dataset,
         episode_indices=cfg.operation.episode_indices,
+        output_dir=output_dir,
+        repo_id=output_repo_id,
+    )
+
+    logging.info(f"Dataset saved to {output_dir}")
+    logging.info(f"Episodes: {new_dataset.meta.total_episodes}, Frames: {new_dataset.meta.total_frames}")
+
+    if cfg.push_to_hub:
+        logging.info(f"Pushing to hub as {output_repo_id}")
+        LeRobotDataset(output_repo_id, root=output_dir).push_to_hub()
+
+
+def handle_trim_episode(cfg: EditDatasetConfig) -> None:
+    if not isinstance(cfg.operation, TrimEpisodeConfig):
+        raise ValueError("Operation config must be TrimEpisodeConfig")
+
+    if cfg.operation.end_frame <= cfg.operation.start_frame:
+        raise ValueError(
+            f"end_frame ({cfg.operation.end_frame}) must be greater than start_frame "
+            f"({cfg.operation.start_frame}) for trim_episode operation"
+        )
+
+    dataset = LeRobotDataset(cfg.repo_id, root=cfg.root)
+    output_repo_id, output_dir = get_output_path(
+        cfg.repo_id,
+        new_repo_id=cfg.new_repo_id,
+        root=cfg.root,
+        new_root=cfg.new_root,
+    )
+
+    # In case of in-place modification, make the dataset point to the backup directory
+    if output_dir == dataset.root:
+        dataset.root = dataset.root.with_name(dataset.root.name + "_old")
+
+    logging.info(
+        f"Trimming episode {cfg.operation.episode_index} of {cfg.repo_id} to "
+        f"[{cfg.operation.start_frame}, {cfg.operation.end_frame})"
+    )
+    new_dataset = trim_episode(
+        dataset,
+        episode_index=cfg.operation.episode_index,
+        start_frame=cfg.operation.start_frame,
+        end_frame=cfg.operation.end_frame,
         output_dir=output_dir,
         repo_id=output_repo_id,
     )
@@ -703,6 +755,8 @@ def edit_dataset(cfg: EditDatasetConfig) -> None:
 
     if operation_type == "delete_episodes":
         handle_delete_episodes(cfg)
+    elif operation_type == "trim_episode":
+        handle_trim_episode(cfg)
     elif operation_type == "split":
         handle_split(cfg)
     elif operation_type == "merge":
