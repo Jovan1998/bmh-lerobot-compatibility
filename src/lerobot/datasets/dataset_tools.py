@@ -942,7 +942,15 @@ def _copy_and_reindex_videos(
                 else set()
             )
 
-            if all_in_file_set == episodes_to_keep_set and not windowed_in_file:
+            if all_in_file_set == episodes_to_keep_set:
+                # No episodes are dropped from this file, so we never need to
+                # rewrite the video bitstream. Even when one episode is being
+                # windowed (trimmed), we keep the source MP4 byte-for-byte and
+                # point the trimmed episode's from/to timestamps at the kept
+                # sub-range inside the unchanged file. Readers seek to those
+                # offsets and only decode the kept frames; the discarded
+                # frames stay in the file but are never referenced. This makes
+                # trim lossless and turns it into a plain file copy.
                 assert src_dataset.meta.video_path is not None
                 src_video_path = src_dataset.root / src_dataset.meta.video_path.format(
                     video_key=video_key, chunk_index=src_chunk_idx, file_index=src_file_idx
@@ -956,14 +964,19 @@ def _copy_and_reindex_videos(
                 for old_idx in episodes_in_file:
                     new_idx = episode_mapping[old_idx]
                     src_ep = src_dataset.meta.episodes[old_idx]
+                    orig_from_ts = float(src_ep[f"videos/{video_key}/from_timestamp"])
+                    orig_to_ts = float(src_ep[f"videos/{video_key}/to_timestamp"])
+                    if old_idx in windowed_in_file:
+                        start, end = episode_frame_window[old_idx]
+                        from_ts = orig_from_ts + start / src_dataset.meta.fps
+                        to_ts = orig_from_ts + end / src_dataset.meta.fps
+                    else:
+                        from_ts = orig_from_ts
+                        to_ts = orig_to_ts
                     episodes_video_metadata[new_idx][f"videos/{video_key}/chunk_index"] = src_chunk_idx
                     episodes_video_metadata[new_idx][f"videos/{video_key}/file_index"] = src_file_idx
-                    episodes_video_metadata[new_idx][f"videos/{video_key}/from_timestamp"] = float(
-                        src_ep[f"videos/{video_key}/from_timestamp"]
-                    )
-                    episodes_video_metadata[new_idx][f"videos/{video_key}/to_timestamp"] = float(
-                        src_ep[f"videos/{video_key}/to_timestamp"]
-                    )
+                    episodes_video_metadata[new_idx][f"videos/{video_key}/from_timestamp"] = from_ts
+                    episodes_video_metadata[new_idx][f"videos/{video_key}/to_timestamp"] = to_ts
             else:
                 # Build list of frame ranges to keep, in sorted order.
                 sorted_keep_episodes = sorted(episodes_in_file, key=lambda x: episode_mapping[x])
