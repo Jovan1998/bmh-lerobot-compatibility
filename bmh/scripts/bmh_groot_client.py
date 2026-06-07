@@ -433,7 +433,7 @@ def main(cfg: BmhInferenceConfig) -> None:
                 logger.info(
                     "inference fired at frame=%d (consumed_since_swap=%d), "
                     "remaining_at_fire=%d, fire_time=%.6f",
-                    frame_counter, consumed_since_swap, remaining_at_fire, t_start,
+                    frame_counter, consumed_since_swap, remaining_at_fire, time.perf_counter()-t_start,
                 )
 
             # 4. Sleep to next tick.
