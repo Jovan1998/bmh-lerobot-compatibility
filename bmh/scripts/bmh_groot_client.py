@@ -69,17 +69,6 @@ BIMANUAL_CAMERA_KEYS = {
     "right_wrist": "right_right_wrist",
 }
 
-# Number of leading actions of a freshly arrived chunk to *crossfade* with the
-# tail of the old chunk instead of switching to them outright. At a chunk swap
-# the new chunk's first kept action and the old chunk's next action describe the
-# same instant in time, but they come from two different policy passes, so they
-# rarely agree exactly — sending the new one cold produces a one-frame jump (the
-# seam jitter). Blending the two over the first `BLEND_FRAMES` actions with a
-# linear ramp (mostly-old → mostly-new) turns that step into a short wash-in.
-# Set to 0 to disable blending and switch hard. Must be < action_horizon.
-BLEND_FRAMES = 2
-
-
 def _blend_actions(
     old: dict[str, float], new: dict[str, float], alpha: float
 ) -> dict[str, float]:
@@ -276,6 +265,17 @@ class BmhInferenceConfig:
     # is max(refetch_after, server-latency-in-frames). Must be in
     # [1, action_horizon).
     refetch_after: int = 3
+    # Number of leading actions of a freshly arrived chunk to *crossfade* with the
+    # tail of the old chunk instead of switching to them outright. At a chunk swap
+    # the new chunk's first kept action and the old chunk's next action describe the
+    # same instant in time, but they come from two different policy passes, so they
+    # rarely agree exactly — sending the new one cold produces a one-frame jump (the
+    # seam jitter). Blending the two over the first `blend_frames` actions with a
+    # linear ramp (mostly-old → mostly-new) turns that step into a short wash-in.
+    # If the old chunk has fewer than `blend_frames` actions left (or the new chunk
+    # is shorter), the blend is clamped to whatever overlap exists. Set to 0 to
+    # disable blending and switch hard. Must be in [0, action_horizon).
+    blend_frames: int = 3
 
 
 @draccus.wrap()
@@ -291,6 +291,11 @@ def main(cfg: BmhInferenceConfig) -> None:
         raise SystemExit(
             f"--refetch_after must be in [1, action_horizon={cfg.action_horizon}); "
             f"got {cfg.refetch_after}."
+        )
+    if not 0 <= cfg.blend_frames < cfg.action_horizon:
+        raise SystemExit(
+            f"--blend_frames must be in [0, action_horizon={cfg.action_horizon}); "
+            f"got {cfg.blend_frames}."
         )
 
     robot = make_robot_from_config(cfg.robot)
@@ -407,13 +412,14 @@ def main(cfg: BmhInferenceConfig) -> None:
                 # next actions and `new_chunk[drop:]` are the new chunk's first
                 # kept actions; after the time-align above these describe the same
                 # instants but come from different policy passes, so a cold switch
-                # leaves a one-frame jump. Blend the first `BLEND_FRAMES` of them
-                # with a mostly-old → mostly-new ramp. If the old chunk had already
-                # run dry (`leftover_old` empty) the robot was holding position, so
-                # there is nothing to blend against and this is a no-op.
+                # leaves a one-frame jump. Blend the first `blend_frames` of them
+                # with a mostly-old → mostly-new ramp. The blend length is clamped
+                # to the overlap: if the old chunk has fewer actions left than
+                # `blend_frames` (or already ran dry — `leftover_old` empty, robot
+                # holding position) we interpolate over only the frames available.
                 leftover_old = current_chunk[idx:]
                 new_kept = new_chunk[drop:]
-                blend_len = min(BLEND_FRAMES, len(leftover_old), len(new_kept))
+                blend_len = min(cfg.blend_frames, len(leftover_old), len(new_kept))
                 for k in range(blend_len):
                     alpha = (k + 1) / (blend_len + 1)
                     new_kept[k] = _blend_actions(leftover_old[k], new_kept[k], alpha)
