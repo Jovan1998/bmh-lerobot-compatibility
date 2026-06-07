@@ -346,7 +346,7 @@ def main(cfg: BmhInferenceConfig) -> None:
             #    robot's current position. The chunk's action[0] is the policy's
             #    response to the observation captured when the request fired,
             #    `elapsed` frames ago — but the robot has kept moving along the
-            #    old chunk since then. Dropping the first `elapsed - 1` actions
+            #    old chunk since then. Dropping the first `elapsed` actions
             #    makes the new chunk pick up from where the robot actually is,
             #    instead of snapping it back to the fire-time pose (the cause of
             #    the back-and-forth jitter).
@@ -366,7 +366,7 @@ def main(cfg: BmhInferenceConfig) -> None:
                 if new_chunk is None:
                     raise RuntimeError("inference worker reported failure; aborting")
                 elapsed = frame_counter - fire_frame
-                drop = min(max(elapsed - 1, 0), remaining_at_fire, len(new_chunk) - 1)
+                drop = min(elapsed, remaining_at_fire, len(new_chunk) - 1)
                 leftover = max(len(current_chunk) - idx, 0)
                 logger.info(
                     "chunk swap: arrived after %d frames, dropping %d stale "
