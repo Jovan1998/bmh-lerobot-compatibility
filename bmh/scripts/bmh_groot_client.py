@@ -376,15 +376,24 @@ def main(cfg: BmhInferenceConfig) -> None:
                 elapsed = frame_counter - fire_frame
                 # Skip the `elapsed` frames the robot already advanced (capped at
                 # what it could actually consume), then trim `SKIP_LEAD` more so
-                # the chunk starts just ahead of the current pose. The final
-                # `len(new_chunk) - 1` cap guarantees at least one action survives.
+                # the chunk starts just ahead of the current pose.
+                #
+                # Final cap: keep at least `refetch_after` actions in the chunk.
+                # The re-fire trigger needs `consumed_since_swap >= refetch_after`,
+                # and `consumed_since_swap` only advances while there are actions
+                # left to send. If a high-latency swap trimmed the chunk below
+                # `refetch_after`, the trigger could never arm again and the robot
+                # would hold position forever (the bug seen when ping exceeds the
+                # action horizon). Capping here guarantees the loop always re-fires.
                 drop = min(elapsed, remaining_at_fire) + SKIP_LEAD
-                drop = min(drop, len(new_chunk) - 1)
+                drop = min(drop, max(len(new_chunk) - cfg.refetch_after, 0))
                 leftover = max(len(current_chunk) - idx, 0)
                 logger.info(
-                    "chunk swap: arrived after %d frames, dropping %d stale "
-                    "actions (remaining_at_fire=%d, lead=%d, leftover=%d)",
-                    elapsed, drop, remaining_at_fire, SKIP_LEAD, leftover,
+                    "chunk swap: %d actions arrived after %d frames, dropping %d "
+                    "stale actions, %d kept (remaining_at_fire=%d, lead=%d, "
+                    "leftover=%d)",
+                    len(new_chunk), elapsed, drop, len(new_chunk) - drop,
+                    remaining_at_fire, SKIP_LEAD, leftover,
                 )
                 current_chunk = new_chunk[drop:]
                 idx = 0
