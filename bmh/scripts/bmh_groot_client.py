@@ -69,6 +69,14 @@ BIMANUAL_CAMERA_KEYS = {
     "right_wrist": "right_right_wrist",
 }
 
+# Extra leading actions to drop from a freshly arrived chunk, on top of the
+# `elapsed` in-flight frames. The elapsed-frame skip only re-syncs the chunk to
+# where the robot *already is*; the residual jitter comes from the new chunk
+# still starting a hair behind the robot's true motion. Trimming a couple more
+# leading actions makes the chunk pick up slightly *ahead* of the current pose,
+# which smooths the seam. Tune if the robot starts under/over-shooting at swaps.
+SKIP_LEAD = 2
+
 
 def recursive_add_extra_dim(obs: dict) -> dict:
     """Recursively prepend a size-1 leading dim. Called twice to inject (B=1, T=1)."""
@@ -366,12 +374,17 @@ def main(cfg: BmhInferenceConfig) -> None:
                 if new_chunk is None:
                     raise RuntimeError("inference worker reported failure; aborting")
                 elapsed = frame_counter - fire_frame
-                drop = min(elapsed, remaining_at_fire, len(new_chunk) - 1)
+                # Skip the `elapsed` frames the robot already advanced (capped at
+                # what it could actually consume), then trim `SKIP_LEAD` more so
+                # the chunk starts just ahead of the current pose. The final
+                # `len(new_chunk) - 1` cap guarantees at least one action survives.
+                drop = min(elapsed, remaining_at_fire) + SKIP_LEAD
+                drop = min(drop, len(new_chunk) - 1)
                 leftover = max(len(current_chunk) - idx, 0)
                 logger.info(
                     "chunk swap: arrived after %d frames, dropping %d stale "
-                    "actions (remaining_at_fire=%d, leftover=%d)",
-                    elapsed, drop, remaining_at_fire, leftover,
+                    "actions (remaining_at_fire=%d, lead=%d, leftover=%d)",
+                    elapsed, drop, remaining_at_fire, SKIP_LEAD, leftover,
                 )
                 current_chunk = new_chunk[drop:]
                 idx = 0
