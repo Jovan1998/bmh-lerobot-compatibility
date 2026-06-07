@@ -69,13 +69,27 @@ BIMANUAL_CAMERA_KEYS = {
     "right_wrist": "right_right_wrist",
 }
 
-# Extra leading actions to drop from a freshly arrived chunk, on top of the
-# `elapsed` in-flight frames. The elapsed-frame skip only re-syncs the chunk to
-# where the robot *already is*; the residual jitter comes from the new chunk
-# still starting a hair behind the robot's true motion. Trimming a couple more
-# leading actions makes the chunk pick up slightly *ahead* of the current pose,
-# which smooths the seam. Tune if the robot starts under/over-shooting at swaps.
-SKIP_LEAD = 2
+# Number of leading actions of a freshly arrived chunk to *crossfade* with the
+# tail of the old chunk instead of switching to them outright. At a chunk swap
+# the new chunk's first kept action and the old chunk's next action describe the
+# same instant in time, but they come from two different policy passes, so they
+# rarely agree exactly — sending the new one cold produces a one-frame jump (the
+# seam jitter). Blending the two over the first `BLEND_FRAMES` actions with a
+# linear ramp (mostly-old → mostly-new) turns that step into a short wash-in.
+# Set to 0 to disable blending and switch hard. Must be < action_horizon.
+BLEND_FRAMES = 2
+
+
+def _blend_actions(
+    old: dict[str, float], new: dict[str, float], alpha: float
+) -> dict[str, float]:
+    """Convex blend of two joint-command dicts: ``(1 - alpha) * old + alpha * new``.
+
+    Used to crossfade the seam between a retiring action chunk and a freshly
+    arrived one. ``alpha`` near 0 keeps the old command, near 1 takes the new.
+    Iterates over `new`'s keys; both dicts carry the same SO-joint key set.
+    """
+    return {k: (1.0 - alpha) * old[k] + alpha * new[k] for k in new}
 
 
 def recursive_add_extra_dim(obs: dict) -> dict:
@@ -374,28 +388,44 @@ def main(cfg: BmhInferenceConfig) -> None:
                 if new_chunk is None:
                     raise RuntimeError("inference worker reported failure; aborting")
                 elapsed = frame_counter - fire_frame
-                # Skip the `elapsed` frames the robot already advanced (capped at
-                # what it could actually consume), then trim `SKIP_LEAD` more so
-                # the chunk starts just ahead of the current pose.
+                # Drop the `elapsed` frames the robot already advanced along the
+                # old chunk (capped at what it could actually consume), so the new
+                # chunk picks up from where the robot *is*, not from the fire-time
+                # pose (the cause of the back-and-forth jitter).
                 #
-                # Final cap: keep at least `refetch_after` actions in the chunk.
-                # The re-fire trigger needs `consumed_since_swap >= refetch_after`,
-                # and `consumed_since_swap` only advances while there are actions
-                # left to send. If a high-latency swap trimmed the chunk below
-                # `refetch_after`, the trigger could never arm again and the robot
-                # would hold position forever (the bug seen when ping exceeds the
-                # action horizon). Capping here guarantees the loop always re-fires.
-                drop = min(elapsed, remaining_at_fire) + SKIP_LEAD
+                # Cap: keep at least `refetch_after` actions in the chunk. The
+                # re-fire trigger needs `consumed_since_swap >= refetch_after`, and
+                # that counter only advances while there are actions left to send.
+                # If a high-latency swap trimmed the chunk below `refetch_after`,
+                # the trigger could never arm again and the robot would hold
+                # position forever (the bug seen when ping exceeds the action
+                # horizon). Capping here guarantees the loop always re-fires.
+                drop = min(elapsed, remaining_at_fire)
                 drop = min(drop, max(len(new_chunk) - cfg.refetch_after, 0))
-                leftover = max(len(current_chunk) - idx, 0)
+
+                # Crossfade the seam. `current_chunk[idx:]` are the old chunk's
+                # next actions and `new_chunk[drop:]` are the new chunk's first
+                # kept actions; after the time-align above these describe the same
+                # instants but come from different policy passes, so a cold switch
+                # leaves a one-frame jump. Blend the first `BLEND_FRAMES` of them
+                # with a mostly-old → mostly-new ramp. If the old chunk had already
+                # run dry (`leftover_old` empty) the robot was holding position, so
+                # there is nothing to blend against and this is a no-op.
+                leftover_old = current_chunk[idx:]
+                new_kept = new_chunk[drop:]
+                blend_len = min(BLEND_FRAMES, len(leftover_old), len(new_kept))
+                for k in range(blend_len):
+                    alpha = (k + 1) / (blend_len + 1)
+                    new_kept[k] = _blend_actions(leftover_old[k], new_kept[k], alpha)
+
                 logger.info(
                     "chunk swap: %d actions arrived after %d frames, dropping %d "
-                    "stale actions, %d kept (remaining_at_fire=%d, lead=%d, "
-                    "leftover=%d)",
-                    len(new_chunk), elapsed, drop, len(new_chunk) - drop,
-                    remaining_at_fire, SKIP_LEAD, leftover,
+                    "stale actions, %d kept, %d blended "
+                    "(remaining_at_fire=%d, leftover=%d)",
+                    len(new_chunk), elapsed, drop, len(new_kept), blend_len,
+                    remaining_at_fire, len(leftover_old),
                 )
-                current_chunk = new_chunk[drop:]
+                current_chunk = new_kept
                 idx = 0
                 inflight = False
                 consumed_since_swap = 0
