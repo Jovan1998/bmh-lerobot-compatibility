@@ -248,11 +248,12 @@ class BmhInferenceConfig:
     timeout_ms: int = 15000
     jpeg_quality: int = 95
     api_token: str = ""
-    # Fire the next inference request when this many actions remain in the
-    # current chunk. 0 fires on the very last action (≈ sync); larger values
-    # give the server more time to respond at the cost of staler observations.
-    # Must be in [0, action_horizon).
-    prefetch_at: int = 3
+    # Fire the next inference request once this many actions have been consumed
+    # from the freshly swapped-in chunk. Kept small so we re-sync to the latest
+    # observation often. The in-flight guard means the effective request cadence
+    # is max(refetch_after, server-latency-in-frames). Must be in
+    # [1, action_horizon).
+    refetch_after: int = 3
 
 
 @draccus.wrap()
@@ -264,10 +265,10 @@ def main(cfg: BmhInferenceConfig) -> None:
         raise SystemExit("--lang_instruction must not be empty.")
     if not 1 <= cfg.jpeg_quality <= 100:
         raise SystemExit("--jpeg_quality must be in [1, 100].")
-    if not 0 <= cfg.prefetch_at < cfg.action_horizon:
+    if not 1 <= cfg.refetch_after < cfg.action_horizon:
         raise SystemExit(
-            f"--prefetch_at must be in [0, action_horizon={cfg.action_horizon}); "
-            f"got {cfg.prefetch_at}."
+            f"--refetch_after must be in [1, action_horizon={cfg.action_horizon}); "
+            f"got {cfg.refetch_after}."
         )
 
     robot = make_robot_from_config(cfg.robot)
@@ -312,6 +313,14 @@ def main(cfg: BmhInferenceConfig) -> None:
     inflight = False
     last_action: dict[str, float] | None = None
     chunk_exhausted_at: float | None = None
+    # Monotonic per-tick frame counter (one tick == one control period at `fps`).
+    # Used to measure how many frames a request spent in flight so we can drop
+    # the chunk's stale leading actions on arrival.
+    frame_counter = 0
+    fire_frame = 0
+    # Actions consumed from the current chunk since it was swapped in; drives the
+    # `refetch_after` re-fire trigger below.
+    consumed_since_swap = 0
 
     obs_queue: queue.Queue[dict[str, Any] | None] = queue.Queue(maxsize=1)
     chunk_queue: queue.Queue[list[dict[str, float]] | None] = queue.Queue(maxsize=1)
@@ -327,8 +336,16 @@ def main(cfg: BmhInferenceConfig) -> None:
     try:
         while True:
             tick_start = time.perf_counter()
+            frame_counter += 1
 
-            # 1. Try to swap in a freshly arrived chunk (hard swap).
+            # 1. Try to swap in a freshly arrived chunk, time-aligned to the
+            #    robot's current position. The chunk's action[0] is the policy's
+            #    response to the observation captured when the request fired,
+            #    `elapsed` frames ago — but the robot has kept moving along the
+            #    old chunk since then. Dropping the first `elapsed - 1` actions
+            #    makes the new chunk pick up from where the robot actually is,
+            #    instead of snapping it back to the fire-time pose (the cause of
+            #    the back-and-forth jitter). Clamp so at least one action remains.
             try:
                 new_chunk = chunk_queue.get_nowait()
             except queue.Empty:
@@ -336,11 +353,17 @@ def main(cfg: BmhInferenceConfig) -> None:
             else:
                 if new_chunk is None:
                     raise RuntimeError("inference worker reported failure; aborting")
+                elapsed = frame_counter - fire_frame
+                drop = min(max(elapsed - 1, 0), len(new_chunk) - 1)
                 leftover = max(len(current_chunk) - idx, 0)
-                logger.info("chunk swap: leftover=%d", leftover)
-                current_chunk = new_chunk
+                logger.info(
+                    "chunk swap: arrived after %d frames, dropping %d stale "
+                    "actions (leftover=%d)", elapsed, drop, leftover,
+                )
+                current_chunk = new_chunk[drop:]
                 idx = 0
                 inflight = False
+                consumed_since_swap = 0
                 chunk_exhausted_at = None
 
             # 2. Send an action (or hold position if we ran out).
@@ -349,6 +372,7 @@ def main(cfg: BmhInferenceConfig) -> None:
                 robot.send_action(action)
                 last_action = action
                 idx += 1
+                consumed_since_swap += 1
                 chunk_exhausted_at = None
             else:
                 if chunk_exhausted_at is None:
@@ -358,15 +382,20 @@ def main(cfg: BmhInferenceConfig) -> None:
                     robot.send_action(last_action)
                 logger.warning("late chunk: gap=%.1f ms (holding position)", gap_ms)
 
-            # 3. Fire prefetch if the trigger condition is met and nothing is
-            # currently in flight.
-            remaining = len(current_chunk) - idx
-            if not inflight and remaining == cfg.prefetch_at:
+            # 3. Fire the next request once we've consumed `refetch_after`
+            #    actions from the current chunk and nothing is already in flight.
+            #    Record the fire frame so the swap above can measure round-trip
+            #    latency in frames and trim the stale lead accordingly.
+            if not inflight and consumed_since_swap >= cfg.refetch_after:
                 obs = robot.get_observation()
                 obs["lang"] = cfg.lang_instruction
                 obs_queue.put(obs)
                 inflight = True
-                logger.debug("inference fired at remaining=%d", remaining)
+                fire_frame = frame_counter
+                logger.debug(
+                    "inference fired at frame=%d (consumed_since_swap=%d)",
+                    frame_counter, consumed_since_swap,
+                )
 
             # 4. Sleep to next tick.
             sleep = period - (time.perf_counter() - tick_start)
