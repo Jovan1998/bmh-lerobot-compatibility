@@ -318,6 +318,10 @@ def main(cfg: BmhInferenceConfig) -> None:
     # the chunk's stale leading actions on arrival.
     frame_counter = 0
     fire_frame = 0
+    # Actions left in the old chunk when the in-flight request fired. The robot
+    # can advance through at most this many actions before it runs dry and holds
+    # position, so it bounds how many leading actions we may skip on arrival.
+    remaining_at_fire = 0
     # Actions consumed from the current chunk since it was swapped in; drives the
     # `refetch_after` re-fire trigger below.
     consumed_since_swap = 0
@@ -345,7 +349,15 @@ def main(cfg: BmhInferenceConfig) -> None:
             #    old chunk since then. Dropping the first `elapsed - 1` actions
             #    makes the new chunk pick up from where the robot actually is,
             #    instead of snapping it back to the fire-time pose (the cause of
-            #    the back-and-forth jitter). Clamp so at least one action remains.
+            #    the back-and-forth jitter).
+            #
+            #    The skip is bounded by `remaining_at_fire`: if the old chunk ran
+            #    out before this one arrived (a full gap), the robot was *holding
+            #    position*, not advancing, for those extra frames — so they must
+            #    not be skipped. Without this bound a gap would drop almost the
+            #    whole new chunk, leaving fewer than `refetch_after` actions, so
+            #    the re-fire trigger below could never arm again and the robot
+            #    would hold forever.
             try:
                 new_chunk = chunk_queue.get_nowait()
             except queue.Empty:
@@ -354,11 +366,12 @@ def main(cfg: BmhInferenceConfig) -> None:
                 if new_chunk is None:
                     raise RuntimeError("inference worker reported failure; aborting")
                 elapsed = frame_counter - fire_frame
-                drop = min(max(elapsed - 1, 0), len(new_chunk) - 1)
+                drop = min(max(elapsed - 1, 0), remaining_at_fire, len(new_chunk) - 1)
                 leftover = max(len(current_chunk) - idx, 0)
                 logger.info(
                     "chunk swap: arrived after %d frames, dropping %d stale "
-                    "actions (leftover=%d)", elapsed, drop, leftover,
+                    "actions (remaining_at_fire=%d, leftover=%d)",
+                    elapsed, drop, remaining_at_fire, leftover,
                 )
                 current_chunk = new_chunk[drop:]
                 idx = 0
@@ -384,14 +397,16 @@ def main(cfg: BmhInferenceConfig) -> None:
 
             # 3. Fire the next request once we've consumed `refetch_after`
             #    actions from the current chunk and nothing is already in flight.
-            #    Record the fire frame so the swap above can measure round-trip
-            #    latency in frames and trim the stale lead accordingly.
+            #    Record the fire frame and how many actions are still queued so
+            #    the swap above can measure round-trip latency in frames and cap
+            #    the stale-lead trim at what the robot can actually consume.
             if not inflight and consumed_since_swap >= cfg.refetch_after:
                 obs = robot.get_observation()
                 obs["lang"] = cfg.lang_instruction
                 obs_queue.put(obs)
                 inflight = True
                 fire_frame = frame_counter
+                remaining_at_fire = max(len(current_chunk) - idx, 0)
                 logger.debug(
                     "inference fired at frame=%d (consumed_since_swap=%d)",
                     frame_counter, consumed_since_swap,
