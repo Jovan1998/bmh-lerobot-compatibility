@@ -429,7 +429,7 @@ def main(cfg: BmhInferenceConfig) -> None:
                 inflight = True
                 fire_frame = frame_counter
                 remaining_at_fire = max(len(current_chunk) - idx, 0)
-                logger.debug(
+                logger.info(
                     "inference fired at frame=%d (consumed_since_swap=%d)",
                     frame_counter, consumed_since_swap,
                 )
