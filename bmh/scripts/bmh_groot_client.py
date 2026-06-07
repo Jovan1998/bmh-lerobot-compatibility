@@ -423,6 +423,7 @@ def main(cfg: BmhInferenceConfig) -> None:
             #    the swap above can measure round-trip latency in frames and cap
             #    the stale-lead trim at what the robot can actually consume.
             if not inflight and consumed_since_swap >= cfg.refetch_after:
+                t_start = time.perf_counter()
                 obs = robot.get_observation()
                 obs["lang"] = cfg.lang_instruction
                 obs_queue.put(obs)
@@ -430,8 +431,9 @@ def main(cfg: BmhInferenceConfig) -> None:
                 fire_frame = frame_counter
                 remaining_at_fire = max(len(current_chunk) - idx, 0)
                 logger.info(
-                    "inference fired at frame=%d (consumed_since_swap=%d)",
-                    frame_counter, consumed_since_swap,
+                    "inference fired at frame=%d (consumed_since_swap=%d), "
+                    "remaining_at_fire=%d, fire_time=%.6f",
+                    frame_counter, consumed_since_swap, remaining_at_fire, t_start,
                 )
 
             # 4. Sleep to next tick.
