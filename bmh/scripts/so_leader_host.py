@@ -5,12 +5,21 @@ Leader Host — runs on Pi A (leader Pi).
 Reads two SO-101 leader arms via USB and streams their joint positions
 over ZMQ PUSH sockets to the follower Pi.
 
+BMH-101: the head servos (head_pan/head_tilt, IDs 8/9) ride the LEFT arm's
+serial bus, so the left leader is created with with_head=True by default
+(disable with --no-left_with_head). The follower side must be configured
+with the matching `with_head` value: if the leader streams head keys the
+follower doesn't expect, the follower raises a KeyError; if the follower
+expects head keys the leader doesn't send, the follower head silently
+holds position.
+
 Usage:
     python so_leader_host.py \
         --left_port /dev/ttyACM0 \
         --right_port /dev/ttyACM1 \
         --left_zmq_port 5555 \
         --right_zmq_port 5557 \
+        --left_with_head \
         --fps 60
 
 Single arm mode:
@@ -21,6 +30,7 @@ Single arm mode:
 """
 
 import argparse
+import contextlib
 import json
 import logging
 import time
@@ -39,11 +49,11 @@ def create_push_socket(context: zmq.Context, port: int) -> zmq.Socket:
     return sock
 
 
-def create_leader(port: str, arm_id: str):
+def create_leader(port: str, arm_id: str, with_head: bool = False):
     """Create and connect an SOLeader arm."""
     from lerobot.teleoperators.so_leader import SOLeader, SOLeaderTeleopConfig
 
-    config = SOLeaderTeleopConfig(port=port, id=arm_id)
+    config = SOLeaderTeleopConfig(port=port, id=arm_id, with_head=with_head)
     leader = SOLeader(config)
     leader.connect()
     return leader
@@ -57,7 +67,15 @@ def main():
     parser.add_argument("--right_zmq_port", type=int, default=5557, help="ZMQ port for right arm stream")
     parser.add_argument("--fps", type=int, default=60, help="Target loop frequency in Hz")
     parser.add_argument("--left_id", type=str, default="so_leader_left", help="Calibration ID for left arm")
-    parser.add_argument("--right_id", type=str, default="so_leader_right", help="Calibration ID for right arm")
+    parser.add_argument(
+        "--right_id", type=str, default="so_leader_right", help="Calibration ID for right arm"
+    )
+    parser.add_argument(
+        "--left_with_head",
+        action=argparse.BooleanOptionalAction,
+        default=True,
+        help="Whether the left arm's bus carries the head servos (head_pan/head_tilt, IDs 8/9)",
+    )
     args = parser.parse_args()
 
     if not args.left_port and not args.right_port:
@@ -65,11 +83,10 @@ def main():
 
     zmq_context = zmq.Context()
     leaders = []
-    sockets = []
 
     try:
         if args.left_port:
-            left_leader = create_leader(args.left_port, args.left_id)
+            left_leader = create_leader(args.left_port, args.left_id, with_head=args.left_with_head)
             left_socket = create_push_socket(zmq_context, args.left_zmq_port)
             leaders.append(("left", left_leader, left_socket))
             logger.info(f"Left leader arm on {args.left_port} → ZMQ :{args.left_zmq_port}")
@@ -92,10 +109,9 @@ def main():
                 except ConnectionError as e:
                     logger.warning(f"{name} arm read error, skipping frame: {e}")
                     continue
-                try:
+                # zmq.Again: no receiver connected yet, drop frame
+                with contextlib.suppress(zmq.Again):
                     socket.send_string(json.dumps(action), zmq.NOBLOCK)
-                except zmq.Again:
-                    pass  # no receiver connected yet, drop frame
 
             elapsed = time.perf_counter() - loop_start
             sleep_time = loop_dt - elapsed

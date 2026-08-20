@@ -29,6 +29,9 @@ class SOLeaderConfig:
     # Whether to use degrees for angles
     use_degrees: bool = True
 
+    # BMH-101: head_pan/head_tilt (IDs 8/9) ride the LEFT arm's serial bus
+    with_head: bool = False
+
 
 @TeleoperatorConfig.register_subclass("so101_leader")
 @TeleoperatorConfig.register_subclass("so100_leader")

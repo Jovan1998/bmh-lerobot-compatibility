@@ -2,22 +2,28 @@ import json
 import logging
 from functools import cached_property
 
+from lerobot.teleoperators.teleoperator import Teleoperator
 from lerobot.utils.decorators import check_if_already_connected, check_if_not_connected
 from lerobot.utils.errors import DeviceNotConnectedError
 
-from lerobot.teleoperators.teleoperator import Teleoperator
 from .config_so_network_leader import SONetworkLeaderConfig
 
 logger = logging.getLogger(__name__)
 
-# The 6 motor keys that SOLeader.get_action() produces
-MOTOR_NAMES = [
+# The motor keys that SOLeader.get_action() produces
+ARM_MOTOR_NAMES = [
     "shoulder_pan",
     "shoulder_lift",
     "elbow_flex",
     "wrist_flex",
+    "wrist_yaw",
     "wrist_roll",
     "gripper",
+]
+# BMH-101: head_pan/head_tilt ride the LEFT arm's serial bus (with_head=True)
+HEAD_MOTOR_NAMES = [
+    "head_pan",
+    "head_tilt",
 ]
 
 
@@ -43,7 +49,8 @@ class SONetworkLeader(Teleoperator):
 
     @cached_property
     def action_features(self) -> dict[str, type]:
-        return {f"{motor}.pos": float for motor in MOTOR_NAMES}
+        motor_names = ARM_MOTOR_NAMES + (HEAD_MOTOR_NAMES if self.config.with_head else [])
+        return {f"{motor}.pos": float for motor in motor_names}
 
     @cached_property
     def feedback_features(self) -> dict[str, type]:

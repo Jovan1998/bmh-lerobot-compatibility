@@ -22,6 +22,10 @@ class SONetworkLeaderBaseConfig:
     # Must match the leader's use_degrees setting
     use_degrees: bool = True
 
+    # BMH-101: head_pan/head_tilt (IDs 8/9) ride the LEFT arm's serial bus.
+    # Must match the leader host's with_head setting.
+    with_head: bool = False
+
 
 @TeleoperatorConfig.register_subclass("so_network_leader")
 @dataclass

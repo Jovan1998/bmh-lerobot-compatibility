@@ -48,8 +48,8 @@ def _make_bus_mock() -> MagicMock:
     return bus
 
 
-@pytest.fixture
-def follower():
+@contextmanager
+def _patched_follower(**cfg_kwargs):
     bus_mock = _make_bus_mock()
 
     def _bus_side_effect(*_args, **kwargs):
@@ -71,11 +71,42 @@ def follower():
         ),
         patch.object(SO100Follower, "configure", lambda self: None),
     ):
-        cfg = SO100FollowerConfig(port="/dev/null")
+        cfg = SO100FollowerConfig(port="/dev/null", **cfg_kwargs)
         robot = SO100Follower(cfg)
         yield robot
         if robot.is_connected:
             robot.disconnect()
+
+
+@pytest.fixture
+def follower():
+    with _patched_follower() as robot:
+        yield robot
+
+
+def test_motor_layout(follower):
+    # BMH-101 arm: 7 motors, IDs 7 (shoulder_pan) down to 1 (gripper), no head by default
+    assert list(follower.bus.motors) == [
+        "shoulder_pan",
+        "shoulder_lift",
+        "elbow_flex",
+        "wrist_flex",
+        "wrist_yaw",
+        "wrist_roll",
+        "gripper",
+    ]
+    assert [m.id for m in follower.bus.motors.values()] == [7, 6, 5, 4, 3, 2, 1]
+    assert "head_pan.pos" not in follower.action_features
+
+
+def test_motor_layout_with_head():
+    with _patched_follower(with_head=True) as robot:
+        assert len(robot.bus.motors) == 9
+        assert list(robot.bus.motors)[-2:] == ["head_pan", "head_tilt"]
+        assert [robot.bus.motors[m].id for m in ("head_pan", "head_tilt")] == [8, 9]
+        assert "head_pan.pos" in robot.action_features
+        assert "head_tilt.pos" in robot.action_features
+        assert "head_pan.pos" in robot.observation_features
 
 
 def test_connect_disconnect(follower):

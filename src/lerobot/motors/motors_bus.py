@@ -847,6 +847,57 @@ class SerialMotorsBus(MotorsBusBase):
 
         return mins, maxes
 
+    def center_homings_on_ranges(
+        self,
+        homing_offsets: dict[str, Value],
+        range_mins: dict[str, Value],
+        range_maxes: dict[str, Value],
+    ) -> tuple[dict[str, Value], dict[str, Value], dict[str, Value]]:
+        """Shift each motor's homing offset so its recorded range is centered on the half-turn position.
+
+        Given the homing offsets written by :meth:`set_half_turn_homings` and the ranges recorded by
+        :meth:`record_ranges_of_motion`, compute new homing offsets such that the midpoint of each
+        recorded range lands exactly on the half-turn position (e.g. `2047` on a 12-bit encoder). With
+        DEGREES normalization (which reads 0° at the range midpoint), this makes the zero position the
+        physical center of the mechanical range, independent of where the operator hand-placed the joint
+        before calibration. Range limits are shifted by the same amount so they keep describing the same
+        physical travel.
+
+        Pure dict math — no bus I/O. The caller is expected to write the results via
+        :meth:`write_calibration`.
+
+        Args:
+            homing_offsets: Mapping *motor name → homing offset* currently written to the motors.
+            range_mins: Mapping *motor name → recorded range minimum* (raw ticks).
+            range_maxes: Mapping *motor name → recorded range maximum* (raw ticks).
+
+        Returns:
+            tuple[dict[str, Value], dict[str, Value], dict[str, Value]]: The recentered
+                *(homing_offsets, range_mins, range_maxes)*.
+        """
+        new_offsets: dict[str, Value] = {}
+        new_mins: dict[str, Value] = {}
+        new_maxes: dict[str, Value] = {}
+        for motor, offset in homing_offsets.items():
+            max_res = self.model_resolution_table[self._get_motor_model(motor)] - 1
+            half_turn = int(max_res / 2)
+            mid = (int(range_mins[motor]) + int(range_maxes[motor])) // 2
+            target_offset = int(offset) + (mid - half_turn)
+            # Homing_Offset is sign-magnitude with an 11-bit magnitude → clamp to ±half_turn.
+            new_offset = min(half_turn, max(-half_turn, target_offset))
+            if new_offset != target_offset:
+                logger.warning(
+                    f"Homing offset for '{motor}' clamped to {new_offset} (wanted {target_offset}). "
+                    "Its zero position will be off-center; re-run calibration with the joint closer "
+                    "to the middle of its range."
+                )
+            applied = new_offset - int(offset)
+            new_offsets[motor] = new_offset
+            new_mins[motor] = int(range_mins[motor]) - applied
+            new_maxes[motor] = int(range_maxes[motor]) - applied
+
+        return new_offsets, new_mins, new_maxes
+
     def _normalize(self, ids_values: dict[int, int]) -> dict[int, float]:
         if not self.calibration:
             raise RuntimeError(f"{self} has no calibration registered.")

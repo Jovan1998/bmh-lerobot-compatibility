@@ -40,16 +40,22 @@ class SOLeader(Teleoperator):
         super().__init__(config)
         self.config = config
         norm_mode_body = MotorNormMode.DEGREES if config.use_degrees else MotorNormMode.RANGE_M100_100
+        motors = {
+            "shoulder_pan": Motor(7, "sts3215", norm_mode_body),
+            "shoulder_lift": Motor(6, "sts3215", norm_mode_body),
+            "elbow_flex": Motor(5, "sts3215", norm_mode_body),
+            "wrist_flex": Motor(4, "sts3215", norm_mode_body),
+            "wrist_yaw": Motor(3, "sts3215", norm_mode_body),
+            "wrist_roll": Motor(2, "sts3215", norm_mode_body),
+            "gripper": Motor(1, "sts3215", MotorNormMode.RANGE_0_100),
+        }
+        if config.with_head:
+            # BMH-101: head_pan/head_tilt (IDs 8/9) ride the LEFT arm's serial bus
+            motors["head_pan"] = Motor(8, "sts3215", norm_mode_body)
+            motors["head_tilt"] = Motor(9, "sts3215", norm_mode_body)
         self.bus = FeetechMotorsBus(
             port=self.config.port,
-            motors={
-                "shoulder_pan": Motor(1, "sts3215", norm_mode_body),
-                "shoulder_lift": Motor(2, "sts3215", norm_mode_body),
-                "elbow_flex": Motor(3, "sts3215", norm_mode_body),
-                "wrist_flex": Motor(4, "sts3215", norm_mode_body),
-                "wrist_roll": Motor(5, "sts3215", norm_mode_body),
-                "gripper": Motor(6, "sts3215", MotorNormMode.RANGE_0_100),
-            },
+            motors=motors,
             calibration=self.calibration,
         )
 
@@ -97,18 +103,17 @@ class SOLeader(Teleoperator):
         for motor in self.bus.motors:
             self.bus.write("Operating_Mode", motor, OperatingMode.POSITION.value)
 
-        input(f"Move {self} to the middle of its range of motion and press ENTER....")
+        input(f"Move {self} roughly to the middle of its range of motion and press ENTER....")
         homing_offsets = self.bus.set_half_turn_homings()
 
-        full_turn_motor = "wrist_roll"
-        unknown_range_motors = [motor for motor in self.bus.motors if motor != full_turn_motor]
         print(
-            f"Move all joints except '{full_turn_motor}' sequentially through their "
+            "Move all joints (including wrist_roll) sequentially through their "
             "entire ranges of motion.\nRecording positions. Press ENTER to stop..."
         )
-        range_mins, range_maxes = self.bus.record_ranges_of_motion(unknown_range_motors)
-        range_mins[full_turn_motor] = 0
-        range_maxes[full_turn_motor] = 4095
+        range_mins, range_maxes = self.bus.record_ranges_of_motion()
+        homing_offsets, range_mins, range_maxes = self.bus.center_homings_on_ranges(
+            homing_offsets, range_mins, range_maxes
+        )
 
         self.calibration = {}
         for motor, m in self.bus.motors.items():

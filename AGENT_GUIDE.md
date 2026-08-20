@@ -86,7 +86,7 @@ lerobot-setup-motors --robot.type=so101_follower --robot.port=<FOLLOWER_PORT>
 lerobot-setup-motors --teleop.type=so101_leader  --teleop.port=<LEADER_PORT>
 ```
 
-**4.4 Calibrate** — center all joints, press Enter, sweep each joint through its full range. The `id` is the calibration key — reuse it everywhere.
+**4.4 Calibrate** — roughly center all joints (precision doesn't matter — the zero is auto-centered from the recorded range), press Enter, then sweep **every** joint (including wrist roll and, on the left arm, the head) through its full range. The `id` is the calibration key — reuse it everywhere.
 
 ```bash
 lerobot-calibrate --robot.type=so101_follower --robot.port=<FOLLOWER_PORT> --robot.id=my_follower

@@ -14,6 +14,7 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+import logging
 import re
 from unittest.mock import patch
 
@@ -358,3 +359,42 @@ def test_sync_write_by_value_dict(data_name, ids_values, dummy_motors):
     mock__encode_sign.assert_called_once_with(data_name, ids_values)
     if data_name in bus.normalized_data:
         mock__unnormalize.assert_called_once_with(ids_values)
+
+
+def test_center_homings_on_ranges(dummy_motors):
+    bus = MockMotorsBus("/dev/dummy-port", dummy_motors)
+    # dummy_1/dummy_3 are model_2 (resolution 1024 → half-turn 511),
+    # dummy_2 is model_3 (resolution 4096 → half-turn 2047)
+    half_turns = {"dummy_1": 511, "dummy_2": 2047, "dummy_3": 511}
+    homing_offsets = {"dummy_1": -20, "dummy_2": 100, "dummy_3": 0}
+    range_mins = {"dummy_1": 100, "dummy_2": 1000, "dummy_3": 200}
+    range_maxes = {"dummy_1": 900, "dummy_2": 3000, "dummy_3": 700}
+
+    new_offsets, new_mins, new_maxes = bus.center_homings_on_ranges(homing_offsets, range_mins, range_maxes)
+
+    for motor in dummy_motors:
+        applied = new_offsets[motor] - homing_offsets[motor]
+        # offset moved by the distance from the recorded midpoint to the half-turn position
+        assert applied == (range_mins[motor] + range_maxes[motor]) // 2 - half_turns[motor]
+        # range limits shifted by the same amount (same physical travel)
+        assert new_mins[motor] == range_mins[motor] - applied
+        assert new_maxes[motor] == range_maxes[motor] - applied
+        # invariant: the shifted range is now centered on the half-turn position
+        assert (new_mins[motor] + new_maxes[motor]) // 2 == half_turns[motor]
+
+
+def test_center_homings_on_ranges_clamp_warns(dummy_motors, caplog):
+    bus = MockMotorsBus("/dev/dummy-port", dummy_motors)
+    # dummy_2 (4096 res): target offset 100 + (3500 - 2047) would exceed the ±2047 limit
+    with caplog.at_level(logging.WARNING):
+        new_offsets, new_mins, new_maxes = bus.center_homings_on_ranges(
+            {"dummy_2": 1000}, {"dummy_2": 3000}, {"dummy_2": 4000}
+        )
+
+    assert new_offsets["dummy_2"] == 2047
+    assert "clamped" in caplog.text
+    applied = 2047 - 1000
+    assert new_mins["dummy_2"] == 3000 - applied
+    assert new_maxes["dummy_2"] == 4000 - applied
+    # span preserved even when clamped
+    assert new_maxes["dummy_2"] - new_mins["dummy_2"] == 1000

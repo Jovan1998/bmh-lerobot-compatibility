@@ -41,6 +41,9 @@ class SOFollowerConfig:
     # Set to `True` for backward compatibility with previous policies/dataset
     use_degrees: bool = True
 
+    # BMH-101: head_pan/head_tilt (IDs 8/9) ride the LEFT arm's serial bus
+    with_head: bool = False
+
 
 @RobotConfig.register_subclass("so101_follower")
 @RobotConfig.register_subclass("so100_follower")

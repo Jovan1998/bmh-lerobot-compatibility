@@ -1,9 +1,9 @@
 import logging
 from functools import cached_property
 
+from lerobot.teleoperators.teleoperator import Teleoperator
 from lerobot.utils.decorators import check_if_already_connected, check_if_not_connected
 
-from lerobot.teleoperators.teleoperator import Teleoperator
 from ..so_network_leader import SONetworkLeader
 from ..so_network_leader.config_so_network_leader import SONetworkLeaderConfig
 from .config_bi_so_network_leader import BiSONetworkLeaderConfig
@@ -34,6 +34,7 @@ class BiSONetworkLeader(Teleoperator):
             polling_timeout_ms=config.left_arm_config.polling_timeout_ms,
             connect_timeout_s=config.left_arm_config.connect_timeout_s,
             use_degrees=config.left_arm_config.use_degrees,
+            with_head=config.left_arm_config.with_head,
         )
 
         right_arm_config = SONetworkLeaderConfig(
@@ -44,6 +45,7 @@ class BiSONetworkLeader(Teleoperator):
             polling_timeout_ms=config.right_arm_config.polling_timeout_ms,
             connect_timeout_s=config.right_arm_config.connect_timeout_s,
             use_degrees=config.right_arm_config.use_degrees,
+            with_head=config.right_arm_config.with_head,
         )
 
         self.left_arm = SONetworkLeader(left_arm_config)
