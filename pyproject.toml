@@ -299,6 +299,7 @@ lerobot-edit-dataset="lerobot.scripts.lerobot_edit_dataset:main"
 lerobot-setup-can="lerobot.scripts.lerobot_setup_can:main"
 lerobot-rollout="lerobot.scripts.lerobot_rollout:main"
 bmh-groot-client="bmh.scripts.bmh_groot_client:main"
+bmh-center-arm="bmh.scripts.bmh_center_arm:main"
 
 # ---------------- Tool Configurations ----------------
 [tool.setuptools.package-data]
