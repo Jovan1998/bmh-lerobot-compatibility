@@ -9,14 +9,16 @@ move, or ends far from its target, points at a wiring, ID, or calibration
 problem for that joint.
 
 The motors are ramped from their current position to center with a smoothstep
-interpolation (no single full-speed goal jump), held there briefly so the pose
-can be inspected, then torque is released.
+interpolation (no single full-speed goal jump), then hold the pose until ENTER
+is received on stdin (or stdin closes) — only then is torque released. The
+controller-app drives the release via its "Release Motors" button.
 
 Output is line-oriented and stable so the controller-app can parse it:
 
     RESULT name=shoulder_pan start=-12.4 target=0.0 end=0.3 ok=true
     ...
     CENTERING_DONE ok=true
+    HOLDING press ENTER to release the motors
 
 Exit codes: 0 = all joints reached center, 2 = some joint missed its target,
 1 = error (no calibration, port busy, ...).
@@ -27,6 +29,7 @@ Usage:
 """
 
 import argparse
+import contextlib
 import logging
 import sys
 import time
@@ -89,7 +92,12 @@ def main() -> None:
         help="Whether this arm's bus carries the head servos (head_pan/head_tilt, IDs 8/9)",
     )
     parser.add_argument("--duration", type=float, default=2.5, help="Ramp duration in seconds")
-    parser.add_argument("--hold", type=float, default=5.0, help="Seconds to hold the center pose")
+    parser.add_argument(
+        "--settle",
+        type=float,
+        default=0.5,
+        help="Seconds to let the motors settle after the ramp before measuring the end positions",
+    )
     parser.add_argument("--fps", type=int, default=30, help="Goal-position write frequency during the ramp")
     args = parser.parse_args()
 
@@ -128,9 +136,7 @@ def main() -> None:
         time.sleep(0.2)
 
         ramp_to(bus, start, targets, args.duration, args.fps)
-
-        logger.info(f"Holding center pose for {args.hold:.1f}s — check the arm visually")
-        time.sleep(args.hold)
+        time.sleep(args.settle)
 
         end = bus.sync_read("Present_Position")
         all_ok = True
@@ -143,6 +149,12 @@ def main() -> None:
                 flush=True,
             )
         print(f"CENTERING_DONE ok={'true' if all_ok else 'false'}", flush=True)
+
+        # Hold the pose under torque until the operator releases it (ENTER over
+        # stdin, stdin EOF, or Ctrl-C) — check the arm visually while it holds.
+        print("HOLDING press ENTER to release the motors", flush=True)
+        with contextlib.suppress(EOFError, KeyboardInterrupt):
+            input()
         sys.exit(0 if all_ok else 2)
     finally:
         # Release torque so the arm is free again (leader must never stay stiff);
