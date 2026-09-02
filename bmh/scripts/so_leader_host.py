@@ -55,7 +55,21 @@ def create_leader(port: str, arm_id: str, with_head: bool = False):
 
     config = SOLeaderTeleopConfig(port=port, id=arm_id, with_head=with_head)
     leader = SOLeader(config)
-    leader.connect()
+
+    if not leader.calibration:
+        raise RuntimeError(
+            f"No calibration file found for id '{arm_id}' "
+            f"(expected at {leader.calibration_fpath}). Calibrate this arm first."
+        )
+
+    # connect(calibrate=False) never triggers the interactive calibration flow —
+    # this host runs headless (no stdin), so a prompt would crash with EOFError.
+    leader.connect(calibrate=False)
+    if not leader.bus.is_calibrated:
+        # Motor registers drifted from the calibration file (e.g. replaced servo):
+        # rewrite the file values to the motors, exactly like the calibrate flow does.
+        logger.info(f"{arm_id}: motor calibration registers differ from the file — rewriting them")
+        leader.bus.write_calibration(leader.calibration)
     return leader
 
 
