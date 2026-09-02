@@ -99,10 +99,18 @@ class SOFollower(Robot):
 
         self.bus.connect()
         if not self.is_calibrated and calibrate:
-            logger.info(
-                "Mismatch between calibration values in the motor and the calibration file or no calibration file found"
-            )
-            self.calibrate()
+            if self.calibration:
+                # BMH: motor registers drifted from the calibration file (e.g. replaced
+                # servo). Auto-apply the file instead of prompting — connect() must work
+                # headless (teleoperate/record/inference run without stdin). Recalibration
+                # happens explicitly via `lerobot-calibrate`.
+                logger.info(
+                    f"Motor calibration registers differ from the file for id {self.id} — writing file values to the motors"
+                )
+                self.bus.write_calibration(self.calibration)
+            else:
+                logger.info("No calibration file found")
+                self.calibrate()
 
         for cam in self.cameras.values():
             cam.connect()
