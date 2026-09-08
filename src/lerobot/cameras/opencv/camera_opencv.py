@@ -36,6 +36,7 @@ from lerobot.utils.decorators import check_if_already_connected, check_if_not_co
 from lerobot.utils.errors import DeviceNotConnectedError
 
 from ..camera import Camera
+from ..preview import FramePreviewWriter
 from ..utils import get_cv2_rotation
 from .configuration_opencv import ColorMode, OpenCVCameraConfig
 
@@ -119,6 +120,19 @@ class OpenCVCamera(Camera):
 
         self.rotation: int | None = get_cv2_rotation(config.rotation)
         self.backend: int = config.backend
+
+        # BMH: optional low-rate JPEG preview tapped from the read thread (see FramePreviewWriter).
+        self._preview: FramePreviewWriter | None = (
+            FramePreviewWriter(
+                path=config.preview_path,
+                fps=config.preview_fps,
+                width=config.preview_width,
+                quality=config.preview_quality,
+                rotation=self.rotation,
+            )
+            if config.preview_path
+            else None
+        )
 
         if self.height and self.width:
             self.capture_width, self.capture_height = self.width, self.height
@@ -443,6 +457,10 @@ class OpenCVCamera(Camera):
         while not self.stop_event.is_set():
             try:
                 raw_frame = self._read_from_hardware()
+                if self._preview is not None:
+                    # Raw frame is BGR straight from OpenCV — what imencode expects. Rate-limited
+                    # inside, so this is a single perf_counter comparison on most frames.
+                    self._preview.maybe_write(raw_frame)
                 processed_frame = self._postprocess_image(raw_frame)
                 capture_time = time.perf_counter()
 
@@ -579,6 +597,10 @@ class OpenCVCamera(Camera):
 
         if self.thread is not None:
             self._stop_read_thread()
+
+        # Read thread is stopped, so nothing can re-create the preview file after this.
+        if self._preview is not None:
+            self._preview.close()
 
         if self.videocapture is not None:
             self.videocapture.release()

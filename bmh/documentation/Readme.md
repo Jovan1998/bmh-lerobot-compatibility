@@ -7,6 +7,7 @@ over ZMQ instead of reading from local USB.
 ## Modules
 
 ### `so_network_leader/`
+
 Drop-in replacement for `SOLeader`. Connects to a ZMQ PUSH socket on the leader Pi
 and receives joint positions as JSON.
 
@@ -14,6 +15,7 @@ and receives joint positions as JSON.
 - `so_network_leader.py` — `SONetworkLeader(Teleoperator)` implementation
 
 ### `bi_so_network_leader/`
+
 Bimanual wrapper — composes two `SONetworkLeader` instances (left + right arms
 on separate ZMQ ports). Drop-in replacement for `BiSOLeader`.
 
@@ -73,3 +75,10 @@ lerobot-record \
 
 ```
 
+> **Live preview while recording (BMH extra).** Every `opencv` camera entry also accepts optional
+> `preview_path`, `preview_fps` (default 3), `preview_width` (default 320) and `preview_quality`
+> (default 60). When `preview_path` is set, the camera's read thread writes a downscaled JPEG to that
+> path up to `preview_fps` times per second (atomic replace — put it on tmpfs such as `/dev/shm`) so
+> an external process can show a live view without opening the device a second time. The
+> controller-app sets `"preview_path": "/dev/shm/bmh-101/preview-front.jpg"` on the front camera.
+> Implementation: `src/lerobot/cameras/preview.py`.
