@@ -6,7 +6,7 @@ Runs the closed-loop control on the follower Pi:
 
     bi_so_follower.get_observation()
         ↓
-    BiSoBimanualAdapter.obs_to_policy_inputs(...)   # cameras + 12-joint state + language
+    BiSoBimanualAdapter.obs_to_policy_inputs(...)   # cameras + grouped joint state + language
         ↓
     PolicyClient.get_action(...)  →  action chunk  (ZMQ to remote GR00T server)
         ↓
@@ -16,6 +16,13 @@ Runs the closed-loop control on the follower Pi:
 
 Mirrors the spirit of Isaac-GR00T `gr00t/eval/real_robot/SO100/eval_so100.py` but
 adapted for the BMH-101 bimanual robot (bi_so_follower in the BMH LeRobot fork).
+
+The joint layout is not hardcoded: the state/action groups are derived from the
+robot's `action_features` with the same rule the platform uses at training time
+(see bmh/groot_client/layout.py). For the 7-DoF + head BMH-101 that is
+`left_single_arm` / `left_gripper` / `left_head` / `right_single_arm` /
+`right_gripper` (16 dims); the head servos ride the left arm's bus and are driven
+like any other `.pos` key.
 """
 
 import logging
@@ -30,6 +37,9 @@ import cv2
 import draccus
 import numpy as np
 
+from bmh.groot_client import PolicyClient
+from bmh.groot_client.layout import JointGroup, group_joint_names, pack_state, unpack_action
+
 # Importing the robot configs ensures draccus CLI registration is populated.
 from lerobot.cameras.opencv.configuration_opencv import OpenCVCameraConfig  # noqa: F401
 from lerobot.robots import (  # noqa: F401
@@ -41,22 +51,8 @@ from lerobot.robots import (  # noqa: F401
 )
 from lerobot.utils.utils import init_logging
 
-from bmh.groot_client import PolicyClient
-
 logger = logging.getLogger(__name__)
 
-
-# Joint order matches `bi_so_follower.get_observation()` keys, dropping the
-# `left_` / `right_` arm prefix. This is the per-arm SO-100/101 joint order
-# (matches eval_so100.py `robot_state_keys`).
-SO_JOINT_NAMES = [
-    "shoulder_pan.pos",
-    "shoulder_lift.pos",
-    "elbow_flex.pos",
-    "wrist_flex.pos",
-    "wrist_roll.pos",
-    "gripper.pos",
-]
 
 # Maps GR00T video modality key (as trained — bare `front` / `left_wrist` /
 # `right_wrist`) to the corresponding key in `bi_so_follower.get_observation()`,
@@ -69,9 +65,8 @@ BIMANUAL_CAMERA_KEYS = {
     "right_wrist": "right_right_wrist",
 }
 
-def _blend_actions(
-    old: dict[str, float], new: dict[str, float], alpha: float
-) -> dict[str, float]:
+
+def _blend_actions(old: dict[str, float], new: dict[str, float], alpha: float) -> dict[str, float]:
     """Convex blend of two joint-command dicts: ``(1 - alpha) * old + alpha * new``.
 
     Used to crossfade the seam between a retiring action chunk and a freshly
@@ -97,41 +92,40 @@ class BiSoBimanualAdapter:
     """
     Bimanual sibling of eval_so100.py's `So100Adapter`. Packs raw `bi_so_follower`
     observations into the GR00T VLA input format and decodes returned action chunks
-    back into a 12-key `{left_*, right_*}` dict that `bi_so_follower.send_action()`
-    accepts.
+    back into a `{left_*, right_*}` `.pos` dict that `bi_so_follower.send_action()`
+    accepts (one key per joint in `joint_names`, head servos included).
 
-    The state-modality key convention is `left_single_arm` (5,) /
-    `left_gripper` (1,) / `right_single_arm` (5,) / `right_gripper` (1,),
-    mirroring how eval_so100.py splits a single arm into `single_arm` +
-    `gripper`, with `left_` / `right_` prefixes for the bimanual layout.
-    The action chunk returned by the server is expected to use the same
-    modality keys; `validate_modality()` confirms this at startup against
-    `PolicyClient.get_modality_config()` and raises a clear error if the
-    trained model uses a different layout.
+    The state/action modality groups are derived from `joint_names` (the robot's
+    `action_features` keys, in order) by `bmh.groot_client.layout.group_joint_names`
+    — the same rule the platform backend uses to build the training modality, so a
+    checkpoint trained on a dataset recorded with this robot advertises exactly
+    `self.state_keys`. For the 7-DoF + head BMH-101: `left_single_arm` (6,) /
+    `left_gripper` (1,) / `left_head` (2,) / `right_single_arm` (6,) /
+    `right_gripper` (1,). `validate_modality()` confirms the server's layout at
+    startup against `PolicyClient.get_modality_config()` and raises a clear error
+    if the trained model uses a different one.
     """
 
-    STATE_KEYS = ("left_single_arm", "left_gripper", "right_single_arm", "right_gripper")
-
-    def __init__(self, policy_client: PolicyClient, jpeg_quality: int):
+    def __init__(self, policy_client: PolicyClient, jpeg_quality: int, joint_names: list[str]):
         self.policy = policy_client
         self.jpeg_quality = jpeg_quality
+        self.groups: list[JointGroup] = group_joint_names(joint_names)
+        self.state_keys: tuple[str, ...] = tuple(g.key for g in self.groups)
+        logger.info(
+            "Joint layout: %d joints in %d groups: %s",
+            len(joint_names),
+            len(self.groups),
+            {g.key: len(g.names) for g in self.groups},
+        )
 
     def obs_to_policy_inputs(self, obs: dict[str, Any]) -> dict:
         model_obs: dict[str, Any] = {}
 
         model_obs["video"] = {
-            server_key: obs[obs_key]
-            for server_key, obs_key in BIMANUAL_CAMERA_KEYS.items()
+            server_key: obs[obs_key] for server_key, obs_key in BIMANUAL_CAMERA_KEYS.items()
         }
 
-        left_state = np.array([obs[f"left_{k}"] for k in SO_JOINT_NAMES], dtype=np.float32)
-        right_state = np.array([obs[f"right_{k}"] for k in SO_JOINT_NAMES], dtype=np.float32)
-        model_obs["state"] = {
-            "left_single_arm": left_state[:5],
-            "left_gripper": left_state[5:6],
-            "right_single_arm": right_state[:5],
-            "right_gripper": right_state[5:6],
-        }
+        model_obs["state"] = pack_state(obs, self.groups)
 
         model_obs["language"] = {"annotation.human.task_description": obs["lang"]}
 
@@ -144,33 +138,24 @@ class BiSoBimanualAdapter:
         for cam_key, arr in model_obs["video"].items():
             frame = arr[0, 0]  # (H, W, 3) RGB uint8
             bgr = cv2.cvtColor(frame, cv2.COLOR_RGB2BGR)
-            ok, buf = cv2.imencode(
-                ".jpg", bgr, [cv2.IMWRITE_JPEG_QUALITY, self.jpeg_quality]
-            )
+            ok, buf = cv2.imencode(".jpg", bgr, [cv2.IMWRITE_JPEG_QUALITY, self.jpeg_quality])
             if not ok:
                 raise RuntimeError(f"JPEG encode failed for camera {cam_key!r}")
             model_obs["video"][cam_key] = buf.tobytes()
         total = sum(len(v) for v in model_obs["video"].values())
         logger.info(
             "video sent: %d cams, %.1f KiB total (Q=%d)",
-            len(model_obs["video"]), total / 1024, self.jpeg_quality,
+            len(model_obs["video"]),
+            total / 1024,
+            self.jpeg_quality,
         )
         return model_obs
 
     def decode_action_chunk(self, chunk: dict, t: int) -> dict[str, float]:
-        left_arm = chunk["left_single_arm"][0][t]      # (5,)
-        left_gripper = chunk["left_gripper"][0][t]  # (1,)
-        right_arm = chunk["right_single_arm"][0][t]    # (5,)
-        right_gripper = chunk["right_gripper"][0][t]  # (1,)
-
-        left = np.concatenate([left_arm, left_gripper], axis=0)    # (6,)
-        right = np.concatenate([right_arm, right_gripper], axis=0)  # (6,)
-
-        action: dict[str, float] = {}
-        for i, joint in enumerate(SO_JOINT_NAMES):
-            action[f"left_{joint}"] = float(left[i])
-            action[f"right_{joint}"] = float(right[i])
-        return action
+        # One `<side>_<motor>.pos` key per joint, head included. bi_so_follower
+        # routes them by prefix and so_follower writes every `.pos` key to its
+        # bus, so the head is driven without further plumbing.
+        return unpack_action(chunk, self.groups, t)
 
     def get_action(self, obs: dict) -> list[dict[str, float]]:
         model_input = self.obs_to_policy_inputs(obs)
@@ -184,37 +169,63 @@ class BiSoBimanualAdapter:
         return [self.decode_action_chunk(action_chunk, t) for t in range(horizon)]
 
     def validate_modality(self, modality_cfg: dict) -> None:
-        """Compare server's advertised state modality keys against `STATE_KEYS`.
+        """Compare the server's advertised modality keys against this robot's layout.
 
-        Raises with a clear diff if the trained model uses a different layout —
-        this catches the common "model trained with different state grouping"
-        mismatch before we ship garbage action commands to the motors.
+        State keys are compared order-sensitively against `self.state_keys` (derived
+        from the robot's joint names); video keys are compared as a set against
+        `BIMANUAL_CAMERA_KEYS`. Raises with a clear diff if the trained model uses a
+        different layout — this catches the common "model trained on a different
+        robot layout" mismatch before we ship garbage action commands to the motors.
         """
         if not modality_cfg:
-            logger.warning(
-                "Server returned an empty modality config; skipping modality validation."
-            )
+            logger.warning("Server returned an empty modality config; skipping modality validation.")
             return
 
         state_cfg = modality_cfg.get("state")
         if state_cfg is None:
             logger.warning(
-                "Server modality config has no 'state' entry; skipping modality validation. "
-                "Server keys: %s",
+                "Server modality config has no 'state' entry; skipping modality validation. Server keys: %s",
                 list(modality_cfg.keys()),
             )
             return
 
-        server_state_keys = tuple(getattr(state_cfg, "modality_keys", ()) or ())
-        if server_state_keys != self.STATE_KEYS:
+        server_state_keys = tuple(_modality_keys(state_cfg))
+        if server_state_keys != self.state_keys:
             raise SystemExit(
-                "GR00T model state modality keys do not match this bimanual adapter.\n"
-                f"  This client expects: {self.STATE_KEYS}\n"
-                f"  Server reports:      {server_state_keys}\n"
-                "Retrain the model with these keys, or extend `BiSoBimanualAdapter` "
-                "to remap them."
+                "GR00T model state modality keys do not match this robot's joint layout.\n"
+                f"  This robot expects: {self.state_keys}\n"
+                f"  Server reports:     {server_state_keys}\n"
+                "Retrain the model on data recorded with this robot layout (e.g. the "
+                "7-DoF + head BMH-101 needs a `left_head` group), or run the client on "
+                "the robot the model was trained for."
             )
-        logger.info("Modality check passed (state keys: %s).", self.STATE_KEYS)
+
+        video_cfg = modality_cfg.get("video")
+        if video_cfg is not None:
+            server_video_keys = set(_modality_keys(video_cfg))
+            expected_video_keys = set(BIMANUAL_CAMERA_KEYS)
+            if server_video_keys != expected_video_keys:
+                raise SystemExit(
+                    "GR00T model video modality keys do not match this client's cameras.\n"
+                    f"  This client expects: {sorted(expected_video_keys)}\n"
+                    f"  Server reports:      {sorted(server_video_keys)}\n"
+                    "Retrain the model with these camera keys, or extend "
+                    "`BIMANUAL_CAMERA_KEYS` to map them."
+                )
+        logger.info(
+            "Modality check passed (state keys: %s, video keys: %s).",
+            self.state_keys,
+            tuple(BIMANUAL_CAMERA_KEYS),
+        )
+
+
+def _modality_keys(section: Any) -> list[str]:
+    """`modality_keys` of one server modality section (ModalityConfig object or dict)."""
+    if isinstance(section, dict):
+        keys = section.get("modality_keys")
+    else:
+        keys = getattr(section, "modality_keys", None)
+    return [str(k) for k in (keys or [])]
 
 
 def _inference_worker(
@@ -289,13 +300,11 @@ def main(cfg: BmhInferenceConfig) -> None:
         raise SystemExit("--jpeg_quality must be in [1, 100].")
     if not 1 <= cfg.refetch_after < cfg.action_horizon:
         raise SystemExit(
-            f"--refetch_after must be in [1, action_horizon={cfg.action_horizon}); "
-            f"got {cfg.refetch_after}."
+            f"--refetch_after must be in [1, action_horizon={cfg.action_horizon}); got {cfg.refetch_after}."
         )
     if not 0 <= cfg.blend_frames < cfg.action_horizon:
         raise SystemExit(
-            f"--blend_frames must be in [0, action_horizon={cfg.action_horizon}); "
-            f"got {cfg.blend_frames}."
+            f"--blend_frames must be in [0, action_horizon={cfg.action_horizon}); got {cfg.blend_frames}."
         )
 
     robot = make_robot_from_config(cfg.robot)
@@ -310,12 +319,17 @@ def main(cfg: BmhInferenceConfig) -> None:
     )
     if not client.ping():
         robot.disconnect()
-        raise SystemExit(
-            f"Cannot reach GR00T policy server at {cfg.policy_host}:{cfg.policy_port}"
-        )
+        raise SystemExit(f"Cannot reach GR00T policy server at {cfg.policy_host}:{cfg.policy_port}")
     logger.info("Connected to GR00T server at %s:%s", cfg.policy_host, cfg.policy_port)
 
-    adapter = BiSoBimanualAdapter(client, jpeg_quality=cfg.jpeg_quality)
+    # bi_so_follower.action_features lists every `.pos` key in bus order with the
+    # left_/right_ prefix — for the BMH-101 with `--robot.left_arm_config.with_head=true`
+    # that is the same 16 names the training dataset's `features` carry.
+    adapter = BiSoBimanualAdapter(
+        client,
+        jpeg_quality=cfg.jpeg_quality,
+        joint_names=list(robot.action_features.keys()),
+    )
     try:
         modality_cfg = client.get_modality_config()
         adapter.validate_modality(modality_cfg)
@@ -428,8 +442,13 @@ def main(cfg: BmhInferenceConfig) -> None:
                     "chunk swap: %d actions arrived after %d frames, dropping %d "
                     "stale actions, %d kept, %d blended "
                     "(remaining_at_fire=%d, leftover=%d)",
-                    len(new_chunk), elapsed, drop, len(new_kept), blend_len,
-                    remaining_at_fire, len(leftover_old),
+                    len(new_chunk),
+                    elapsed,
+                    drop,
+                    len(new_kept),
+                    blend_len,
+                    remaining_at_fire,
+                    len(leftover_old),
                 )
                 current_chunk = new_kept
                 idx = 0
@@ -469,7 +488,10 @@ def main(cfg: BmhInferenceConfig) -> None:
                 logger.info(
                     "inference fired at frame=%d (consumed_since_swap=%d), "
                     "remaining_at_fire=%d, fire_time=%.6f",
-                    frame_counter, consumed_since_swap, remaining_at_fire, time.perf_counter()-t_start,
+                    frame_counter,
+                    consumed_since_swap,
+                    remaining_at_fire,
+                    time.perf_counter() - t_start,
                 )
 
             # 4. Sleep to next tick.
