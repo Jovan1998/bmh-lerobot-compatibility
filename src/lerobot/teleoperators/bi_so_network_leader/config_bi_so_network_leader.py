@@ -16,3 +16,11 @@ class BiSONetworkLeaderConfig(TeleoperatorConfig):
     right_arm_config: SONetworkLeaderBaseConfig = field(
         default_factory=lambda: SONetworkLeaderBaseConfig(port_zmq=5557)
     )
+
+    # BMH-101 group locks (left arm / right arm / head). Path to a JSON file
+    # {"left": bool, "right": bool, "head": bool} written by the controller-app.
+    # Polled with one os.stat per get_action(); only re-read when it changed.
+    # None disables locking entirely (upstream behaviour).
+    lock_file: str | None = None
+    # Seconds to ease a group from its held pose back to the live leader pose after unlock.
+    unlock_blend_s: float = 0.8

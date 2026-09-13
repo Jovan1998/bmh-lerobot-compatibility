@@ -82,3 +82,32 @@ lerobot-record \
 > an external process can show a live view without opening the device a second time. The
 > controller-app sets `"preview_path": "/dev/shm/bmh-101/preview-front.jpg"` on the front camera.
 > Implementation: `src/lerobot/cameras/preview.py`.
+
+## Teleop group locks (BMH extra)
+
+`bi_so_network_leader` can **freeze the left arm, the right arm and the head independently**
+(any combination) while teleoperating or recording. A frozen group keeps commanding the pose it
+had when the lock engaged, no matter what the leader does; on release it eases back to the live
+leader pose over `unlock_blend_s` seconds (smoothstep, default 0.8 s) instead of jumping.
+Locking a group again mid-blend holds the blended pose.
+
+- Flags: `--teleop.lock_file=<path>` enables it (default `None` = off, upstream behaviour);
+  `--teleop.unlock_blend_s=0.8` tunes the release.
+- State file: a JSON object `{"left": bool, "right": bool, "head": bool}`, replaced atomically
+  (tmp + rename) by whoever drives the UI. The controller-app writes
+  `~/.cache/bmh-101/teleop-locks.json` and passes that path on both `lerobot-teleoperate` and
+  `lerobot-record`. The teleoperator does one `os.stat` per loop tick and only re-reads the file
+  when it changed; a missing file means "all unlocked", a malformed one is logged once and ignored.
+- Groups: `left` = the 7 `left_*.pos` arm keys incl. gripper, `right` = the 7 `right_*.pos` keys,
+  `head` = `left_head_pan.pos` / `left_head_tilt.pos` (the head rides the left stream, hence the
+  explicit key sets). Every change is logged as `Teleop locks: left=on right=off head=off`.
+- **Recording:** the lock runs inside `get_action()`, so `lerobot-record` stores the held / blended
+  pose as the dataset `action` - the same values the follower was commanded, and consistent with
+  `observation.state`. Locks also hold through the inter-episode reset phase.
+- Implementation: `src/lerobot/teleoperators/bi_so_network_leader/group_lock.py`
+  (`ActionGroupLock`, `LockFileWatcher`); tests in `tests/bmh/test_group_lock.py`.
+
+```bash
+# Manual toggle from any shell on the follower Pi (the app does this for you):
+printf '{"left": true, "right": false, "head": true}' > /tmp/locks.tmp && mv /tmp/locks.tmp ~/.cache/bmh-101/teleop-locks.json
+```

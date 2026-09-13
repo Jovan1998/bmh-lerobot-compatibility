@@ -1,5 +1,7 @@
 import logging
+import time
 from functools import cached_property
+from pathlib import Path
 
 from lerobot.teleoperators.teleoperator import Teleoperator
 from lerobot.utils.decorators import check_if_already_connected, check_if_not_connected
@@ -7,6 +9,7 @@ from lerobot.utils.decorators import check_if_already_connected, check_if_not_co
 from ..so_network_leader import SONetworkLeader
 from ..so_network_leader.config_so_network_leader import SONetworkLeaderConfig
 from .config_bi_so_network_leader import BiSONetworkLeaderConfig
+from .group_lock import ActionGroupLock, LockFileWatcher, bimanual_lock_groups
 
 logger = logging.getLogger(__name__)
 
@@ -51,6 +54,21 @@ class BiSONetworkLeader(Teleoperator):
         self.left_arm = SONetworkLeader(left_arm_config)
         self.right_arm = SONetworkLeader(right_arm_config)
 
+        # BMH-101 group locks (left arm / right arm / head), driven by a JSON state file
+        # the controller-app writes. Disabled (pure passthrough) when lock_file is None.
+        self._lock = ActionGroupLock(
+            bimanual_lock_groups(left_with_head=config.left_arm_config.with_head),
+            blend_s=config.unlock_blend_s,
+        )
+        self._lock_watcher = (
+            LockFileWatcher(Path(config.lock_file).expanduser()) if config.lock_file else None
+        )
+        if self._lock_watcher is not None:
+            logger.info(
+                f"Teleop group locks enabled via {self._lock_watcher.path} "
+                f"(unlock blend {config.unlock_blend_s:.2f}s)"
+            )
+
     @cached_property
     def action_features(self) -> dict[str, type]:
         left_features = self.left_arm.action_features
@@ -93,7 +111,22 @@ class BiSONetworkLeader(Teleoperator):
         right_action = self.right_arm.get_action()
         action_dict.update({f"right_{key}": value for key, value in right_action.items()})
 
-        return action_dict
+        if self._lock_watcher is None:
+            return action_dict
+
+        # Pick up toggles from the controller-app's state file (one os.stat per tick; the
+        # file is only read when it changed), then hold / blend the locked groups. This runs
+        # before lerobot-record stores the action, so datasets contain the pose the follower
+        # was actually commanded.
+        now = time.monotonic()
+        new_locks = self._lock_watcher.poll()
+        if new_locks is not None:
+            self._lock.set_locks(new_locks)
+            logger.info(
+                "Teleop locks: %s",
+                " ".join(f"{group}={'on' if locked else 'off'}" for group, locked in new_locks.items()),
+            )
+        return self._lock.apply(action_dict, now)
 
     def send_feedback(self, feedback: dict[str, float]) -> None:
         raise NotImplementedError
