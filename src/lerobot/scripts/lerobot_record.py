@@ -433,6 +433,9 @@ def record(
             recorded_episodes = 0
             while recorded_episodes < cfg.dataset.num_episodes and not events["stop_recording"]:
                 log_say(f"Recording episode {dataset.num_episodes}", cfg.play_sounds)
+                # A "next episode" key/signal that landed while no loop was running
+                # (e.g. during a long batch video encode) must not skip this episode.
+                events["exit_early"] = False
                 record_loop(
                     robot=robot,
                     events=events,
@@ -473,6 +476,12 @@ def record(
                     events["rerecord_episode"] = False
                     events["exit_early"] = False
                     dataset.clear_episode_buffer()
+                    continue
+
+                if not dataset.has_pending_frames():
+                    # A stop/next signal on the very first loop tick leaves nothing to
+                    # save; `save_episode` would raise on the empty buffer.
+                    logging.warning("No frames were recorded for this episode, skipping save.")
                     continue
 
                 dataset.save_episode()

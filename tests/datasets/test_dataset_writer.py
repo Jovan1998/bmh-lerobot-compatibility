@@ -19,6 +19,7 @@ from pathlib import Path
 from unittest.mock import patch
 
 import numpy as np
+import pyarrow.parquet as pq
 import pytest
 import torch
 from PIL import Image
@@ -226,3 +227,116 @@ def test_finalize_then_read_roundtrip(tmp_path):
     for i in range(5):
         item = dataset[i]
         assert torch.allclose(item["state"], known_states[i], atol=1e-5)
+
+
+# ── durability: the data parquet is closed before slow video work ────
+
+
+VIDEO_FEATURES = {
+    **SIMPLE_FEATURES,
+    "observation.images.cam": {
+        "dtype": "video",
+        "shape": (8, 8, 3),
+        "names": ["height", "width", "channels"],
+    },
+}
+
+
+def _data_parquet_files(root: Path) -> list[Path]:
+    return sorted((root / "data").rglob("*.parquet"))
+
+
+def _rows_on_disk(root: Path) -> int:
+    """Row count across all data files; raises if any file lacks its footer."""
+    return sum(pq.read_table(f).num_rows for f in _data_parquet_files(root))
+
+
+def test_close_writer_rolls_to_new_data_file(tmp_path):
+    """close_writer() between episodes is a checkpoint: the closed file is left
+    untouched and the next episode goes to a fresh data file."""
+    root = tmp_path / "ds"
+    dataset = LeRobotDataset.create(
+        repo_id=DUMMY_REPO_ID, fps=DEFAULT_FPS, features=SIMPLE_FEATURES, root=root
+    )
+    for _ in range(3):
+        dataset.add_frame(_make_frame(SIMPLE_FEATURES))
+    dataset.save_episode()
+    dataset.writer.close_writer()
+
+    (first_file,) = _data_parquet_files(root)
+    first_bytes = first_file.read_bytes()
+    assert pq.read_table(first_file).num_rows == 3
+
+    for _ in range(2):
+        dataset.add_frame(_make_frame(SIMPLE_FEATURES))
+    dataset.save_episode()
+    dataset.finalize()
+
+    files = _data_parquet_files(root)
+    assert len(files) == 2
+    assert files[0].read_bytes() == first_bytes
+    assert pq.read_table(files[1]).num_rows == 2
+    assert dataset.meta.total_episodes == 2
+    assert dataset.meta.total_frames == 5
+    assert dataset[4]["state"].shape == (6,)
+
+
+def test_finalize_closes_parquet_before_video_flush(tmp_path):
+    """finalize() writes the data parquet footer *before* the (slow) video flush,
+    so a kill during encoding cannot corrupt the recorded rows."""
+    root = tmp_path / "ds"
+    dataset = LeRobotDataset.create(
+        repo_id=DUMMY_REPO_ID, fps=DEFAULT_FPS, features=SIMPLE_FEATURES, root=root
+    )
+    for _ in range(3):
+        dataset.add_frame(_make_frame(SIMPLE_FEATURES))
+    dataset.save_episode()
+
+    rows_at_flush: list[int] = []
+    with patch.object(
+        dataset.writer,
+        "flush_pending_videos",
+        side_effect=lambda: rows_at_flush.append(_rows_on_disk(root)),
+    ):
+        dataset.finalize()
+
+    assert rows_at_flush == [3]
+
+
+def test_batch_encode_checkpoints_parquet_before_encoding(tmp_path):
+    """At a batch-encode boundary the data parquet is closed (footer written) before
+    any video is encoded, and recording continues into a new data file afterwards."""
+    root = tmp_path / "ds"
+    dataset = LeRobotDataset.create(
+        repo_id=DUMMY_REPO_ID,
+        fps=DEFAULT_FPS,
+        features=VIDEO_FEATURES,
+        root=root,
+        batch_encoding_size=2,
+    )
+    rows_at_encode: list[int] = []
+
+    def fake_save_episode_video(video_key: str, episode_index: int, temp_path=None) -> dict:
+        rows_at_encode.append(_rows_on_disk(root))
+        return {
+            "episode_index": episode_index,
+            f"videos/{video_key}/chunk_index": 0,
+            f"videos/{video_key}/file_index": 0,
+            f"videos/{video_key}/from_timestamp": 0.0,
+            f"videos/{video_key}/to_timestamp": 0.1,
+        }
+
+    with patch.object(dataset.writer, "_save_episode_video", side_effect=fake_save_episode_video):
+        for _ in range(3):
+            for _ in range(3):
+                dataset.add_frame(_make_frame(VIDEO_FEATURES))
+            dataset.save_episode()
+        # Batch boundary after episode 2: both episodes' rows were on disk before encoding.
+        assert rows_at_encode == [6, 6]
+        dataset.finalize()
+
+    # finalize() checkpointed again before encoding the leftover third episode.
+    assert rows_at_encode == [6, 6, 9]
+    assert len(_data_parquet_files(root)) == 2
+    assert dataset.meta.total_episodes == 3
+    assert dataset.meta.total_frames == 9

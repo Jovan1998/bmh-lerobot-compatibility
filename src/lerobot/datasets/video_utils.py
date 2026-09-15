@@ -21,6 +21,7 @@ import queue
 import shutil
 import tempfile
 import threading
+import time
 import warnings
 from dataclasses import dataclass, field
 from fractions import Fraction
@@ -53,6 +54,11 @@ HW_ENCODERS = [
 ]
 
 VALID_VIDEO_CODECS = {"h264", "hevc", "libsvtav1", "auto"} | set(HW_ENCODERS)
+
+# How often `encode_video_frames` reports progress. A single camera's encode
+# is otherwise silent for minutes on small hardware (e.g. a Pi), which makes a
+# working encoder indistinguishable from a hung process for whoever supervises it.
+ENCODE_PROGRESS_INTERVAL_S = 5.0
 
 
 def _get_codec_options(
@@ -474,13 +480,19 @@ def encode_video_frames(
         output_stream.height = height
 
         # Loop through input frames and encode them
-        for input_data in input_list:
+        n_frames = len(input_list)
+        last_progress_t = time.monotonic()
+        for i, input_data in enumerate(input_list, start=1):
             with Image.open(input_data) as input_image:
                 input_image = input_image.convert("RGB")
                 input_frame = av.VideoFrame.from_image(input_image)
                 packet = output_stream.encode(input_frame)
                 if packet:
                     output.mux(packet)
+            now = time.monotonic()
+            if now - last_progress_t >= ENCODE_PROGRESS_INTERVAL_S:
+                logger.info(f"Encoding {video_path.name}: {i}/{n_frames} frames")
+                last_progress_t = now
 
         # Flush the encoder
         packet = output_stream.encode()

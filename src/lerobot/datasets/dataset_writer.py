@@ -354,6 +354,12 @@ class DatasetWriter:
             f"Batch encoding {self._batch_encoding_size} videos for episodes {start_episode} to {end_episode - 1}"
         )
 
+        # Checkpoint the data parquet before the slow encode: closing the writer
+        # lands the footer on disk, so a kill mid-encode cannot corrupt the rows
+        # saved so far. The next episode rolls over to a fresh data file (see
+        # `_save_episode_data`).
+        self.close_writer()
+
         # Newly recorded episodes live in the metadata buffer / open parquet writer,
         # not in `self._meta.episodes`. Flush + reload so absolute-index lookups work.
         self._meta.flush_and_reload_episodes()
@@ -434,7 +440,13 @@ class DatasetWriter:
                 latest_size_in_mb / frames_in_current_file if frames_in_current_file > 0 else 0
             )
 
-            if latest_size_in_mb + av_size_per_frame * ep_num_frames >= self._meta.data_files_size_in_mb:
+            # Roll over to a new data file when the current one is full, or when its
+            # writer was already closed (a checkpoint — see `close_writer`): opening a
+            # new ParquetWriter on an existing path would truncate that file.
+            if (
+                self._pq_writer is None
+                or latest_size_in_mb + av_size_per_frame * ep_num_frames >= self._meta.data_files_size_in_mb
+            ):
                 chunk_idx, file_idx = update_chunk_file_indices(chunk_idx, file_idx, self._meta.chunks_size)
                 self.close_writer()
                 self._current_file_start_frame = global_frame_index
@@ -614,7 +626,12 @@ class DatasetWriter:
         )
 
     def close_writer(self) -> None:
-        """Close and cleanup the parquet writer if it exists."""
+        """Close the data parquet writer (if open), which writes the file footer.
+
+        Safe to call between episodes as a durability checkpoint: the next
+        ``save_episode`` starts a new data file instead of reopening (and
+        truncating) the closed one — see ``_save_episode_data``.
+        """
         if self._pq_writer is not None:
             self._pq_writer.close()
             self._pq_writer = None
@@ -665,10 +682,14 @@ class DatasetWriter:
             self.image_writer.wait_until_done()
             self.image_writer.stop()
             self.image_writer = None
-        # 2. Flush pending video encoding (streaming or batch)
-        self.flush_pending_videos()
-        # 3. Close own parquet writer
+        # 2. Close own parquet writer *before* the (potentially very slow) video
+        #    flush. No rows are written after this point, and closing writes the
+        #    parquet footer — so if the process is killed while encoding, the
+        #    frame data on disk is a valid file rather than a footer-less stub.
+        #    Videos can be re-encoded from the images left on disk; rows cannot.
         self.close_writer()
+        # 3. Flush pending video encoding (streaming or batch)
+        self.flush_pending_videos()
         # 4. Finalize metadata (idempotent)
         self._meta.finalize()
         self._finalized = True
