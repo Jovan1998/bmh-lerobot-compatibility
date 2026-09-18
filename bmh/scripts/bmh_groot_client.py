@@ -23,13 +23,23 @@ robot's `action_features` with the same rule the platform uses at training time
 `left_single_arm` / `left_gripper` / `left_head` / `right_single_arm` /
 `right_gripper` (16 dims); the head servos ride the left arm's bus and are driven
 like any other `.pos` key.
+
+The *target* — policy host / port / API token plus the language instruction — comes
+from the CLI flags or, when `--control_file` points at the controller-app's JSON
+file, from that file. The file is polled every tick so the app can switch prompt
+or policy server live, without restarting the client (see
+bmh/groot_client/control.py). A switch is validated (ping + modality check) before
+it is used; a rejected switch makes the robot hold position until a valid one
+arrives.
 """
 
 import logging
 import queue
 import threading
 import time
+from collections.abc import Callable
 from dataclasses import asdict, dataclass
+from pathlib import Path
 from pprint import pformat
 from typing import Any
 
@@ -38,6 +48,12 @@ import draccus
 import numpy as np
 
 from bmh.groot_client import PolicyClient
+from bmh.groot_client.control import (
+    ControlFileWatcher,
+    Hold,
+    InferenceTarget,
+    format_target_status,
+)
 from bmh.groot_client.layout import JointGroup, group_joint_names, pack_state, unpack_action
 
 # Importing the robot configs ensures draccus CLI registration is populated.
@@ -104,9 +120,12 @@ class BiSoBimanualAdapter:
     `right_gripper` (1,). `validate_modality()` confirms the server's layout at
     startup against `PolicyClient.get_modality_config()` and raises a clear error
     if the trained model uses a different one.
+
+    `policy` may be attached after construction (and swapped later by the
+    inference worker when the app switches policy servers).
     """
 
-    def __init__(self, policy_client: PolicyClient, jpeg_quality: int, joint_names: list[str]):
+    def __init__(self, policy_client: PolicyClient | None, jpeg_quality: int, joint_names: list[str]):
         self.policy = policy_client
         self.jpeg_quality = jpeg_quality
         self.groups: list[JointGroup] = group_joint_names(joint_names)
@@ -228,27 +247,143 @@ def _modality_keys(section: Any) -> list[str]:
     return [str(k) for k in (keys or [])]
 
 
+class PolicyConnectError(Exception):
+    """A target's policy server cannot be reached, rejects the token, or fails the modality check."""
+
+
+def _connect_policy(
+    target: InferenceTarget,
+    adapter: BiSoBimanualAdapter,
+    probe_timeout_ms: int,
+    timeout_ms: int,
+) -> PolicyClient:
+    """Open a validated `PolicyClient` for `target`, or raise `PolicyConnectError`.
+
+    Ping and modality fetch run with the short `probe_timeout_ms` so an unreachable
+    host is reported within seconds; the returned client is then switched to the
+    regular request `timeout_ms`. A failed probe closes its client before raising,
+    so nothing leaks. Used both at startup and by the worker for live switches.
+    """
+    client = PolicyClient(
+        host=target.policy_host,
+        port=target.policy_port,
+        timeout_ms=probe_timeout_ms,
+        api_token=target.api_token or None,
+    )
+    where = f"{target.policy_host}:{target.policy_port}"
+    try:
+        # A wrong token makes the proxy answer {"error": ...}, which `ping()` re-raises
+        # as RuntimeError instead of returning False — treat both as unreachable.
+        try:
+            reachable = client.ping()
+        except Exception as e:
+            raise PolicyConnectError(f"Cannot reach GR00T policy server at {where}: {e}") from e
+        if not reachable:
+            raise PolicyConnectError(f"Cannot reach GR00T policy server at {where}")
+        logger.info("Connected to GR00T server at %s", where)
+
+        try:
+            modality_cfg = client.get_modality_config()
+        except Exception as e:
+            # get_modality_config is best-effort — log and continue. If keys are wrong,
+            # the first send_action call will fail loudly anyway.
+            logger.warning("Could not fetch modality config from server: %s", e)
+        else:
+            try:
+                adapter.validate_modality(modality_cfg)
+            except SystemExit as e:
+                # validate_modality raises SystemExit for a clean CLI error. Inside the
+                # worker thread that would end the thread silently, so convert it.
+                raise PolicyConnectError(str(e)) from None
+    except PolicyConnectError:
+        client.close()
+        raise
+    client.set_timeout_ms(timeout_ms)
+    return client
+
+
 def _inference_worker(
     adapter: BiSoBimanualAdapter,
-    obs_queue: "queue.Queue[dict[str, Any] | None]",
-    chunk_queue: "queue.Queue[list[dict[str, float]] | None]",
+    obs_queue: "queue.Queue[tuple[InferenceTarget, dict[str, Any]] | None]",
+    chunk_queue: "queue.Queue[list[dict[str, float]] | Hold | None]",
     action_horizon: int,
     stop_event: threading.Event,
+    active: InferenceTarget,
+    connect: Callable[[InferenceTarget], PolicyClient],
 ) -> None:
-    """Owns the PolicyClient (ZMQ REQ is single-thread).
+    """Owns the PolicyClient (ZMQ REQ is single-thread) and applies target switches.
 
-    Pulls one observation at a time from `obs_queue`, runs inference, and
-    pushes the truncated action chunk to `chunk_queue`. A `None` observation
-    is the shutdown sentinel. On failure, pushes `None` to signal the main
-    thread, then continues to honor `stop_event`.
+    Pulls one `(target, observation)` pair at a time from `obs_queue`. `target` is
+    the newest target the main loop knows; `active` is the one the current client
+    was validated for. A new `target.seq` is decided exactly once — a rejected seq
+    is never re-probed on later requests carrying the same seq:
+
+    - same endpoint (prompt-only change) → adopted as is;
+    - other endpoint → `connect()` it (ping + modality check). On success the old
+      client is closed and replaced; on `PolicyConnectError` the old client stays
+      but is *not* used — the reply is a `Hold` and the robot holds position until
+      a new seq arrives.
+
+    The instruction sent with each request is always `active.lang_instruction`, so
+    a rejected target's prompt never reaches any server. Every decision is logged
+    as a `BMH_TARGET {json}` line for the controller-app.
+
+    A `None` item is the shutdown sentinel. On a request failure, pushes `None`
+    to signal the main thread, then continues to honor `stop_event`.
     """
+    decided_seq = active.seq
+    rejected: str | None = None
     while not stop_event.is_set():
         try:
-            obs = obs_queue.get(timeout=0.1)
+            item = obs_queue.get(timeout=0.1)
         except queue.Empty:
             continue
-        if obs is None:
+        if item is None:
             break
+        target, obs = item
+
+        if target.seq != decided_seq:
+            decided_seq = target.seq
+            rejected = None
+            if target.endpoint != active.endpoint:
+                try:
+                    new_client = connect(target)
+                except PolicyConnectError as e:
+                    rejected = str(e)
+                    logger.error(
+                        "target #%d rejected (%s:%d): %s",
+                        target.seq,
+                        target.policy_host,
+                        target.policy_port,
+                        e,
+                    )
+                except Exception as e:
+                    # Unexpected — still hold rather than let the thread die silently.
+                    rejected = f"{type(e).__name__}: {e}"
+                    logger.exception("target #%d: unexpected error while connecting", target.seq)
+                else:
+                    old_client = adapter.policy
+                    adapter.policy = new_client
+                    if old_client is not None:
+                        old_client.close()
+                    active = target
+            else:
+                active = target
+            if rejected is None:
+                logger.info(
+                    'target #%d applied: %s:%d "%s"',
+                    target.seq,
+                    target.policy_host,
+                    target.policy_port,
+                    target.lang_instruction,
+                )
+            logger.info(format_target_status(target, rejected is None, rejected))
+
+        if rejected is not None:
+            chunk_queue.put(Hold(seq=target.seq, error=rejected))
+            continue
+
+        obs["lang"] = active.lang_instruction
         try:
             chunk = adapter.get_action(obs)[:action_horizon]
             chunk_queue.put(chunk)
@@ -270,6 +405,15 @@ class BmhInferenceConfig:
     timeout_ms: int = 15000
     jpeg_quality: int = 95
     api_token: str = ""
+    # Path of the controller-app's JSON control file (see bmh/groot_client/control.py).
+    # When set, the file is read at startup — overriding --policy_host / --policy_port /
+    # --lang_instruction / --api_token — and polled every tick so the app can switch
+    # prompt or policy server live, without restarting the client.
+    control_file: str | None = None
+    # Socket timeout for the ping + modality fetch that validate a (new) policy
+    # server, so an unreachable host is reported within seconds instead of
+    # `timeout_ms`. Regular requests use `timeout_ms`.
+    probe_timeout_ms: int = 5000
     # Fire the next inference request once this many actions have been consumed
     # from the freshly swapped-in chunk. Kept small so we re-sync to the latest
     # observation often. The in-flight guard means the effective request cadence
@@ -292,10 +436,9 @@ class BmhInferenceConfig:
 @draccus.wrap()
 def main(cfg: BmhInferenceConfig) -> None:
     init_logging()
-    logger.info(pformat(asdict(cfg)))
+    # Never echo the API token — the controller-app tails this output into its log.
+    logger.info(pformat({**asdict(cfg), "api_token": "***" if cfg.api_token else ""}))
 
-    if not cfg.lang_instruction.strip():
-        raise SystemExit("--lang_instruction must not be empty.")
     if not 1 <= cfg.jpeg_quality <= 100:
         raise SystemExit("--jpeg_quality must be in [1, 100].")
     if not 1 <= cfg.refetch_after < cfg.action_horizon:
@@ -307,48 +450,64 @@ def main(cfg: BmhInferenceConfig) -> None:
             f"--blend_frames must be in [0, action_horizon={cfg.action_horizon}); got {cfg.blend_frames}."
         )
 
+    # Initial target: the controller-app's control file when given (the app writes
+    # it before spawning us), else the CLI flags. Either way `_connect_policy`
+    # validates it (ping + modality) below, before the robot moves.
+    watcher: ControlFileWatcher | None = None
+    target: InferenceTarget | None = None
+    if cfg.control_file:
+        watcher = ControlFileWatcher(Path(cfg.control_file).expanduser())
+        try:
+            target = watcher.read_initial()
+        except ValueError as e:
+            raise SystemExit(f"--control_file {watcher.path}: {e}") from e
+        if target is None:
+            logger.warning("Control file %s does not exist yet; starting from CLI flags.", watcher.path)
+        else:
+            logger.info("Initial target #%d read from %s", target.seq, watcher.path)
+    if target is None:
+        if not cfg.lang_instruction.strip():
+            raise SystemExit("--lang_instruction must not be empty.")
+        target = InferenceTarget(
+            seq=0,
+            policy_host=cfg.policy_host,
+            policy_port=cfg.policy_port,
+            lang_instruction=cfg.lang_instruction.strip(),
+            api_token=cfg.api_token,
+        )
+
     robot = make_robot_from_config(cfg.robot)
     robot.connect()
     logger.info("Robot connected: %s", robot.name)
 
-    client = PolicyClient(
-        host=cfg.policy_host,
-        port=cfg.policy_port,
-        timeout_ms=cfg.timeout_ms,
-        api_token=cfg.api_token or None,
-    )
-    if not client.ping():
-        robot.disconnect()
-        raise SystemExit(f"Cannot reach GR00T policy server at {cfg.policy_host}:{cfg.policy_port}")
-    logger.info("Connected to GR00T server at %s:%s", cfg.policy_host, cfg.policy_port)
-
     # bi_so_follower.action_features lists every `.pos` key in bus order with the
     # left_/right_ prefix — for the BMH-101 with `--robot.left_arm_config.with_head=true`
-    # that is the same 16 names the training dataset's `features` carry.
+    # that is the same 16 names the training dataset's `features` carry. The policy
+    # client is attached right after, once the server passed the modality check.
     adapter = BiSoBimanualAdapter(
-        client,
+        None,
         jpeg_quality=cfg.jpeg_quality,
         joint_names=list(robot.action_features.keys()),
     )
-    try:
-        modality_cfg = client.get_modality_config()
-        adapter.validate_modality(modality_cfg)
-    except SystemExit:
-        robot.disconnect()
-        raise
-    except Exception as e:
-        # get_modality_config is best-effort — log and continue. If keys are wrong,
-        # the first send_action call will fail loudly anyway.
-        logger.warning("Could not fetch modality config from server: %s", e)
 
-    logger.info('Running inference with instruction: "%s"', cfg.lang_instruction)
+    def connect(t: InferenceTarget) -> PolicyClient:
+        return _connect_policy(t, adapter, cfg.probe_timeout_ms, cfg.timeout_ms)
+
+    try:
+        adapter.policy = connect(target)
+    except PolicyConnectError as e:
+        robot.disconnect()
+        raise SystemExit(str(e)) from e
+    logger.info(format_target_status(target, True, None))
+
+    logger.info('Running inference with instruction: "%s"', target.lang_instruction)
     period = 1.0 / cfg.fps
 
     # Bootstrap: one synchronous inference on the main thread to seed the
     # first chunk. After this, the worker thread is the sole owner of the
     # PolicyClient.
     bootstrap_obs = robot.get_observation()
-    bootstrap_obs["lang"] = cfg.lang_instruction
+    bootstrap_obs["lang"] = target.lang_instruction
     current_chunk: list[dict[str, float]] = adapter.get_action(bootstrap_obs)[: cfg.action_horizon]
     idx = 0
     inflight = False
@@ -366,13 +525,20 @@ def main(cfg: BmhInferenceConfig) -> None:
     # Actions consumed from the current chunk since it was swapped in; drives the
     # `refetch_after` re-fire trigger below.
     consumed_since_swap = 0
+    # Set when the control file delivered a new target: fire the next request as
+    # soon as nothing is in flight instead of waiting for `refetch_after`, so a
+    # prompt / server switch takes effect after a single round-trip.
+    fire_now = False
+    # True after the worker rejected a target: the robot holds its last pose and
+    # nothing is fired until a new seq arrives.
+    holding = False
 
-    obs_queue: queue.Queue[dict[str, Any] | None] = queue.Queue(maxsize=1)
-    chunk_queue: queue.Queue[list[dict[str, float]] | None] = queue.Queue(maxsize=1)
+    obs_queue: queue.Queue[tuple[InferenceTarget, dict[str, Any]] | None] = queue.Queue(maxsize=1)
+    chunk_queue: queue.Queue[list[dict[str, float]] | Hold | None] = queue.Queue(maxsize=1)
     stop_event = threading.Event()
     worker = threading.Thread(
         target=_inference_worker,
-        args=(adapter, obs_queue, chunk_queue, cfg.action_horizon, stop_event),
+        args=(adapter, obs_queue, chunk_queue, cfg.action_horizon, stop_event, target, connect),
         name="bmh-inference-worker",
         daemon=True,
     )
@@ -382,6 +548,22 @@ def main(cfg: BmhInferenceConfig) -> None:
         while True:
             tick_start = time.perf_counter()
             frame_counter += 1
+
+            # 0. Pick up a new target from the controller-app (one os.stat per
+            #    tick; the file is only parsed when it changed). It travels with
+            #    the next request; the worker validates and applies it.
+            if watcher is not None:
+                new_target = watcher.poll()
+                if new_target is not None and new_target.seq != target.seq:
+                    target = new_target
+                    fire_now = True
+                    logger.info(
+                        'target #%d requested: %s:%d "%s"',
+                        target.seq,
+                        target.policy_host,
+                        target.policy_port,
+                        target.lang_instruction,
+                    )
 
             # 1. Try to swap in a freshly arrived chunk, time-aligned to the
             #    robot's current position. The chunk's action[0] is the policy's
@@ -406,57 +588,75 @@ def main(cfg: BmhInferenceConfig) -> None:
             else:
                 if new_chunk is None:
                     raise RuntimeError("inference worker reported failure; aborting")
-                elapsed = frame_counter - fire_frame
-                # Drop the `elapsed` frames the robot already advanced along the
-                # old chunk (capped at what it could actually consume), so the new
-                # chunk picks up from where the robot *is*, not from the fire-time
-                # pose (the cause of the back-and-forth jitter).
-                #
-                # Cap: keep at least `refetch_after` actions in the chunk. The
-                # re-fire trigger needs `consumed_since_swap >= refetch_after`, and
-                # that counter only advances while there are actions left to send.
-                # If a high-latency swap trimmed the chunk below `refetch_after`,
-                # the trigger could never arm again and the robot would hold
-                # position forever (the bug seen when ping exceeds the action
-                # horizon). Capping here guarantees the loop always re-fires.
-                drop = min(elapsed, remaining_at_fire)
-                drop = min(drop, max(len(new_chunk) - cfg.refetch_after, 0))
+                if isinstance(new_chunk, Hold):
+                    # Rejected target: drop what is left of the previous target's
+                    # chunk and hold the last commanded pose. `consumed_since_swap`
+                    # stays 0, so the `refetch_after` trigger never re-fires; only
+                    # a new seq from the control file (`fire_now`) does.
+                    logger.error(
+                        "target #%d rejected: %s — holding position until a valid target is applied",
+                        new_chunk.seq,
+                        new_chunk.error,
+                    )
+                    current_chunk = []
+                    idx = 0
+                    inflight = False
+                    consumed_since_swap = 0
+                    chunk_exhausted_at = None
+                    holding = True
+                else:
+                    holding = False
+                    elapsed = frame_counter - fire_frame
+                    # Drop the `elapsed` frames the robot already advanced along the
+                    # old chunk (capped at what it could actually consume), so the new
+                    # chunk picks up from where the robot *is*, not from the fire-time
+                    # pose (the cause of the back-and-forth jitter).
+                    #
+                    # Cap: keep at least `refetch_after` actions in the chunk. The
+                    # re-fire trigger needs `consumed_since_swap >= refetch_after`, and
+                    # that counter only advances while there are actions left to send.
+                    # If a high-latency swap trimmed the chunk below `refetch_after`,
+                    # the trigger could never arm again and the robot would hold
+                    # position forever (the bug seen when ping exceeds the action
+                    # horizon). Capping here guarantees the loop always re-fires.
+                    drop = min(elapsed, remaining_at_fire)
+                    drop = min(drop, max(len(new_chunk) - cfg.refetch_after, 0))
 
-                # Crossfade the seam. `current_chunk[idx:]` are the old chunk's
-                # next actions and `new_chunk[drop:]` are the new chunk's first
-                # kept actions; after the time-align above these describe the same
-                # instants but come from different policy passes, so a cold switch
-                # leaves a one-frame jump. Blend the first `blend_frames` of them
-                # with a mostly-old → mostly-new ramp. The blend length is clamped
-                # to the overlap: if the old chunk has fewer actions left than
-                # `blend_frames` (or already ran dry — `leftover_old` empty, robot
-                # holding position) we interpolate over only the frames available.
-                leftover_old = current_chunk[idx:]
-                new_kept = new_chunk[drop:]
-                blend_len = min(cfg.blend_frames, len(leftover_old), len(new_kept))
-                for k in range(blend_len):
-                    alpha = (k + 1) / (blend_len + 1)
-                    new_kept[k] = _blend_actions(leftover_old[k], new_kept[k], alpha)
+                    # Crossfade the seam. `current_chunk[idx:]` are the old chunk's
+                    # next actions and `new_chunk[drop:]` are the new chunk's first
+                    # kept actions; after the time-align above these describe the same
+                    # instants but come from different policy passes, so a cold switch
+                    # leaves a one-frame jump. Blend the first `blend_frames` of them
+                    # with a mostly-old → mostly-new ramp. The blend length is clamped
+                    # to the overlap: if the old chunk has fewer actions left than
+                    # `blend_frames` (or already ran dry — `leftover_old` empty, robot
+                    # holding position) we interpolate over only the frames available.
+                    leftover_old = current_chunk[idx:]
+                    new_kept = new_chunk[drop:]
+                    blend_len = min(cfg.blend_frames, len(leftover_old), len(new_kept))
+                    for k in range(blend_len):
+                        alpha = (k + 1) / (blend_len + 1)
+                        new_kept[k] = _blend_actions(leftover_old[k], new_kept[k], alpha)
 
-                logger.info(
-                    "chunk swap: %d actions arrived after %d frames, dropping %d "
-                    "stale actions, %d kept, %d blended "
-                    "(remaining_at_fire=%d, leftover=%d)",
-                    len(new_chunk),
-                    elapsed,
-                    drop,
-                    len(new_kept),
-                    blend_len,
-                    remaining_at_fire,
-                    len(leftover_old),
-                )
-                current_chunk = new_kept
-                idx = 0
-                inflight = False
-                consumed_since_swap = 0
-                chunk_exhausted_at = None
+                    logger.info(
+                        "chunk swap: %d actions arrived after %d frames, dropping %d "
+                        "stale actions, %d kept, %d blended "
+                        "(remaining_at_fire=%d, leftover=%d)",
+                        len(new_chunk),
+                        elapsed,
+                        drop,
+                        len(new_kept),
+                        blend_len,
+                        remaining_at_fire,
+                        len(leftover_old),
+                    )
+                    current_chunk = new_kept
+                    idx = 0
+                    inflight = False
+                    consumed_since_swap = 0
+                    chunk_exhausted_at = None
 
-            # 2. Send an action (or hold position if we ran out).
+            # 2. Send an action (or hold position if we ran out / were told to).
             if idx < len(current_chunk):
                 action = current_chunk[idx]
                 robot.send_action(action)
@@ -464,6 +664,10 @@ def main(cfg: BmhInferenceConfig) -> None:
                 idx += 1
                 consumed_since_swap += 1
                 chunk_exhausted_at = None
+            elif holding:
+                # Rejected target: keep the last pose, quietly (logged once above).
+                if last_action is not None:
+                    robot.send_action(last_action)
             else:
                 if chunk_exhausted_at is None:
                     chunk_exhausted_at = tick_start
@@ -474,15 +678,17 @@ def main(cfg: BmhInferenceConfig) -> None:
 
             # 3. Fire the next request once we've consumed `refetch_after`
             #    actions from the current chunk and nothing is already in flight.
+            #    A new target (`fire_now`) fires as soon as the line is free.
             #    Record the fire frame and how many actions are still queued so
             #    the swap above can measure round-trip latency in frames and cap
-            #    the stale-lead trim at what the robot can actually consume.
-            if not inflight and consumed_since_swap >= cfg.refetch_after:
+            #    the stale-lead trim at what the robot can actually consume. The
+            #    instruction is attached by the worker from the target it accepted.
+            if not inflight and (fire_now or consumed_since_swap >= cfg.refetch_after):
                 t_start = time.perf_counter()
                 obs = robot.get_observation()
-                obs["lang"] = cfg.lang_instruction
-                obs_queue.put(obs)
+                obs_queue.put((target, obs))
                 inflight = True
+                fire_now = False
                 fire_frame = frame_counter
                 remaining_at_fire = max(len(current_chunk) - idx, 0)
                 logger.info(
@@ -509,6 +715,9 @@ def main(cfg: BmhInferenceConfig) -> None:
         worker.join(timeout=2.0)
         if worker.is_alive():
             logger.warning("inference worker did not exit within 2 s")
+        elif adapter.policy is not None:
+            # Only when the worker is gone — ZMQ sockets are not thread-safe.
+            adapter.policy.close()
         try:
             robot.disconnect()
         except Exception as e:

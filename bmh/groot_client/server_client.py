@@ -17,6 +17,7 @@
 # (the BMH-101 only acts as a client). Imports are rewritten to the sibling vendored
 # modules so this file pulls in no further GR00T dependencies.
 
+import contextlib
 from typing import Any
 
 import msgpack_numpy as mnp
@@ -68,14 +69,41 @@ class PolicyClient(BasePolicy):
         self.port = port
         self.timeout_ms = timeout_ms
         self.api_token = api_token
+        self._closed = False
         self._init_socket()
 
     def _init_socket(self):
-        """Initialize or reinitialize the socket with current settings."""
+        """Initialize or reinitialize the socket with current settings.
+
+        BMH: the previous socket (if any) is closed first with LINGER=0. A REQ socket
+        that timed out may still hold an unsent request; left open it would stay
+        registered with the context and make ``context.term()`` block forever.
+        """
+        previous = getattr(self, "socket", None)
+        if previous is not None:
+            previous.setsockopt(zmq.LINGER, 0)
+            previous.close()
         self.socket = self.context.socket(zmq.REQ)
         self.socket.setsockopt(zmq.RCVTIMEO, self.timeout_ms)
         self.socket.setsockopt(zmq.SNDTIMEO, self.timeout_ms)
         self.socket.connect(f"tcp://{self.host}:{self.port}")
+
+    def set_timeout_ms(self, timeout_ms: int) -> None:
+        """BMH: change the send/receive timeout of the live socket (applies to later calls)."""
+        self.timeout_ms = timeout_ms
+        self.socket.setsockopt(zmq.RCVTIMEO, timeout_ms)
+        self.socket.setsockopt(zmq.SNDTIMEO, timeout_ms)
+
+    def close(self) -> None:
+        """BMH: close the socket and terminate the context. Idempotent; never blocks on queued data."""
+        if self._closed:
+            return
+        self._closed = True
+        try:
+            self.socket.setsockopt(zmq.LINGER, 0)
+            self.socket.close()
+        finally:
+            self.context.term()
 
     def ping(self) -> bool:
         try:
@@ -115,11 +143,8 @@ class PolicyClient(BasePolicy):
         return response
 
     def __del__(self):
-        try:
-            self.socket.close()
-            self.context.term()
-        except Exception:
-            pass
+        with contextlib.suppress(Exception):
+            self.close()
 
     def _get_action(
         self, observation: dict[str, Any], options: dict[str, Any] | None = None
