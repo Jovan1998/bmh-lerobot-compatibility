@@ -22,6 +22,18 @@ File contract (all keys required except ``api_token``):
     {"seq": 3, "policy_host": "1.2.3.4", "policy_port": 5555,
      "lang_instruction": "pick up the cube", "api_token": "..."}
 
+A target can also be *idle* — "no server, no prompt": the client closes its policy
+connection, stops moving and holds position until a real target arrives. That is how
+the Physical Agent tab starts the client before any skill is live. Only ``seq`` is
+read from an idle document, every other key is ignored:
+
+.. code-block:: json
+
+    {"seq": 4, "idle": true}
+
+Idle is never expressed by deleting the file — a missing file means "keep the
+current target" (see :class:`ControlFileWatcher`).
+
 stdlib only (no zmq / cv2 / hardware imports) so it is unit-testable anywhere.
 """
 
@@ -54,6 +66,8 @@ class InferenceTarget:
         policy_port: GR00T policy server port.
         lang_instruction: Language instruction sent with every request.
         api_token: Per-request API token (empty = none). Hidden from ``repr``.
+        idle: ``True`` for "no server, no prompt" — host / instruction / token are
+            empty and the port is 0. Build one with :meth:`make_idle`.
     """
 
     seq: int
@@ -61,6 +75,12 @@ class InferenceTarget:
     policy_port: int
     lang_instruction: str
     api_token: str = field(default="", repr=False)
+    idle: bool = False
+
+    @classmethod
+    def make_idle(cls, seq: int) -> InferenceTarget:
+        """The idle target for ``seq``: no server to ask, nothing to do."""
+        return cls(seq=seq, policy_host="", policy_port=0, lang_instruction="", idle=True)
 
     @property
     def endpoint(self) -> tuple[str, int, str]:
@@ -80,6 +100,13 @@ class Hold:
     error: str
 
 
+@dataclass(frozen=True)
+class Idle:
+    """Worker reply for an accepted idle target: stay still until a new ``seq`` arrives."""
+
+    seq: int
+
+
 def parse_target(data: object) -> InferenceTarget:
     """Validate a decoded control-file document.
 
@@ -87,17 +114,24 @@ def parse_target(data: object) -> InferenceTarget:
         data: Result of ``json.loads`` on the control file.
 
     Returns:
-        The target, with host / instruction / token whitespace-stripped.
+        The target, with host / instruction / token whitespace-stripped — or the idle
+        target for ``seq`` when the document says ``"idle": true`` (its other keys
+        are then ignored).
 
     Raises:
         ValueError: If a required key is missing or has the wrong type / range.
-            Bools are rejected where ints are expected.
+            Bools are rejected where ints are expected, and ``idle`` must be a bool.
     """
     if not isinstance(data, dict):
         raise ValueError(f"expected a JSON object, got {type(data).__name__}")
     seq = data.get("seq")
     if type(seq) is not int or seq < 0:
         raise ValueError(f"'seq' must be a non-negative integer, got {seq!r}")
+    idle = data.get("idle", False)
+    if not isinstance(idle, bool):
+        raise ValueError(f"'idle' must be a boolean, got {idle!r}")
+    if idle:
+        return InferenceTarget.make_idle(seq)
     host = data.get("policy_host")
     if not isinstance(host, str) or not host.strip():
         raise ValueError("'policy_host' must be a non-empty string")
@@ -193,7 +227,8 @@ def format_target_status(target: InferenceTarget, accepted: bool, error: str | N
     """One-line ``BMH_TARGET {json}`` status for the app to parse. Never includes the token.
 
     Args:
-        target: The target that was decided on (accepted or rejected).
+        target: The target that was decided on (accepted or rejected). An idle target
+            reports ``"idle": true`` with an empty host / instruction and port 0.
         accepted: Whether the client now runs against ``target``.
         error: Reason for a rejection, ``None`` when accepted.
     """
@@ -202,6 +237,7 @@ def format_target_status(target: InferenceTarget, accepted: bool, error: str | N
             "seq": target.seq,
             "accepted": accepted,
             "error": error,
+            "idle": target.idle,
             "policy_host": target.policy_host,
             "policy_port": target.policy_port,
             "lang_instruction": target.lang_instruction,

@@ -1,7 +1,7 @@
 """Unit tests for the BMH-101 inference control file - no ZMQ, no hardware.
 
-Covers ``parse_target`` validation, ``InferenceTarget.endpoint`` equality,
-``ControlFileWatcher`` change detection (stat-based, like the teleop lock watcher)
+Covers ``parse_target`` validation (incl. the idle document), ``InferenceTarget.endpoint``
+equality, ``ControlFileWatcher`` change detection (stat-based, like the teleop lock watcher)
 and the ``BMH_TARGET`` status line. Pure stdlib module, so this runs anywhere.
 Run with ``uv run --no-sync pytest tests/bmh/test_inference_control.py -q``.
 """
@@ -72,11 +72,38 @@ def test_parse_target_token_defaults_to_empty():
         {**VALID, "lang_instruction": ""},
         {**VALID, "lang_instruction": None},
         {**VALID, "api_token": 7},
+        {**VALID, "idle": "true"},
+        {**VALID, "idle": 1},
+        {**VALID, "idle": None},
+        {"seq": 1, "idle": "yes"},
+        {"idle": True},
+        {"seq": -1, "idle": True},
+        {"seq": 1, "idle": False},
     ],
 )
 def test_parse_target_rejects(bad):
     with pytest.raises(ValueError):
         parse_target(bad)
+
+
+def test_parse_target_idle_needs_only_seq():
+    target = parse_target({"seq": 4, "idle": True})
+    assert target == InferenceTarget.make_idle(4)
+    assert target.idle is True
+    assert (target.seq, target.policy_host, target.policy_port, target.lang_instruction) == (4, "", 0, "")
+    assert target.api_token == ""
+
+
+def test_parse_target_idle_ignores_other_keys():
+    # Even values that would be rejected on a real target: an idle document is only its seq.
+    doc = {**VALID, "seq": 5, "idle": True, "policy_port": "nope", "lang_instruction": 7}
+    assert parse_target(doc) == InferenceTarget.make_idle(5)
+
+
+def test_parse_target_explicit_idle_false_is_a_normal_target():
+    target = parse_target({**VALID, "idle": False})
+    assert target == parse_target(VALID)
+    assert target.idle is False
 
 
 # --------------------------------------------------------------------------- target
@@ -155,6 +182,18 @@ def test_poll_malformed_file_warns_once_and_keeps_none(tmp_path, caplog):
     assert watcher.poll().seq == 3
 
 
+def test_watcher_yields_idle_and_back(tmp_path):
+    path = tmp_path / "control.json"
+    _write(path, {"seq": 1, "idle": True}, 1_000)
+    watcher = ControlFileWatcher(path)
+    assert watcher.read_initial() == InferenceTarget.make_idle(1)
+    _write(path, {**VALID, "seq": 2}, 2_000)
+    assert watcher.poll() == parse_target({**VALID, "seq": 2})
+    _write(path, {"seq": 3, "idle": True}, 3_000)
+    assert watcher.poll() == InferenceTarget.make_idle(3)
+    assert watcher.poll() is None
+
+
 def test_poll_deleted_then_recreated(tmp_path):
     path = tmp_path / "control.json"
     watcher = ControlFileWatcher(path)
@@ -181,6 +220,7 @@ def test_format_target_status_round_trips_without_token():
         "seq": 3,
         "accepted": False,
         "error": "Cannot reach",
+        "idle": False,
         "policy_host": "h",
         "policy_port": 5555,
         "lang_instruction": 'say "hi" ✓',
@@ -189,3 +229,16 @@ def test_format_target_status_round_trips_without_token():
     accepted = json.loads(format_target_status(target, True, None)[len(STATUS_PREFIX) :])
     assert accepted["accepted"] is True
     assert accepted["error"] is None
+
+
+def test_format_target_status_idle():
+    status = format_target_status(InferenceTarget.make_idle(4), True, None)
+    assert json.loads(status[len(STATUS_PREFIX) :]) == {
+        "seq": 4,
+        "accepted": True,
+        "error": None,
+        "idle": True,
+        "policy_host": "",
+        "policy_port": 0,
+        "lang_instruction": "",
+    }

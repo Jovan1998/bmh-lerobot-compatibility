@@ -3,7 +3,9 @@
 Drives ``_inference_worker`` with a fake adapter / fake policy clients and checks the
 decision rules: a prompt-only change is adopted, an endpoint change is probed once via
 ``connect`` and replaces the client, a rejected target answers with ``Hold`` and is
-never re-probed for the same seq. Also covers ``_connect_policy``'s error mapping and
+never re-probed for the same seq, an idle target drops the client and answers with
+``Idle``, and a failing request holds (instead of ending the client) and makes the next
+seq re-probe. Also covers ``_initial_target``, ``_connect_policy``'s error mapping and
 ``PolicyClient.close()`` against a dead port. Needs the ``bmh_network`` extra
 (``msgpack-numpy``) because importing the script pulls in ``PolicyClient``; skipped
 otherwise. Run with ``uv run --no-sync --with msgpack-numpy pytest tests/bmh -q``.
@@ -22,12 +24,13 @@ pytest.importorskip("draccus")
 zmq = pytest.importorskip("zmq")
 
 import bmh.scripts.bmh_groot_client as script  # noqa: E402
-from bmh.groot_client.control import Hold, InferenceTarget  # noqa: E402
+from bmh.groot_client.control import ControlFileWatcher, Hold, Idle, InferenceTarget  # noqa: E402
 from bmh.groot_client.server_client import PolicyClient  # noqa: E402
 from bmh.scripts.bmh_groot_client import (  # noqa: E402
     PolicyConnectError,
     _connect_policy,
     _inference_worker,
+    _initial_target,
 )
 
 HORIZON = 4
@@ -87,15 +90,16 @@ class _Connect:
 class _Worker:
     """Runs `_inference_worker` in a thread; `ask()` sends one request and returns its reply."""
 
-    def __init__(self, connect):
+    def __init__(self, connect, initial: InferenceTarget = INITIAL):
         self.obs_queue: queue.Queue = queue.Queue(maxsize=1)
         self.chunk_queue: queue.Queue = queue.Queue(maxsize=1)
         self.stop = threading.Event()
-        self.initial_client = _FakeClient(INITIAL)
+        # An idle client has no policy attached (see `_run_control_loop`).
+        self.initial_client = None if initial.idle else _FakeClient(initial)
         self.adapter = _FakeAdapter(self.initial_client)
         self.thread = threading.Thread(
             target=_inference_worker,
-            args=(self.adapter, self.obs_queue, self.chunk_queue, HORIZON, self.stop, INITIAL, connect),
+            args=(self.adapter, self.obs_queue, self.chunk_queue, HORIZON, self.stop, initial, connect),
             daemon=True,
         )
         self.thread.start()
@@ -115,8 +119,8 @@ class _Worker:
 def worker_factory():
     workers: list[_Worker] = []
 
-    def make(connect=None) -> _Worker:
-        worker = _Worker(connect or _Connect())
+    def make(connect=None, initial: InferenceTarget = INITIAL) -> _Worker:
+        worker = _Worker(connect or _Connect(), initial)
         workers.append(worker)
         return worker
 
@@ -197,14 +201,151 @@ def test_returning_to_still_connected_endpoint_needs_no_connect(worker_factory):
     assert worker.adapter.calls[-1] == ("h1", 5555, "t1", "task C")
 
 
-def test_get_action_failure_signals_none(worker_factory):
+def _failing_once(adapter):
+    """Make the adapter's next `get_action` raise, then behave again."""
+    real = adapter.get_action
+    state = {"failed": False}
+
+    def get_action(obs):
+        if not state["failed"]:
+            state["failed"] = True
+            raise RuntimeError("server error")
+        return real(obs)
+
+    adapter.get_action = get_action
+
+
+def test_get_action_failure_holds_and_reports_same_seq(worker_factory, caplog):
     worker = worker_factory()
+    _failing_once(worker.adapter)
+    with caplog.at_level("INFO"):
+        replies = [worker.ask(INITIAL) for _ in range(3)]
+    error = "policy request failed: RuntimeError: server error"
+    assert replies == [Hold(seq=1, error=error)] * 3  # the worker survives and keeps holding
+    assert worker.adapter.calls == []  # ...without asking the (dead) server again
+    assert caplog.text.count("BMH_TARGET") == 1
+    assert '"seq": 1, "accepted": false' in caplog.text
+    assert error in caplog.text
 
-    def boom(_obs):
-        raise RuntimeError("server error")
 
-    worker.adapter.get_action = boom
-    assert worker.ask(INITIAL) is None
+def test_get_action_failure_makes_next_seq_reprobe_same_endpoint(worker_factory):
+    connect = _Connect()
+    worker = worker_factory(connect)
+    _failing_once(worker.adapter)
+    assert isinstance(worker.ask(INITIAL), Hold)
+    # Same endpoint, prompt-only change: would be adopted without a connect, but the
+    # last request failed, so the server is probed again and the client replaced.
+    assert isinstance(worker.ask(_target(2, lang="task B")), list)
+    assert [t.seq for t in connect.calls] == [2]
+    assert worker.adapter.policy is not worker.initial_client
+    assert worker.initial_client.closed == 1
+    # Healthy again: the next prompt-only change needs no probe.
+    assert isinstance(worker.ask(_target(3, lang="task C")), list)
+    assert len(connect.calls) == 1
+
+
+def test_get_action_failure_then_unreachable_keeps_holding(worker_factory):
+    connect = _Connect(PolicyConnectError("still down"), None)
+    worker = worker_factory(connect)
+    _failing_once(worker.adapter)
+    assert isinstance(worker.ask(INITIAL), Hold)
+    assert worker.ask(_target(2)) == Hold(seq=2, error="still down")
+    assert isinstance(worker.ask(_target(3)), list)  # still flagged for a probe
+    assert [t.seq for t in connect.calls] == [2, 3]
+
+
+def test_worker_crash_signals_none(worker_factory):
+    worker = worker_factory()
+    worker.obs_queue.put("not a (target, obs) pair")
+    assert worker.chunk_queue.get(timeout=5) is None
+
+
+# --------------------------------------------------------------------------- idle
+
+
+def test_idle_target_closes_client_and_replies_idle(worker_factory, caplog):
+    connect = _Connect()
+    worker = worker_factory(connect)
+    idle = InferenceTarget.make_idle(2)
+    with caplog.at_level("INFO"):
+        replies = [worker.ask(idle) for _ in range(2)]
+    assert replies == [Idle(seq=2)] * 2
+    assert worker.adapter.policy is None
+    assert worker.initial_client.closed == 1
+    assert connect.calls == [] and worker.adapter.calls == []
+    assert caplog.text.count("BMH_TARGET") == 1
+    assert '"seq": 2, "accepted": true, "error": null, "idle": true' in caplog.text
+
+
+def test_idle_then_same_endpoint_reconnects(worker_factory):
+    connect = _Connect()
+    worker = worker_factory(connect)
+    assert worker.ask(InferenceTarget.make_idle(2)) == Idle(seq=2)
+    # Same endpoint as before idle, but the client is gone — it must be reopened.
+    assert isinstance(worker.ask(_target(3, lang="task B")), list)
+    assert [t.seq for t in connect.calls] == [3]
+    assert worker.adapter.calls == [("h1", 5555, "t1", "task B")]
+
+
+def test_worker_started_idle_connects_first_target(worker_factory):
+    connect = _Connect()
+    worker = worker_factory(connect, initial=InferenceTarget.make_idle(0))
+    assert worker.ask(InferenceTarget.make_idle(0)) == Idle(seq=0)
+    assert isinstance(worker.ask(_target(1)), list)
+    assert [t.seq for t in connect.calls] == [1]
+    assert worker.adapter.calls == [("h1", 5555, "t1", "task A")]
+
+
+def test_worker_started_idle_rejected_target_holds_then_idles_again(worker_factory):
+    connect = _Connect(PolicyConnectError("down"))
+    worker = worker_factory(connect, initial=InferenceTarget.make_idle(0))
+    assert worker.ask(_target(1)) == Hold(seq=1, error="down")
+    assert worker.adapter.policy is None
+    assert worker.ask(InferenceTarget.make_idle(2)) == Idle(seq=2)
+
+
+# --------------------------------------------------------------------------- _initial_target
+
+
+def _control_file(tmp_path, data) -> ControlFileWatcher:
+    path = tmp_path / "control.json"
+    if data is not None:
+        path.write_text(data)
+    return ControlFileWatcher(path)
+
+
+FILE_TARGET = '{"seq": 7, "policy_host": "fh", "policy_port": 6000, "lang_instruction": "from file"}'
+
+
+@pytest.mark.parametrize(
+    ("file", "lang", "expected"),
+    [
+        # the control file wins over the CLI flags
+        (FILE_TARGET, "cli task", InferenceTarget(7, "fh", 6000, "from file")),
+        (FILE_TARGET, "", InferenceTarget(7, "fh", 6000, "from file")),
+        ('{"seq": 3, "idle": true}', "cli task", InferenceTarget.make_idle(3)),
+        # no file yet: CLI flags when they carry an instruction, else idle
+        (None, " cli task ", InferenceTarget(0, "ch", 5555, "cli task", "ct")),
+        (None, "", InferenceTarget.make_idle(0)),
+        (None, "   ", InferenceTarget.make_idle(0)),
+    ],
+)
+def test_initial_target_with_control_file(tmp_path, file, lang, expected):
+    assert _initial_target(_control_file(tmp_path, file), "ch", 5555, lang, "ct") == expected
+
+
+def test_initial_target_without_control_file():
+    assert _initial_target(None, "ch", 5555, "cli task", "ct") == InferenceTarget(
+        0, "ch", 5555, "cli task", "ct"
+    )
+    # Idle is only reachable with a control file — nothing could ever wake the client up.
+    with pytest.raises(SystemExit, match="--control_file"):
+        _initial_target(None, "ch", 5555, "  ", "ct")
+
+
+def test_initial_target_invalid_control_file_exits(tmp_path):
+    with pytest.raises(SystemExit, match="control.json"):
+        _initial_target(_control_file(tmp_path, "{not json"), "ch", 5555, "cli task", "ct")
 
 
 # --------------------------------------------------------------------------- _connect_policy
