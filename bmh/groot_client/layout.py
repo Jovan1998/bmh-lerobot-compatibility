@@ -20,6 +20,13 @@ For ``bi_so_follower`` with ``with_head=true`` on the left arm this yields
 ``left_single_arm`` (6), ``left_gripper`` (1), ``left_head`` (2),
 ``right_single_arm`` (6), ``right_gripper`` (1) — the 16-dim BMH-101 layout.
 
+A skill trained with *feedbacks* returns extra action keys next to the joint groups:
+``feedback_<key>`` (e.g. ``feedback_done``), shape ``(B=1, T, W)`` — one 0..1 signal
+duplicated over ``W`` channels by the platform (``FEEDBACK_CHANNEL_WIDTH`` in
+``groot-modality.ts``). They are not joints: :func:`unpack_action` never sees them,
+:func:`unpack_feedback` reads them and :func:`split_feedback` keeps them away from
+the robot.
+
 stdlib + numpy only (no hardware imports) so it is unit-testable anywhere.
 """
 
@@ -33,6 +40,10 @@ import numpy as np
 
 _POS_SUFFIX = ".pos"
 _SIDES = ("left", "right")
+
+# Prefix of the policy's feedback action keys (``feedback_done`` → feedback ``done``).
+# Same vocabulary as the backend's ``buildGrootModality`` and the training runner.
+FEEDBACK_PREFIX = "feedback_"
 
 
 @dataclass(frozen=True)
@@ -145,3 +156,42 @@ def unpack_action(chunk: Mapping[str, Any], groups: Sequence[JointGroup], t: int
         for name, value in zip(g.names, values, strict=True):
             action[name] = float(value)
     return action
+
+
+def unpack_feedback(chunk: Mapping[str, Any], t: int) -> dict[str, float]:
+    """Feedback values for timestep ``t`` of an action chunk.
+
+    Args:
+        chunk: Policy output; every key starting with :data:`FEEDBACK_PREFIX` is a
+            feedback channel of shape ``(B=1, T, W)``. Other keys are ignored.
+        t: Timestep within the chunk.
+
+    Returns:
+        ``{"feedback_<key>": mean over the W channels}`` — keys keep their prefix so the
+        values can travel in the same per-step dict as the joints. Empty for a skill
+        trained without feedbacks.
+    """
+    return {
+        key: float(np.asarray(chunk[key])[0][t].mean()) for key in chunk if key.startswith(FEEDBACK_PREFIX)
+    }
+
+
+def split_feedback(step: Mapping[str, float]) -> tuple[dict[str, float], dict[str, float]]:
+    """Split one decoded chunk step into what the robot gets and what the policy reports.
+
+    Args:
+        step: Joint commands plus the prefixed values of :func:`unpack_feedback`.
+
+    Returns:
+        ``(action, feedback)``: ``action`` holds only the joint keys accepted by
+        ``robot.send_action()``; ``feedback`` is keyed by the bare feedback key
+        (``"done"``, prefix stripped).
+    """
+    action: dict[str, float] = {}
+    feedback: dict[str, float] = {}
+    for key, value in step.items():
+        if key.startswith(FEEDBACK_PREFIX):
+            feedback[key[len(FEEDBACK_PREFIX) :]] = value
+        else:
+            action[key] = value
+    return action, feedback

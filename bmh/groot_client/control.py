@@ -34,6 +34,11 @@ read from an idle document, every other key is ignored:
 Idle is never expressed by deleting the file — a missing file means "keep the
 current target" (see :class:`ControlFileWatcher`).
 
+A skill trained with feedbacks also reports binary flags ("Done", custom ones). They
+travel back the same way, as a line kind of their own — ``BMH_FEEDBACK {json}`` (see
+:func:`format_feedback_status`) — logged only when the flags change, so the
+``BMH_TARGET`` payload stays what it is.
+
 stdlib only (no zmq / cv2 / hardware imports) so it is unit-testable anywhere.
 """
 
@@ -41,7 +46,9 @@ from __future__ import annotations
 
 import json
 import logging
+import math
 import os
+from collections.abc import Mapping
 from dataclasses import dataclass, field
 from pathlib import Path
 
@@ -51,6 +58,10 @@ logger = logging.getLogger(__name__)
 # controller-app greps for it in the process output (see
 # bmh-101-os/controller-app/src/lib/inference.controller.ts).
 STATUS_PREFIX = "BMH_TARGET "
+
+# Prefix of the one-line JSON snapshot the client logs whenever the policy's feedback
+# flags change (same consumer). A line kind of its own, not part of `BMH_TARGET`.
+FEEDBACK_STATUS_PREFIX = "BMH_FEEDBACK "
 
 # Signature reported for a missing control file (never collides with a real stat).
 _MISSING_SIGNATURE = (-1, -1, -1)
@@ -242,4 +253,29 @@ def format_target_status(target: InferenceTarget, accepted: bool, error: str | N
             "policy_port": target.policy_port,
             "lang_instruction": target.lang_instruction,
         }
+    )
+
+
+def format_feedback_status(seq: int, flags: Mapping[str, bool], values: Mapping[str, float]) -> str:
+    """One-line ``BMH_FEEDBACK {json}`` snapshot of the policy's feedback flags.
+
+    Compact JSON, keys in this order:
+    ``BMH_FEEDBACK {"seq":4,"flags":{"done":true},"values":{"done":0.93}}``.
+
+    Args:
+        seq: ``seq`` of the target the flags belong to; the app shows them only while
+            that target is the applied one.
+        flags: Full snapshot, ``{feedback key: on?}`` (see
+            ``bmh/groot_client/feedback.py::FeedbackTracker``). Empty = cleared.
+        values: Raw 0..1 value behind each flag at the moment of the change, for the
+            log reader. Rounded to 3 decimals; non-finite values are left out so the
+            line is always valid JSON.
+    """
+    return FEEDBACK_STATUS_PREFIX + json.dumps(
+        {
+            "seq": seq,
+            "flags": dict(flags),
+            "values": {k: round(float(v), 3) for k, v in values.items() if math.isfinite(v)},
+        },
+        separators=(",", ":"),
     )

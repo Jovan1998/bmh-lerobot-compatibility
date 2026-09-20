@@ -38,6 +38,12 @@ With `--control_file` the client may also run *idle* — no server, no prompt, r
 holding position. It starts that way when neither the file nor `--lang_instruction`
 names a target (the controller-app's Physical Agent tab does this), and returns to
 it whenever the app writes an idle document.
+
+A skill trained with *feedbacks* returns extra `feedback_<key>` action keys (e.g.
+`feedback_done`). They ride along with each chunk step, never reach the robot, and are
+turned into debounced booleans that the controller-app reads from `BMH_FEEDBACK {json}`
+log lines — one per change, tagged with the `seq` of the target whose chunk set them
+(see bmh/groot_client/feedback.py). Display only: the client does not act on them.
 """
 
 import logging
@@ -60,9 +66,19 @@ from bmh.groot_client.control import (
     Hold,
     Idle,
     InferenceTarget,
+    format_feedback_status,
     format_target_status,
 )
-from bmh.groot_client.layout import JointGroup, group_joint_names, pack_state, unpack_action
+from bmh.groot_client.feedback import FeedbackTracker
+from bmh.groot_client.layout import (
+    FEEDBACK_PREFIX,
+    JointGroup,
+    group_joint_names,
+    pack_state,
+    split_feedback,
+    unpack_action,
+    unpack_feedback,
+)
 
 # Importing the robot configs ensures draccus CLI registration is populated.
 from lerobot.cameras.opencv.configuration_opencv import OpenCVCameraConfig  # noqa: F401
@@ -96,8 +112,15 @@ def _blend_actions(old: dict[str, float], new: dict[str, float], alpha: float) -
     Used to crossfade the seam between a retiring action chunk and a freshly
     arrived one. ``alpha`` near 0 keeps the old command, near 1 takes the new.
     Iterates over `new`'s keys; both dicts carry the same SO-joint key set.
+
+    ``feedback_*`` values are taken from `new` as they are: a crossfade would smear
+    the old skill's 1.0 into the new skill's 0. They are also the only keys the two
+    steps may not share (another skill, other feedbacks), so `old` is never asked
+    for one.
     """
-    return {k: (1.0 - alpha) * old[k] + alpha * new[k] for k in new}
+    return {
+        k: v if k.startswith(FEEDBACK_PREFIX) else (1.0 - alpha) * old[k] + alpha * v for k, v in new.items()
+    }
 
 
 def recursive_add_extra_dim(obs: dict) -> dict:
@@ -191,9 +214,15 @@ class BiSoBimanualAdapter:
         rtt_ms = (time.perf_counter() - tic) * 1000.0
         logger.info("policy round-trip: %.1f ms", rtt_ms)
 
-        any_key = next(iter(action_chunk.keys()))
-        horizon = action_chunk[any_key].shape[1]
-        return [self.decode_action_chunk(action_chunk, t) for t in range(horizon)]
+        # Horizon of a joint group — the chunk may carry other keys (`feedback_*`).
+        horizon = action_chunk[self.groups[0].key].shape[1]
+        # Each step = joint commands ∪ prefixed feedback values, so the feedback stays
+        # index-aligned with its action through truncation, the time-align drop and
+        # the swap. `split_feedback` takes them apart again before anything is sent.
+        return [
+            {**self.decode_action_chunk(action_chunk, t), **unpack_feedback(action_chunk, t)}
+            for t in range(horizon)
+        ]
 
     def validate_modality(self, modality_cfg: dict) -> None:
         """Compare the server's advertised modality keys against this robot's layout.
@@ -486,6 +515,15 @@ class BmhInferenceConfig:
     # is shorter), the blend is clamped to whatever overlap exists. Set to 0 to
     # disable blending and switch hard. Must be in [0, action_horizon).
     blend_frames: int = 3
+    # Policy feedbacks (`feedback_<key>` action channels, 0..1 — see
+    # bmh/groot_client/feedback.py). A flag switches on once its value stayed at or
+    # above `feedback_on_threshold` for `feedback_debounce_ticks` consecutive control
+    # ticks, and off again once it stayed at or below `feedback_off_threshold` for as
+    # many. The gap between the thresholds keeps a value hovering around one of them
+    # from flapping the flag. Need off <= on and at least 1 tick.
+    feedback_on_threshold: float = 0.6
+    feedback_off_threshold: float = 0.4
+    feedback_debounce_ticks: int = 5
 
 
 def _initial_target(
@@ -526,6 +564,18 @@ def _initial_target(
     if watcher is not None:
         return InferenceTarget.make_idle(0)
     raise SystemExit("--lang_instruction must not be empty (starting idle needs --control_file).")
+
+
+def _clear_feedback(tracker: FeedbackTracker, seq: int) -> None:
+    """Forget the policy's feedback flags; tell the app only if it had been shown any.
+
+    Args:
+        tracker: The control loop's tracker.
+        seq: Target the flags were reported under (the loop's `chunk_seq`), so the empty
+            snapshot replaces exactly the lines it clears.
+    """
+    if tracker.reset():
+        logger.info(format_feedback_status(seq, {}, {}))
 
 
 def _run_control_loop(
@@ -583,6 +633,18 @@ def _run_control_loop(
     # True while idle, and after the worker rejected a target or lost its server:
     # the robot holds its last pose and nothing is fired until a new seq arrives.
     holding = target.idle
+    # Chunk ownership, for the policy's feedback flags. `fire_seq` is the target the
+    # in-flight request was fired under, `chunk_seq` the one `current_chunk` was
+    # requested under (-1: no chunk yet; real seqs are >= 0). At most one request is
+    # in flight and the worker answers a request with actions only when it accepted
+    # that very target, so this is exact: the tracker is fed only while
+    # `chunk_seq == target.seq` and reset whenever `chunk_seq` changes — a chunk
+    # requested under the old target never sets flags under the new seq.
+    fire_seq = -1
+    chunk_seq = -1
+    tracker = FeedbackTracker(
+        cfg.feedback_on_threshold, cfg.feedback_off_threshold, cfg.feedback_debounce_ticks
+    )
 
     obs_queue: queue.Queue[tuple[InferenceTarget, dict[str, Any]] | None] = queue.Queue(maxsize=1)
     chunk_queue: queue.Queue[list[dict[str, float]] | Hold | Idle | None] = queue.Queue(maxsize=1)
@@ -607,6 +669,7 @@ def _run_control_loop(
             bootstrap_obs = robot.get_observation()
             bootstrap_obs["lang"] = target.lang_instruction
             current_chunk = adapter.get_action(bootstrap_obs)[: cfg.action_horizon]
+            chunk_seq = target.seq
 
         worker = threading.Thread(
             target=_inference_worker,
@@ -636,6 +699,7 @@ def _run_control_loop(
                         consumed_since_swap = 0
                         chunk_exhausted_at = None
                         holding = True
+                        _clear_feedback(tracker, chunk_seq)
                         logger.info("target #%d requested: idle — holding position", target.seq)
                     else:
                         logger.info(
@@ -675,7 +739,8 @@ def _run_control_loop(
                     # `consumed_since_swap` stays 0, so the `refetch_after` trigger
                     # never re-fires; only a new seq from the control file
                     # (`fire_now`) does. A chunk that was still in flight when the
-                    # target went idle lands here too and is discarded.
+                    # target went idle lands here too and is discarded. The dropped
+                    # chunk's feedback flags go with it.
                     if isinstance(new_chunk, Hold):
                         logger.error(
                             "target #%d on hold: %s — holding position until a valid target is applied",
@@ -688,6 +753,7 @@ def _run_control_loop(
                     consumed_since_swap = 0
                     chunk_exhausted_at = None
                     holding = True
+                    _clear_feedback(tracker, chunk_seq)
                 else:
                     holding = False
                     elapsed = frame_counter - fire_frame
@@ -739,15 +805,30 @@ def _run_control_loop(
                     inflight = False
                     consumed_since_swap = 0
                     chunk_exhausted_at = None
+                    if chunk_seq != fire_seq:
+                        # The chunk of another target takes over: its flags start from
+                        # scratch (first fed step re-announces them under the new seq).
+                        chunk_seq = fire_seq
+                        tracker.reset()
 
             # 2. Send an action (or hold position if we ran out / were told to).
+            #    A step also carries the policy's feedback values (see `get_action`);
+            #    only the joints go to the robot — and into `last_action`, which both
+            #    hold branches re-send. Hold / late-chunk ticks leave the tracker alone:
+            #    they are neither evidence for nor against a flag.
             if idx < len(current_chunk):
-                action = current_chunk[idx]
+                action, feedback = split_feedback(current_chunk[idx])
                 robot.send_action(action)
                 last_action = action
                 idx += 1
                 consumed_since_swap += 1
                 chunk_exhausted_at = None
+                # While a newer target is pending, the old target's chunk keeps playing
+                # but must not set flags under the new seq.
+                if chunk_seq == target.seq:
+                    flags = tracker.update(feedback)
+                    if flags is not None:
+                        logger.info(format_feedback_status(chunk_seq, flags, feedback))
             elif holding:
                 # Idle or on hold: keep the last pose, quietly (logged once above).
                 if last_action is not None:
@@ -780,6 +861,7 @@ def _run_control_loop(
                 inflight = True
                 fire_now = False
                 fire_frame = frame_counter
+                fire_seq = target.seq
                 remaining_at_fire = max(len(current_chunk) - idx, 0)
                 if not target.idle:
                     logger.info(
@@ -828,6 +910,13 @@ def main(cfg: BmhInferenceConfig) -> None:
         raise SystemExit(
             f"--blend_frames must be in [0, action_horizon={cfg.action_horizon}); got {cfg.blend_frames}."
         )
+    if cfg.feedback_off_threshold > cfg.feedback_on_threshold:
+        raise SystemExit(
+            f"--feedback_off_threshold ({cfg.feedback_off_threshold}) must not exceed "
+            f"--feedback_on_threshold ({cfg.feedback_on_threshold})."
+        )
+    if cfg.feedback_debounce_ticks < 1:
+        raise SystemExit(f"--feedback_debounce_ticks must be >= 1; got {cfg.feedback_debounce_ticks}.")
 
     # Initial target: the controller-app's control file when given, else the CLI
     # flags, else idle. A real target is validated by `_connect_policy` (ping +

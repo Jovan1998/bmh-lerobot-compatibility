@@ -4,7 +4,9 @@ Runs ``_run_control_loop`` (and ``main`` for the robot-disconnect guarantees) ag
 fakes and checks what reaches the robot: an idle start is still and quiet, a target from
 the control file connects and moves, an idle update stops motion at once and discards the
 chunk that was still in flight, a failing request holds instead of ending the process,
-and a failing startup never leaks a connected (torqued) robot.
+and a failing startup never leaks a connected (torqued) robot. The policy's feedback
+values (``feedback_*``) never reach the robot, and come back as ``BMH_FEEDBACK`` lines
+under the seq of the target whose chunk set them.
 
 The scripted watcher is the test clock: the loop polls it exactly once per tick, so it
 delivers targets at fixed ticks and ends the run with ``KeyboardInterrupt`` - which the
@@ -12,6 +14,8 @@ loop treats as a normal shutdown. Needs the same optional deps as the worker tes
 skipped otherwise. Run with ``uv run --no-sync --with msgpack-numpy pytest tests/bmh -q``.
 """
 
+import json
+import re
 import threading
 from collections.abc import Callable
 
@@ -23,10 +27,11 @@ pytest.importorskip("draccus")
 pytest.importorskip("zmq")
 
 import bmh.scripts.bmh_groot_client as script  # noqa: E402
-from bmh.groot_client.control import InferenceTarget  # noqa: E402
+from bmh.groot_client.control import FEEDBACK_STATUS_PREFIX, InferenceTarget  # noqa: E402
 from bmh.scripts.bmh_groot_client import (  # noqa: E402
     BmhInferenceConfig,
     PolicyConnectError,
+    _blend_actions,
     _run_control_loop,
     main,
 )
@@ -99,13 +104,25 @@ class _Connect:
 
 
 class _FakeAdapter:
-    """Call `n` (1-based) answers with actions `n * 100 + i`, so chunks are told apart."""
+    """Call `n` (1-based) answers with actions `n * 100 + i`, so chunks are told apart.
 
-    def __init__(self, fail_on: tuple[int, ...] = (), gates: dict[int, threading.Event] | None = None):
+    `feedback(n, i)` adds step `i`'s prefixed `feedback_*` values to call `n`'s chunk, the
+    way `BiSoBimanualAdapter.get_action` hands them over.
+    """
+
+    def __init__(
+        self,
+        fail_on: tuple[int, ...] = (),
+        gates: dict[int, threading.Event] | None = None,
+        feedback: Callable[[int, int], dict[str, float]] | None = None,
+        horizon: int = HORIZON,
+    ):
         self.policy = None
         self.calls: list[str] = []
         self.fail_on = fail_on
         self.gates = gates or {}
+        self.feedback = feedback
+        self.horizon = horizon
 
     def get_action(self, obs: dict) -> list[dict[str, float]]:
         self.calls.append(obs["lang"])
@@ -114,7 +131,10 @@ class _FakeAdapter:
             assert self.gates[n].wait(5), "gate was never opened"
         if n in self.fail_on:
             raise RuntimeError("server gone")
-        return [{"j": float(n * 100 + i)} for i in range(HORIZON)]
+        return [
+            {"j": float(n * 100 + i), **(self.feedback(n, i) if self.feedback else {})}
+            for i in range(self.horizon)
+        ]
 
 
 class _ScriptedWatcher:
@@ -135,6 +155,25 @@ class _ScriptedWatcher:
 
 def _statuses(caplog) -> list[str]:
     return [r.getMessage() for r in caplog.records if r.getMessage().startswith("BMH_TARGET")]
+
+
+def _feedback_lines(caplog) -> list[dict]:
+    """Decoded `BMH_FEEDBACK` payloads, in log order."""
+    messages = [r.getMessage() for r in caplog.records]
+    return [
+        json.loads(m[len(FEEDBACK_STATUS_PREFIX) :]) for m in messages if m.startswith(FEEDBACK_STATUS_PREFIX)
+    ]
+
+
+def _line(seq: int, done: bool | None, value: float | None = None) -> dict:
+    """Expected payload for the single feedback `done`; `done=None` is the cleared snapshot."""
+    if done is None:
+        return {"seq": seq, "flags": {}, "values": {}}
+    return {"seq": seq, "flags": {"done": done}, "values": {"done": value}}
+
+
+def _joints_only(robot: _FakeRobot) -> bool:
+    return all(set(action) == {"j"} for action in robot.sent)
 
 
 # --------------------------------------------------------------------------- loop
@@ -239,6 +278,153 @@ def test_startup_connect_failure_exits_without_a_worker():
     assert not [t for t in threading.enumerate() if t.name == "bmh-inference-worker"]
 
 
+# --------------------------------------------------------------------------- feedback
+
+
+def test_ramping_feedback_reports_true_once_after_the_debounce(caplog):
+    # One 24-step chunk whose `feedback_done` ramps i / 16; request 2 hangs until the last
+    # tick, so tick t plays step t - 1 and nothing else feeds the tracker. The value is at
+    # or above 0.6 from step 10 (0.625) on: the 5th such tick in a row is step 14 (0.875).
+    gate = threading.Event()
+    robot = _FakeRobot()
+    adapter = _FakeAdapter(gates={2: gate}, horizon=24, feedback=lambda _n, i: {"feedback_done": i / 16})
+    with caplog.at_level("INFO"):
+        _run_control_loop(
+            robot,
+            adapter,
+            _ScriptedWatcher({TICKS: gate.set}),
+            _target(1),
+            _cfg(action_horizon=24),
+            _Connect(),
+        )
+    assert _feedback_lines(caplog) == [_line(1, False, 0.0), _line(1, True, 0.875)]
+    # Nothing but joints ever reached the robot — the late-chunk ticks re-send the last
+    # *action*, not the last chunk step.
+    assert len(robot.sent) == TICKS and _joints_only(robot)
+    assert robot.sent[23] == robot.sent[40] == {"j": 123.0}
+
+
+def test_no_feedback_keys_means_no_feedback_lines(caplog):
+    robot = _FakeRobot()
+    with caplog.at_level("INFO"):
+        _run_control_loop(robot, _FakeAdapter(), _ScriptedWatcher(), _target(1), _cfg(), _Connect())
+    assert len(robot.sent) > HORIZON
+    assert FEEDBACK_STATUS_PREFIX.strip() not in caplog.text
+
+
+def test_idle_clears_the_feedback_flags(caplog):
+    # `done` is on from tick 5 (default debounce); the idle target arrives at tick 7 while
+    # request 2 is still in flight, its stale chunk lands during idle (tick 9+).
+    gate = threading.Event()
+    robot = _FakeRobot()
+    adapter = _FakeAdapter(gates={2: gate}, feedback=lambda _n, _i: {"feedback_done": 1.0})
+    lines_before_gate: list[int] = []
+
+    def open_gate() -> None:
+        lines_before_gate.append(len(_feedback_lines(caplog)))
+        gate.set()
+
+    watcher = _ScriptedWatcher({7: lambda: InferenceTarget.make_idle(2), 9: open_gate})
+    with caplog.at_level("INFO"):
+        _run_control_loop(robot, adapter, watcher, _target(1), _cfg(), _Connect())
+    # Cleared once - under the seq the flags were reported for - not again when the worker's
+    # `Idle` reply and the stale chunk arrive.
+    assert _feedback_lines(caplog) == [_line(1, False, 1.0), _line(1, True, 1.0), _line(1, None)]
+    # ...and at once, with the robot: not when the worker (still busy with the stale
+    # request, for up to `timeout_ms` on a slow server) gets round to answering `Idle`.
+    assert lines_before_gate == [3]
+    assert len(robot.sent) == TICKS and _joints_only(robot)  # incl. ~50 idle hold ticks
+    assert robot.sent[-1] == {"j": 105.0}
+
+
+def test_hold_after_a_failed_request_clears_the_feedback_flags(caplog):
+    # Request 2 fails, but only once the gate opens at tick 7 - `done` is on by then.
+    gate = threading.Event()
+    robot = _FakeRobot()
+    adapter = _FakeAdapter(
+        fail_on=(2,), gates={2: gate}, feedback=lambda _n, _i: {"feedback_done": 1.0}, horizon=24
+    )
+    with caplog.at_level("INFO"):
+        _run_control_loop(
+            robot, adapter, _ScriptedWatcher({7: gate.set}), _target(1), _cfg(action_horizon=24), _Connect()
+        )
+    assert _feedback_lines(caplog) == [_line(1, False, 1.0), _line(1, True, 1.0), _line(1, None)]
+    assert len(robot.sent) == TICKS and _joints_only(robot)  # incl. the hold ticks
+    assert robot.sent[-1] == robot.sent[-2]
+
+
+def test_inflight_chunk_of_the_old_target_sets_nothing_under_the_new_seq(caplog):
+    # Request 2 is fired under target #1 and hangs; target #2 arrives at tick 5; the gate
+    # opens at tick 7. Chunk 2 - the only one reporting `done` - is therefore played while
+    # target #2 is already current. With a debounce of 1 a single fed step would flip the
+    # flag, so any leak shows.
+    gate = threading.Event()
+    robot = _FakeRobot()
+    adapter = _FakeAdapter(gates={2: gate}, feedback=lambda n, _i: {"feedback_done": 1.0 if n == 2 else 0.0})
+    watcher = _ScriptedWatcher({5: lambda: _target(2, lang="task B"), 7: gate.set})
+    with caplog.at_level("INFO"):
+        _run_control_loop(robot, adapter, watcher, _target(1), _cfg(feedback_debounce_ticks=1), _Connect())
+    assert adapter.calls[:3] == ["task A", "task A", "task B"]
+    assert any(200 <= a["j"] < 300 for a in robot.sent)  # the old target's chunk did play
+    # Never on: not under #1 (no longer current), not under #2 (not its chunk). #2's own
+    # first chunk then re-announces the flag under the new seq.
+    assert _feedback_lines(caplog) == [_line(1, False, 0.0), _line(2, False, 0.0)]
+    assert _joints_only(robot)
+
+
+def test_new_target_starts_its_flags_from_scratch(caplog):
+    # Every chunk says `done`; a prompt-only change arrives at tick 20. The flag must not
+    # carry over: target #2 announces it off, then debounces it on from its own chunks.
+    robot = _FakeRobot()
+    adapter = _FakeAdapter(feedback=lambda _n, _i: {"feedback_done": 1.0})
+    watcher = _ScriptedWatcher({20: lambda: _target(2, lang="task B")})
+    with caplog.at_level("INFO"):
+        _run_control_loop(robot, adapter, watcher, _target(1), _cfg(), _Connect())
+    assert _feedback_lines(caplog) == [
+        _line(1, False, 1.0),
+        _line(1, True, 1.0),
+        _line(2, False, 1.0),
+        _line(2, True, 1.0),
+    ]
+    assert _joints_only(robot)
+
+
+def test_blending_chunks_with_different_feedback_keys_does_not_raise(caplog):
+    # Consecutive chunks disagree on their feedback keys (as across a skill switch):
+    # none / {a} / {a, b}, crossfaded over 3 frames at every swap.
+    def feedback(n: int, _i: int) -> dict[str, float]:
+        return [{}, {"feedback_a": 1.0}, {"feedback_a": 0.0, "feedback_b": 1.0}][n % 3]
+
+    robot = _FakeRobot()
+    with caplog.at_level("INFO"):
+        _run_control_loop(
+            robot,
+            _FakeAdapter(feedback=feedback),
+            _ScriptedWatcher(),
+            _target(1),
+            _cfg(blend_frames=3),
+            _Connect(),
+        )
+    blended = [int(n) for n in re.findall(r"(\d+) blended", caplog.text)]
+    assert blended and max(blended) > 0  # the crossfade really ran
+    assert len(robot.sent) > HORIZON and _joints_only(robot)
+
+
+def test_blend_actions_takes_feedback_from_the_new_chunk_unblended():
+    old = {"j": 0.0, "feedback_done": 1.0, "feedback_old_only": 1.0}
+    new = {"j": 10.0, "feedback_done": 0.0, "feedback_new_only": 0.5}
+    assert _blend_actions(old, new, 0.25) == {"j": 2.5, "feedback_done": 0.0, "feedback_new_only": 0.5}
+
+
+def test_feedback_config_defaults():
+    cfg = BmhInferenceConfig(robot=None)
+    assert (cfg.feedback_on_threshold, cfg.feedback_off_threshold, cfg.feedback_debounce_ticks) == (
+        0.6,
+        0.4,
+        5,
+    )
+
+
 # --------------------------------------------------------------------------- main
 
 
@@ -275,6 +461,17 @@ def test_main_without_target_or_control_file_never_touches_the_robot(fake_main):
     robot, _adapter, _state = fake_main
     with pytest.raises(SystemExit, match="--control_file"):
         main(_cfg())
+    assert robot.connected == 0
+
+
+@pytest.mark.parametrize(
+    "overrides",
+    [{"feedback_on_threshold": 0.3}, {"feedback_off_threshold": 0.7}, {"feedback_debounce_ticks": 0}],
+)
+def test_main_rejects_bad_feedback_settings_before_touching_the_robot(fake_main, overrides):
+    robot, _adapter, _state = fake_main
+    with pytest.raises(SystemExit, match="--feedback_"):
+        main(_cfg(lang_instruction="task A", **overrides))
     assert robot.connected == 0
 
 

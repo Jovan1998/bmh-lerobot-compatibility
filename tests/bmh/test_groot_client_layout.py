@@ -8,11 +8,14 @@ import numpy as np
 import pytest
 
 from bmh.groot_client.layout import (
+    FEEDBACK_PREFIX,
     JointGroup,
     group_joint_names,
     group_key_for,
     pack_state,
+    split_feedback,
     unpack_action,
+    unpack_feedback,
 )
 
 # `bi_so_follower.action_features` keys for the 7-DoF + head BMH-101
@@ -147,3 +150,45 @@ def test_unpack_action_rejects_wrong_width():
     chunk["left_head"] = np.zeros((1, 4, 1))  # server trained without head_tilt
     with pytest.raises(ValueError, match="left_head"):
         unpack_action(chunk, groups, 0)
+
+
+# --------------------------------------------------------------------------- feedback
+
+
+def _chunk_with_feedback(horizon: int = 4) -> dict:
+    groups = group_joint_names(BMH_101_16_NAMES)
+    chunk = {g.key: np.zeros((1, horizon, len(g.names)), dtype=np.float32) for g in groups}
+    # (B=1, T, W=4): the platform duplicates each feedback over W channels.
+    done = np.zeros((1, horizon, 4), dtype=np.float32)
+    done[0, 1] = [0.0, 0.0, 1.0, 1.0]
+    done[0, 2] = [1.0, 1.0, 1.0, 1.0]
+    chunk[f"{FEEDBACK_PREFIX}done"] = done
+    chunk[f"{FEEDBACK_PREFIX}object_grasped"] = np.full((1, horizon, 2), 0.25, dtype=np.float32)
+    return chunk
+
+
+def test_unpack_action_ignores_feedback_keys():
+    # What an old client does with a feedback-trained skill, too: the extra keys are inert.
+    action = unpack_action(_chunk_with_feedback(), group_joint_names(BMH_101_16_NAMES), 1)
+    assert list(action) == BMH_101_16_NAMES
+
+
+def test_unpack_feedback_averages_the_channel_width():
+    chunk = _chunk_with_feedback()
+    assert unpack_feedback(chunk, 0) == {"feedback_done": 0.0, "feedback_object_grasped": 0.25}
+    assert unpack_feedback(chunk, 1) == {"feedback_done": 0.5, "feedback_object_grasped": 0.25}
+    assert unpack_feedback(chunk, 2) == {"feedback_done": 1.0, "feedback_object_grasped": 0.25}
+    assert all(type(v) is float for v in unpack_feedback(chunk, 1).values())
+
+
+def test_unpack_feedback_is_empty_for_a_skill_without_feedbacks():
+    groups = group_joint_names(BMH_101_16_NAMES)
+    assert unpack_feedback({g.key: np.zeros((1, 4, len(g.names))) for g in groups}, 0) == {}
+
+
+def test_split_feedback_separates_joints_from_bare_feedback_keys():
+    step = {"left_gripper.pos": 3.0, "feedback_done": 0.9, "right_gripper.pos": -1.0, "feedback_a_b": 0.1}
+    action, feedback = split_feedback(step)
+    assert action == {"left_gripper.pos": 3.0, "right_gripper.pos": -1.0}
+    assert feedback == {"done": 0.9, "a_b": 0.1}  # prefix stripped: the platform's feedback key
+    assert split_feedback({"left_gripper.pos": 3.0}) == ({"left_gripper.pos": 3.0}, {})

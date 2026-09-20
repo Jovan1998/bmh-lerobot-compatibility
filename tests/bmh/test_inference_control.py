@@ -2,7 +2,7 @@
 
 Covers ``parse_target`` validation (incl. the idle document), ``InferenceTarget.endpoint``
 equality, ``ControlFileWatcher`` change detection (stat-based, like the teleop lock watcher)
-and the ``BMH_TARGET`` status line. Pure stdlib module, so this runs anywhere.
+and the ``BMH_TARGET`` / ``BMH_FEEDBACK`` status lines. Pure stdlib module, so this runs anywhere.
 Run with ``uv run --no-sync pytest tests/bmh/test_inference_control.py -q``.
 """
 
@@ -12,9 +12,11 @@ import os
 import pytest
 
 from bmh.groot_client.control import (
+    FEEDBACK_STATUS_PREFIX,
     STATUS_PREFIX,
     ControlFileWatcher,
     InferenceTarget,
+    format_feedback_status,
     format_target_status,
     parse_target,
 )
@@ -242,3 +244,43 @@ def test_format_target_status_idle():
         "policy_port": 0,
         "lang_instruction": "",
     }
+
+
+# --------------------------------------------------------------------------- feedback
+
+
+def test_format_feedback_status_is_the_exact_compact_line():
+    # The controller-app matches /BMH_FEEDBACK (\{.*\})\s*$/ — this is the contract.
+    line = format_feedback_status(4, {"done": True}, {"done": 0.93})
+    assert line == 'BMH_FEEDBACK {"seq":4,"flags":{"done":true},"values":{"done":0.93}}'
+
+
+def test_format_feedback_status_round_trips():
+    flags = {"done": False, "object_grasped": True}
+    line = format_feedback_status(7, flags, {"done": 0.123456, "object_grasped": 1.0})
+    assert line.startswith(FEEDBACK_STATUS_PREFIX)
+    assert "\n" not in line
+    payload = json.loads(line[len(FEEDBACK_STATUS_PREFIX) :])
+    assert payload == {"seq": 7, "flags": flags, "values": {"done": 0.123, "object_grasped": 1.0}}
+    assert list(payload) == ["seq", "flags", "values"]
+    assert list(payload["flags"]) == ["done", "object_grasped"]  # feedbacks[] order survives
+
+
+def test_format_feedback_status_cleared_snapshot():
+    assert format_feedback_status(4, {}, {}) == 'BMH_FEEDBACK {"seq":4,"flags":{},"values":{}}'
+
+
+def test_format_feedback_status_never_emits_invalid_json():
+    line = format_feedback_status(1, {"a": False, "b": False}, {"a": float("nan"), "b": float("inf")})
+    assert json.loads(line[len(FEEDBACK_STATUS_PREFIX) :]) == {
+        "seq": 1,
+        "flags": {"a": False, "b": False},
+        "values": {},
+    }
+
+
+def test_feedback_line_is_not_a_target_line():
+    assert not format_feedback_status(1, {}, {}).startswith(STATUS_PREFIX)
+    assert not format_target_status(InferenceTarget.make_idle(1), True, None).startswith(
+        FEEDBACK_STATUS_PREFIX
+    )

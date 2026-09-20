@@ -79,6 +79,43 @@ def test_decode_action_chunk_emits_all_16_pos_keys_including_head():
     assert action["left_wrist_yaw.pos"] == pytest.approx(float(chunk["left_single_arm"][0, 3, 4]))
 
 
+class _FakePolicy:
+    """Stand-in for ``PolicyClient``: answers every request with one fixed chunk."""
+
+    def __init__(self, chunk: dict):
+        self.chunk = chunk
+
+    def get_action(self, _model_input: dict) -> tuple[dict, dict]:
+        return self.chunk, {}
+
+
+def test_get_action_takes_horizon_from_a_joint_group_and_carries_feedback_per_step():
+    adapter = _adapter()
+    # The feedback key comes first and is longer than the joint groups: the horizon must
+    # not be read off "whatever key is first".
+    done = np.zeros((1, 12, 4), dtype=np.float32)
+    done[0, 5:] = 1.0
+    done[0, 4] = [0.0, 1.0, 1.0, 0.0]
+    chunk = {"feedback_done": done}
+    chunk.update({g.key: np.full((1, 8, len(g.names)), 2.0, dtype=np.float32) for g in adapter.groups})
+    adapter.policy = _FakePolicy(chunk)
+
+    steps = adapter.get_action(_fake_obs())
+
+    assert len(steps) == 8
+    assert all(list(step) == [*BMH_101_16_NAMES, "feedback_done"] for step in steps)
+    assert [step["feedback_done"] for step in steps] == [0.0, 0.0, 0.0, 0.0, 0.5, 1.0, 1.0, 1.0]
+    assert steps[3]["left_head_pan.pos"] == 2.0
+
+
+def test_get_action_without_feedback_keys_yields_joints_only():
+    adapter = _adapter()
+    adapter.policy = _FakePolicy({g.key: np.zeros((1, 8, len(g.names))) for g in adapter.groups})
+    steps = adapter.get_action(_fake_obs())
+    assert len(steps) == 8
+    assert all(list(step) == BMH_101_16_NAMES for step in steps)
+
+
 def test_validate_modality_accepts_matching_layout():
     _adapter().validate_modality(_modality_cfg(BMH_101_STATE_KEYS))
 
