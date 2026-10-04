@@ -100,7 +100,14 @@ Locking a group again mid-blend holds the blended pose.
   when it changed; a missing file means "all unlocked", a malformed one is logged once and ignored.
 - Groups: `left` = the 7 `left_*.pos` arm keys incl. gripper, `right` = the 7 `right_*.pos` keys,
   `head` = `left_head_pan.pos` / `left_head_tilt.pos` (the head rides the left stream, hence the
-  explicit key sets). Every change is logged as `Teleop locks: left=on right=off head=off`.
+  explicit key sets). Every change is logged as
+  `Teleop locks: left=on right=off head=off | head jitter: pan=+0.0 tilt=+0.0`.
+- **Head jitter:** the state file may also carry `"head_jitter": {"pan": deg, "tilt": deg}`. A
+  *frozen* head is then held at its frozen pose plus that offset (degrees, clamped to ±15) and eases
+  to every new offset over `unlock_blend_s`; the offset is always relative to the frozen pose, so it
+  never accumulates. It is ignored while the head is not frozen, and a file without the key means no
+  offset. The controller-app writes a fresh random offset when the inter-episode reset starts
+  ("Jitter head" in the recording panel), so a dataset covers small head-pose differences.
 - **Recording:** the lock runs inside `get_action()`, so `lerobot-record` stores the held / blended
   pose as the dataset `action` - the same values the follower was commanded, and consistent with
   `observation.state`. Locks also hold through the inter-episode reset phase.

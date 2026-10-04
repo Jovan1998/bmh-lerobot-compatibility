@@ -9,7 +9,7 @@ from lerobot.utils.decorators import check_if_already_connected, check_if_not_co
 from ..so_network_leader import SONetworkLeader
 from ..so_network_leader.config_so_network_leader import SONetworkLeaderConfig
 from .config_bi_so_network_leader import BiSONetworkLeaderConfig
-from .group_lock import ActionGroupLock, LockFileWatcher, bimanual_lock_groups
+from .group_lock import ActionGroupLock, LockFileWatcher, bimanual_lock_groups, head_jitter_offsets
 
 logger = logging.getLogger(__name__)
 
@@ -122,9 +122,13 @@ class BiSONetworkLeader(Teleoperator):
         new_locks = self._lock_watcher.poll()
         if new_locks is not None:
             self._lock.set_locks(new_locks)
+            # Head jitter: the offset a frozen head is held at (ignored while the head tracks).
+            head_jitter = self._lock_watcher.head_jitter
+            self._lock.set_offsets(head_jitter_offsets(head_jitter))
             logger.info(
-                "Teleop locks: %s",
+                "Teleop locks: %s | head jitter: %s",
                 " ".join(f"{group}={'on' if locked else 'off'}" for group, locked in new_locks.items()),
+                " ".join(f"{axis}={degrees:+.1f}" for axis, degrees in head_jitter.items()),
             )
         return self._lock.apply(action_dict, now)
 

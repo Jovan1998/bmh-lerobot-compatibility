@@ -18,9 +18,11 @@ class BiSONetworkLeaderConfig(TeleoperatorConfig):
     )
 
     # BMH-101 group locks (left arm / right arm / head). Path to a JSON file
-    # {"left": bool, "right": bool, "head": bool} written by the controller-app.
+    # {"left": bool, "right": bool, "head": bool} written by the controller-app, optionally
+    # with "head_jitter": {"pan": deg, "tilt": deg} - an offset a frozen head is held at.
     # Polled with one os.stat per get_action(); only re-read when it changed.
     # None disables locking entirely (upstream behaviour).
     lock_file: str | None = None
-    # Seconds to ease a group from its held pose back to the live leader pose after unlock.
+    # Seconds to ease a group from its held pose back to the live leader pose after unlock
+    # (also the time a frozen head takes to ease to a new head_jitter offset).
     unlock_blend_s: float = 0.8

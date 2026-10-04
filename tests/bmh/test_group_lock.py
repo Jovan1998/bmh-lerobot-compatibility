@@ -1,7 +1,7 @@
 """Unit tests for the BMH-101 teleop group lock - no ZMQ, no hardware.
 
-Covers ``ActionGroupLock`` (freeze + smoothstep unlock blend) and ``LockFileWatcher``
-(stat-based change detection of the controller-app's JSON file). Needs ``draccus``
+Covers ``ActionGroupLock`` (freeze + smoothstep unlock blend + head-jitter offsets) and
+``LockFileWatcher`` (stat-based change detection of the controller-app's JSON file). Needs ``draccus``
 because importing the teleoperator package registers draccus configs. Run with
 ``uv run --no-sync pytest tests/bmh/test_group_lock.py -q``.
 """
@@ -16,9 +16,11 @@ pytest.importorskip("draccus")
 
 from lerobot.teleoperators.bi_so_network_leader.group_lock import (  # noqa: E402
     LOCK_GROUPS,
+    MAX_HEAD_JITTER_DEG,
     ActionGroupLock,
     LockFileWatcher,
     bimanual_lock_groups,
+    head_jitter_offsets,
     smoothstep,
 )
 from lerobot.teleoperators.so_network_leader.so_network_leader import (  # noqa: E402
@@ -223,6 +225,157 @@ def test_negative_blend_duration_rejected():
         _lock(blend_s=-0.1)
 
 
+# --------------------------------------------------------------------------- offsets (head jitter)
+
+PAN, TILT = HEAD
+TICK_S = 1 / 30
+
+
+def _jitter(pan: float, tilt: float) -> dict[str, float]:
+    return head_jitter_offsets({"pan": pan, "tilt": tilt})
+
+
+def _head_locked(head: float) -> ActionGroupLock:
+    lock = _lock()
+    lock.set_locks({"head": True})
+    lock.apply(_action(head=head), now=0.0)
+    return lock
+
+
+def _run(lock: ActionGroupLock, start: float, seconds: float, head: float = 0.0) -> tuple[dict, float]:
+    """Tick the lock at 30 Hz for ``seconds``; returns the last output and its time."""
+    now, out = start, {}
+    for _ in range(round(seconds / TICK_S)):
+        now += TICK_S
+        out = lock.apply(_action(head=head), now=now)
+    return out, now
+
+
+def test_head_jitter_offsets_map_to_the_head_keys():
+    assert _jitter(2.0, -1.0) == {PAN: 2.0, TILT: -1.0}
+    assert set(_jitter(0.0, 0.0)) == set(HEAD)
+
+
+def test_offset_is_ignored_while_the_group_tracks():
+    lock = _lock()
+    lock.set_offsets(_jitter(5.0, 5.0))
+    action = _action(left=1.0, head=3.0)
+    assert lock.apply(action, now=0.0) == action
+    assert lock.apply(action, now=1.0) == action
+
+
+def test_offset_eases_in_while_held_and_then_stays():
+    lock = _head_locked(10.0)
+    lock.set_offsets(_jitter(4.0, -2.0))
+
+    # The tick that observes the offset still outputs exactly the held pose (no jump).
+    out = lock.apply(_action(head=50.0), now=TICK_S)
+    assert _all(out, HEAD, 10.0)
+    # Halfway through the ease: smoothstep(0.5) == 0.5.
+    out, now = _run(lock, TICK_S, BLEND_S / 2, head=50.0)
+    assert out[PAN] == pytest.approx(12.0) and out[TILT] == pytest.approx(9.0)
+    # Done: exactly held + offset, and it stays there whatever the leader does.
+    out, now = _run(lock, now, BLEND_S, head=-50.0)
+    assert out[PAN] == 14.0 and out[TILT] == 8.0
+    out, _ = _run(lock, now, 5.0, head=99.0)
+    assert out[PAN] == 14.0 and out[TILT] == 8.0
+
+
+def test_offset_ease_is_monotonic_and_only_moves_the_held_group():
+    lock = _head_locked(0.0)
+    lock.set_offsets(_jitter(5.0, 0.0))
+    samples, now = [], 0.0
+    for _ in range(round(BLEND_S / TICK_S) + 2):
+        now += TICK_S
+        out = lock.apply(_action(left=1.0, right=2.0), now=now)
+        samples.append(out[PAN])
+        assert out[TILT] == 0.0
+        assert _all(out, LEFT, 1.0) and _all(out, RIGHT, 2.0)
+    assert samples[0] == 0.0 and samples[-1] == 5.0
+    assert all(b >= a for a, b in pairwise(samples))
+
+
+def test_new_offset_replaces_the_old_one_around_the_same_held_pose():
+    lock = _head_locked(10.0)
+    lock.set_offsets(_jitter(4.0, 4.0))
+    _, now = _run(lock, 0.0, 2.0)
+
+    # Re-roll: eases from the current offset, and ends at held + new offset (no accumulation).
+    lock.set_offsets(_jitter(-3.0, 1.0))
+    out = lock.apply(_action(), now=now + TICK_S)
+    assert _all(out, HEAD, 14.0)
+    out, now = _run(lock, now + TICK_S, 2.0)
+    assert out[PAN] == 7.0 and out[TILT] == 11.0
+
+    lock.set_offsets({})  # offset cleared: back to the held pose itself
+    out, _ = _run(lock, now, 2.0)
+    assert _all(out, HEAD, 10.0)
+
+
+def test_offset_ease_resumes_after_a_pause_instead_of_jumping():
+    # lerobot-record calls no get_action() while it saves an episode; the first tick of the
+    # next episode must not finish the ease in one step.
+    lock = _head_locked(0.0)
+    lock.set_offsets(_jitter(5.0, 5.0))
+    lock.apply(_action(), now=TICK_S)
+    before, now = _run(lock, TICK_S, BLEND_S / 2)
+    assert before[PAN] == pytest.approx(2.5)
+
+    after = lock.apply(_action(), now=now + 120.0)
+    assert 0.0 < after[PAN] - before[PAN] < 1.0
+    out, _ = _run(lock, now + 120.0, BLEND_S)
+    assert _all(out, HEAD, 5.0)
+
+
+def test_locking_with_an_offset_already_set_starts_at_the_held_pose():
+    lock = _lock()
+    lock.set_offsets(_jitter(5.0, 5.0))
+    lock.apply(_action(head=20.0), now=0.0)
+
+    lock.set_locks({"head": True})
+    out = lock.apply(_action(head=30.0), now=TICK_S)
+    assert _all(out, HEAD, 20.0)
+    out, _ = _run(lock, TICK_S, 2.0, head=30.0)
+    assert _all(out, HEAD, 25.0)
+
+
+def test_unlock_blends_from_the_offset_pose_to_the_leader():
+    lock = _head_locked(10.0)
+    lock.set_offsets(_jitter(4.0, 4.0))
+    _run(lock, 0.0, 2.0)
+
+    lock.set_locks({"head": False})
+    out = lock.apply(_action(head=34.0), now=10.0)
+    assert _all(out, HEAD, 14.0)  # starts from held + offset, not from the bare held pose
+    out = lock.apply(_action(head=34.0), now=10.0 + BLEND_S / 2)
+    assert _all(out, HEAD, 24.0)
+    out = lock.apply(_action(head=34.0), now=10.0 + BLEND_S)
+    assert _all(out, HEAD, 34.0)
+    assert lock.modes["head"] == "track"
+
+
+def test_relock_holds_the_new_pose_without_a_stale_offset():
+    lock = _head_locked(10.0)
+    lock.set_offsets(_jitter(4.0, 4.0))
+    _, now = _run(lock, 0.0, 2.0)
+    lock.set_locks({"head": False})
+    lock.set_offsets({})
+    _, now = _run(lock, now, 2.0, head=30.0)
+
+    lock.set_locks({"head": True})
+    out, _ = _run(lock, now, 2.0, head=60.0)
+    assert _all(out, HEAD, 30.0)
+
+
+def test_zero_blend_duration_snaps_to_the_offset():
+    lock = _lock(blend_s=0.0)
+    lock.set_locks({"head": True})
+    lock.apply(_action(head=1.0), now=0.0)
+    lock.set_offsets(_jitter(3.0, -3.0))
+    out = lock.apply(_action(head=9.0), now=0.1)
+    assert out[PAN] == 4.0 and out[TILT] == -2.0
+
+
 # --------------------------------------------------------------------------- watcher
 
 
@@ -281,3 +434,62 @@ def test_watcher_deleted_file_clears_locks(tmp_path):
     path.unlink()
     assert watcher.poll() == ALL_UNLOCKED
     assert watcher.poll() is None
+
+
+NO_JITTER = {"pan": 0.0, "tilt": 0.0}
+
+
+def test_watcher_head_jitter_defaults_to_zero(tmp_path):
+    path = tmp_path / "locks.json"
+    watcher = LockFileWatcher(path)
+    assert watcher.head_jitter == NO_JITTER
+    _write(path, {"head": True}, 1_000)  # file from an app without head jitter
+    assert watcher.poll() == {"left": False, "right": False, "head": True}
+    assert watcher.head_jitter == NO_JITTER
+
+
+def test_watcher_reads_head_jitter_with_the_locks(tmp_path):
+    path = tmp_path / "locks.json"
+    watcher = LockFileWatcher(path)
+    _write(path, {"head": True, "head_jitter": {"pan": 2.5, "tilt": -1}}, 1_000)
+    assert watcher.poll() == {"left": False, "right": False, "head": True}
+    assert watcher.head_jitter == {"pan": 2.5, "tilt": -1.0}
+
+    # A change of only the offset is still reported as a new state.
+    _write(path, {"head": True, "head_jitter": {"pan": -4.0}}, 2_000)
+    assert watcher.poll() == {"left": False, "right": False, "head": True}
+    assert watcher.head_jitter == {"pan": -4.0, "tilt": 0.0}
+
+    path.unlink()
+    assert watcher.poll() == ALL_UNLOCKED
+    assert watcher.head_jitter == NO_JITTER
+
+
+def test_watcher_clamps_head_jitter(tmp_path):
+    path = tmp_path / "locks.json"
+    watcher = LockFileWatcher(path)
+    _write(path, {"head": True, "head_jitter": {"pan": 90, "tilt": -90}}, 1_000)
+    assert watcher.poll() is not None
+    assert watcher.head_jitter == {"pan": MAX_HEAD_JITTER_DEG, "tilt": -MAX_HEAD_JITTER_DEG}
+
+
+@pytest.mark.parametrize("bad", [[1, 2], "5", {"pan": "5"}, {"pan": True}, {"tilt": None}])
+def test_watcher_malformed_head_jitter_keeps_previous_state(tmp_path, caplog, bad):
+    path = tmp_path / "locks.json"
+    watcher = LockFileWatcher(path)
+    _write(path, {"head": True, "head_jitter": {"pan": 2.0, "tilt": 1.0}}, 1_000)
+    assert watcher.poll()["head"] is True
+
+    _write(path, {"head": False, "head_jitter": bad}, 2_000)
+    with caplog.at_level("WARNING"):
+        assert watcher.poll() is None
+    assert "head_jitter" in caplog.text
+    assert watcher.head_jitter == {"pan": 2.0, "tilt": 1.0}
+
+
+def test_watcher_non_finite_head_jitter_is_rejected(tmp_path):
+    path = tmp_path / "locks.json"
+    watcher = LockFileWatcher(path)
+    path.write_text('{"head": true, "head_jitter": {"pan": NaN, "tilt": Infinity}}')
+    assert watcher.poll() is None
+    assert watcher.head_jitter == NO_JITTER
