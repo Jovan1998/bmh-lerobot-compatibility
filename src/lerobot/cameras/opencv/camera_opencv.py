@@ -20,8 +20,6 @@ import logging
 import math
 import os
 import platform
-import subprocess
-import sys
 import time
 from pathlib import Path
 from threading import Event, Lock, Thread
@@ -49,28 +47,7 @@ from .configuration_opencv import ColorMode, OpenCVCameraConfig
 # treat the same cameras as new devices. Thus we select a higher bound to search indices.
 MAX_OPENCV_INDEX = 60
 
-# BMH: frame-rate watchdog in the read thread (see `_read_loop`). Frames are counted per
-# window; a window below MIN_RATIO x configured fps logs a warning at most once per
-# WARN_INTERVAL so a camera silently halving its rate shows up in the recording log.
-FPS_WATCHDOG_WINDOW_S = 5.0
-FPS_WATCHDOG_WARN_INTERVAL_S = 60.0
-FPS_WATCHDOG_MIN_RATIO = 0.9
-
 logger = logging.getLogger(__name__)
-
-
-def _parse_v4l2_controls(output: str) -> dict[str, int]:
-    """Parses `v4l2-ctl -C` output (`name: value [(label)]` per line) into {name: int}."""
-    values: dict[str, int] = {}
-    for line in output.splitlines():
-        name, sep, rest = line.partition(":")
-        if not sep:
-            continue
-        try:
-            values[name.strip()] = int(rest.split()[0])
-        except (IndexError, ValueError):
-            continue
-    return values
 
 
 class OpenCVCamera(Camera):
@@ -202,9 +179,6 @@ class OpenCVCamera(Camera):
             )
 
         self._configure_capture_settings()
-        # BMH: after the format is set (some firmwares reset exposure controls on a format
-        # change) and before the read thread starts.
-        self._apply_v4l2_controls()
         self._start_read_thread()
 
         if warmup and self.warmup_s > 0:
@@ -321,54 +295,6 @@ class OpenCVCamera(Camera):
             raise RuntimeError(
                 f"{self} failed to set capture_height={self.capture_height} ({actual_height=}, {height_success=})."
             )
-
-    def _apply_v4l2_controls(self) -> None:
-        """BMH: applies `config.v4l2_controls` with `v4l2-ctl` and verifies them by reading back.
-
-        No-op when the field is empty or the platform is not Linux. Setting controls while OpenCV
-        holds the device open is fine.
-
-        Raises:
-            RuntimeError: If `v4l2-ctl` is missing (install `v4l-utils`), rejects a control, or the
-                          device reports a different value than requested.
-        """
-        controls = self.config.v4l2_controls
-        if not controls or sys.platform != "linux":
-            return
-
-        dev = (
-            f"/dev/video{self.index_or_path}"
-            if isinstance(self.index_or_path, int)
-            else str(self.index_or_path)
-        )
-        set_args = ",".join(f"{name}={value}" for name, value in controls.items())
-        try:
-            subprocess.run(
-                ["v4l2-ctl", "-d", dev, "-c", set_args], check=True, capture_output=True, text=True
-            )
-            readback = subprocess.run(
-                ["v4l2-ctl", "-d", dev, "-C", ",".join(controls)],
-                check=True,
-                capture_output=True,
-                text=True,
-            )
-        except FileNotFoundError as e:
-            raise RuntimeError(
-                f"{self} cannot apply v4l2 controls {controls}: `v4l2-ctl` not found (install `v4l-utils`)."
-            ) from e
-        except subprocess.CalledProcessError as e:
-            raise RuntimeError(
-                f"{self} failed to apply v4l2 controls {controls} on {dev}: {e.stderr.strip() or e}"
-            ) from e
-
-        actual = _parse_v4l2_controls(readback.stdout)
-        for name, value in controls.items():
-            if actual.get(name) != value:
-                raise RuntimeError(
-                    f"{self} failed to apply v4l2 control {name}={value} (device reports {actual.get(name)})."
-                )
-
-        logger.info(f"{self} v4l2 controls applied: {controls}")
 
     @staticmethod
     def find_cameras() -> list[dict[str, Any]]:
@@ -521,8 +447,6 @@ class OpenCVCamera(Camera):
         1. Reads a color frame
         2. Stores result in latest_frame and updates timestamp (thread-safe)
         3. Sets new_frame_event to notify listeners
-        4. BMH: counts frames per FPS_WATCHDOG_WINDOW_S and warns (rate-limited) when the
-           camera delivers less than FPS_WATCHDOG_MIN_RATIO of the configured fps
 
         Stops on DeviceNotConnectedError, logs other errors and continues.
         """
@@ -530,10 +454,6 @@ class OpenCVCamera(Camera):
             raise RuntimeError(f"{self}: stop_event is not initialized before starting read loop.")
 
         failure_count = 0
-        # BMH: frame-rate watchdog state (see FPS_WATCHDOG_*).
-        window_start = time.perf_counter()
-        window_frames = 0
-        last_fps_warning: float | None = None
         while not self.stop_event.is_set():
             try:
                 raw_frame = self._read_from_hardware()
@@ -549,22 +469,6 @@ class OpenCVCamera(Camera):
                     self.latest_timestamp = capture_time
                 self.new_frame_event.set()
                 failure_count = 0
-
-                window_frames += 1
-                elapsed = capture_time - window_start
-                if elapsed >= FPS_WATCHDOG_WINDOW_S:
-                    rate = window_frames / elapsed
-                    window_start, window_frames = capture_time, 0
-                    if (
-                        self.fps
-                        and rate < FPS_WATCHDOG_MIN_RATIO * self.fps
-                        and (
-                            last_fps_warning is None
-                            or capture_time - last_fps_warning >= FPS_WATCHDOG_WARN_INTERVAL_S
-                        )
-                    ):
-                        last_fps_warning = capture_time
-                        logger.warning(f"{self} delivering {rate:.1f} fps, configured {self.fps}")
 
             except DeviceNotConnectedError:
                 break

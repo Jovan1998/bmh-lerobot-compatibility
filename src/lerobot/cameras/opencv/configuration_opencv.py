@@ -57,10 +57,6 @@ class OpenCVCameraConfig(CameraConfig):
         preview_fps: BMH. Maximum preview snapshots per second. Defaults to 3.
         preview_width: BMH. Preview width in pixels (aspect kept). Defaults to 320.
         preview_quality: BMH. Preview JPEG quality 1–100. Defaults to 60.
-        v4l2_controls: BMH. V4L2 controls (`v4l2-ctl -c name=value`) applied right after the capture
-                      format is set and verified by reading them back, e.g.
-                      `{"exposure_dynamic_framerate": 0}` to stop a UVC camera from halving its
-                      frame rate in low light. Linux only; ignored elsewhere. Defaults to None.
 
     Note:
         - Only 3-channel color output (RGB/BGR) is currently supported.
@@ -80,9 +76,6 @@ class OpenCVCameraConfig(CameraConfig):
     preview_fps: float = 3.0
     preview_width: int = 320
     preview_quality: int = 60
-    # BMH: V4L2 controls applied right after the capture format is set, e.g.
-    # {"exposure_dynamic_framerate": 0}. Linux only; ignored on other platforms.
-    v4l2_controls: dict[str, int] | None = None
 
     def __post_init__(self) -> None:
         self.color_mode = ColorMode(self.color_mode)
