@@ -83,6 +83,24 @@ lerobot-record \
 > controller-app sets `"preview_path": "/dev/shm/bmh-101/preview-front.jpg"` on the front camera.
 > Implementation: `src/lerobot/cameras/preview.py`.
 
+> **V4L2 controls (BMH extra).** Every `opencv` camera entry also accepts optional `v4l2_controls`,
+> a `{name: int}` map applied with `v4l2-ctl -d /dev/videoN -c name=value` right after the capture
+> format is set (before the read thread starts) and verified by reading the values back — a mismatch
+> or a missing `v4l2-ctl` (`apt install v4l-utils`) fails `connect()` loudly. Linux only, ignored
+> elsewhere; the controls reset on camera power cycle, so they have to be passed on every run.
+> **Recommended for the Innomaker U20CAM wrist cameras:** `"v4l2_controls": {"exposure_dynamic_framerate": 0}`.
+> Their firmware ships with AE priority on, which halves the frame rate (30 → 15 fps) in a dark room
+> while still reporting 30 fps; the record loop then stores the same frame twice. Disabling AE
+> priority keeps auto exposure (darker/noisier frames in the dark, never stale ones). If a camera
+> ignores that control, fall back to manual exposure instead:
+> `{"auto_exposure": 1, "exposure_time_absolute": 300, "gain": 0}` (exposure unit 100 µs; ≤ 333 keeps
+> 30 fps; tune `gain`). The controller-app passes the recommended value on all three cameras for
+> both recording and inference. Independently, the camera read thread logs
+> `OpenCVCamera(N) delivering X fps, configured 30` (at most once a minute) whenever a 5 s window
+> falls below 90 % of the configured fps, so a silent drop is visible in the recording log.
+> Implementation: `OpenCVCamera._apply_v4l2_controls` / `_read_loop` in
+> `src/lerobot/cameras/opencv/camera_opencv.py`.
+
 ## Teleop group locks (BMH extra)
 
 `bi_so_network_leader` can **freeze the left arm, the right arm and the head independently**
