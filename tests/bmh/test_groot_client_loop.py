@@ -4,7 +4,9 @@ Runs ``_run_control_loop`` (and ``main`` for the robot-disconnect guarantees) ag
 fakes and checks what reaches the robot: an idle start is still and quiet, a target from
 the control file connects and moves, an idle update stops motion at once and discards the
 chunk that was still in flight, a failing request holds instead of ending the process,
-and a failing startup never leaks a connected (torqued) robot. The policy's feedback
+and a failing startup never leaks a connected (torqued) robot. A relaxed idle target turns
+the torque off on both arms' buses and sends nothing until a Hold or a new task, which
+stiffen the arms where they were left. The policy's feedback
 values (``feedback_*``) never reach the robot, and come back as ``BMH_FEEDBACK`` lines
 under the seq of the target whose chunk set them.
 
@@ -18,6 +20,7 @@ import json
 import re
 import threading
 from collections.abc import Callable
+from types import SimpleNamespace
 
 import pytest
 
@@ -76,6 +79,65 @@ class _FakeRobot:
 
     def disconnect(self) -> None:
         self.disconnected += 1
+
+
+class _FakeBus:
+    """One arm's motor bus: records torque and position transfers into the robot's `calls`."""
+
+    def __init__(self, arm: str, calls: list[tuple], present: dict[str, float]):
+        self.arm = arm
+        self.calls = calls
+        self.present = present
+
+    def disable_torque(self, num_retry: int = 0) -> None:
+        self.calls.append((self.arm, "torque off"))
+
+    def enable_torque(self, num_retry: int = 0) -> None:
+        self.calls.append((self.arm, "torque on"))
+
+    def sync_read(self, data_name: str, num_retry: int = 0) -> dict[str, float]:
+        self.calls.append((self.arm, f"read {data_name}"))
+        return dict(self.present)
+
+    def sync_write(self, data_name: str, values: dict[str, float], num_retry: int = 0) -> None:
+        self.calls.append((self.arm, f"write {data_name}", dict(values)))
+
+
+class _FakeBiRobot(_FakeRobot):
+    """`_FakeRobot` with a `bi_so_follower`'s two arms, whose buses can be relaxed.
+
+    `calls` interleaves the bus calls with every observation and send, in order. The
+    arms "were moved by hand" to `j = 11` (left) and `j = 22` (right).
+    """
+
+    def __init__(self):
+        super().__init__()
+        self.calls: list[tuple] = []
+        self.left_arm = SimpleNamespace(bus=_FakeBus("left", self.calls, {"j": 11.0}))
+        self.right_arm = SimpleNamespace(bus=_FakeBus("right", self.calls, {"j": 22.0}))
+
+    def get_observation(self) -> dict:
+        self.calls.append(("robot", "observe"))
+        return super().get_observation()
+
+    def send_action(self, action: dict[str, float]) -> None:
+        self.calls.append(("robot", "send"))
+        super().send_action(action)
+
+    def bus_calls(self) -> list[tuple]:
+        return [c for c in self.calls if c[0] != "robot"]
+
+
+RELAX_CALLS = [("left", "torque off"), ("right", "torque off")]
+STIFFEN_CALLS = [
+    ("left", "read Present_Position"),
+    ("left", "write Goal_Position", {"j": 11.0}),  # pinned before the torque comes on
+    ("left", "torque on"),
+    ("right", "read Present_Position"),
+    ("right", "write Goal_Position", {"j": 22.0}),
+    ("right", "torque on"),
+]
+LEFT_AT_HAND = {"left_j.pos": 11.0, "right_j.pos": 22.0}
 
 
 class _FakeClient:
@@ -256,6 +318,72 @@ def test_request_failure_holds_then_new_seq_recovers(caplog):
     assert connect.clients[0].closed == 1
     assert any(a["j"] >= 300 for a in robot.sent[sent_at_retry[0] :])
     assert caplog.text.count("late chunk") <= 2  # rate-limited, never per tick
+
+
+def _status_json(line: str) -> dict:
+    return json.loads(line[len("BMH_TARGET ") :])
+
+
+def test_relax_mid_run_goes_limp_and_sends_nothing(caplog):
+    # Request 2 hangs until tick 9; the relaxed idle target arrives at tick 6, while it is
+    # in flight - its chunk must be dropped like for a plain idle, and nothing re-sent.
+    gate = threading.Event()
+    robot, adapter, connect = _FakeBiRobot(), _FakeAdapter(gates={2: gate}), _Connect()
+    sent_at_relax: list[int] = []
+
+    def relax() -> InferenceTarget:
+        sent_at_relax.append(len(robot.sent))
+        return InferenceTarget.make_idle(2, relaxed=True)
+
+    watcher = _ScriptedWatcher({6: relax, 9: gate.set})
+    with caplog.at_level("INFO"):
+        _run_control_loop(robot, adapter, watcher, _target(1), _cfg(), connect)
+
+    assert sent_at_relax == [5]  # ticks 1-5 played the bootstrap chunk
+    assert len(robot.sent) == 5  # ...and from the relax on: nothing, not even the held pose
+    assert robot.bus_calls() == RELAX_CALLS  # once per bus, never stiffened again
+    assert adapter.calls == ["task A"] * 2  # the in-flight chunk landed and was dropped
+    last = _status_json(_statuses(caplog)[-1])
+    assert (last["seq"], last["accepted"], last["idle"], last["relaxed"]) == (2, True, True, True)
+    assert "late chunk" not in caplog.text
+
+
+def test_relaxed_start_goes_limp(caplog):
+    robot, adapter, connect = _FakeBiRobot(), _FakeAdapter(), _Connect()
+    with caplog.at_level("INFO"):
+        _run_control_loop(
+            robot, adapter, _ScriptedWatcher(), InferenceTarget.make_idle(0, relaxed=True), _cfg(), connect
+        )
+    assert robot.bus_calls() == RELAX_CALLS
+    assert robot.sent == [] and robot.observations == 0
+    assert _status_json(_statuses(caplog)[0])["relaxed"] is True
+
+
+def test_hold_after_relax_stiffens_where_the_arms_were_left():
+    robot, adapter, connect = _FakeBiRobot(), _FakeAdapter(), _Connect()
+    watcher = _ScriptedWatcher(
+        {3: lambda: InferenceTarget.make_idle(1, relaxed=True), 6: lambda: InferenceTarget.make_idle(2)}
+    )
+    _run_control_loop(robot, adapter, watcher, InferenceTarget.make_idle(0), _cfg(), connect)
+
+    assert robot.bus_calls() == RELAX_CALLS + STIFFEN_CALLS
+    # Held from the Hold's tick on, every tick, at the pose read back from the buses.
+    assert robot.sent == [LEFT_AT_HAND] * (TICKS - 5)
+    assert connect.calls == [] and adapter.calls == []
+
+
+def test_new_task_after_relax_stiffens_before_it_observes():
+    robot, adapter, connect = _FakeBiRobot(), _FakeAdapter(), _Connect()
+    watcher = _ScriptedWatcher({3: lambda: InferenceTarget.make_idle(1, relaxed=True), 6: lambda: _target(2)})
+    _run_control_loop(robot, adapter, watcher, InferenceTarget.make_idle(0), _cfg(), connect)
+
+    assert robot.bus_calls() == RELAX_CALLS + STIFFEN_CALLS
+    # The new task's first observation sees the arms with the torque already back on.
+    first_observe = robot.calls.index(("robot", "observe"))
+    assert robot.calls[:first_observe] == RELAX_CALLS + STIFFEN_CALLS + [("robot", "send")]
+    assert robot.sent[0] == LEFT_AT_HAND  # held at the hand-placed pose until the chunk lands
+    assert connect.calls == [_target(2)]
+    assert {"j": 100.0} in robot.sent  # ...then the task runs
 
 
 def test_late_chunk_warning_is_rate_limited(caplog):

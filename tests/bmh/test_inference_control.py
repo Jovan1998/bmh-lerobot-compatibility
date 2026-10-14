@@ -1,6 +1,6 @@
 """Unit tests for the BMH-101 inference control file - no ZMQ, no hardware.
 
-Covers ``parse_target`` validation (incl. the idle document), ``InferenceTarget.endpoint``
+Covers ``parse_target`` validation (incl. the idle and the relaxed idle document), ``InferenceTarget.endpoint``
 equality, ``ControlFileWatcher`` change detection (stat-based, like the teleop lock watcher)
 and the ``BMH_TARGET`` / ``BMH_FEEDBACK`` status lines. Pure stdlib module, so this runs anywhere.
 Run with ``uv run --no-sync pytest tests/bmh/test_inference_control.py -q``.
@@ -81,6 +81,9 @@ def test_parse_target_token_defaults_to_empty():
         {"idle": True},
         {"seq": -1, "idle": True},
         {"seq": 1, "idle": False},
+        {"seq": 1, "idle": True, "relaxed": "true"},
+        {"seq": 1, "idle": True, "relaxed": 1},
+        {"seq": 1, "idle": True, "relaxed": None},
     ],
 )
 def test_parse_target_rejects(bad):
@@ -100,6 +103,22 @@ def test_parse_target_idle_ignores_other_keys():
     # Even values that would be rejected on a real target: an idle document is only its seq.
     doc = {**VALID, "seq": 5, "idle": True, "policy_port": "nope", "lang_instruction": 7}
     assert parse_target(doc) == InferenceTarget.make_idle(5)
+
+
+def test_parse_target_relaxed_idle():
+    target = parse_target({"seq": 6, "idle": True, "relaxed": True})
+    assert target == InferenceTarget.make_idle(6, relaxed=True)
+    assert target.idle is True and target.relaxed is True
+    assert parse_target({"seq": 6, "idle": True, "relaxed": False}) == InferenceTarget.make_idle(6)
+    assert parse_target({"seq": 6, "idle": True}).relaxed is False
+
+
+def test_parse_target_non_idle_ignores_relaxed():
+    # Only an idle document can relax the motors; a task always runs with torque on.
+    for value in (True, "nope"):
+        target = parse_target({**VALID, "relaxed": value})
+        assert target == parse_target(VALID)
+        assert target.relaxed is False
 
 
 def test_parse_target_explicit_idle_false_is_a_normal_target():
@@ -193,6 +212,8 @@ def test_watcher_yields_idle_and_back(tmp_path):
     assert watcher.poll() == parse_target({**VALID, "seq": 2})
     _write(path, {"seq": 3, "idle": True}, 3_000)
     assert watcher.poll() == InferenceTarget.make_idle(3)
+    _write(path, {"seq": 4, "idle": True, "relaxed": True}, 4_000)
+    assert watcher.poll() == InferenceTarget.make_idle(4, relaxed=True)
     assert watcher.poll() is None
 
 
@@ -226,6 +247,7 @@ def test_format_target_status_round_trips_without_token():
         "policy_host": "h",
         "policy_port": 5555,
         "lang_instruction": 'say "hi" ✓',
+        "relaxed": False,
     }
 
     accepted = json.loads(format_target_status(target, True, None)[len(STATUS_PREFIX) :])
@@ -243,7 +265,16 @@ def test_format_target_status_idle():
         "policy_host": "",
         "policy_port": 0,
         "lang_instruction": "",
+        "relaxed": False,
     }
+
+
+def test_format_target_status_relaxed():
+    status = json.loads(
+        format_target_status(InferenceTarget.make_idle(5, relaxed=True), True, None)[len(STATUS_PREFIX) :]
+    )
+    assert status["idle"] is True
+    assert status["relaxed"] is True
 
 
 # --------------------------------------------------------------------------- feedback

@@ -37,7 +37,9 @@ the app can apply another target.
 With `--control_file` the client may also run *idle* — no server, no prompt, robot
 holding position. It starts that way when neither the file nor `--lang_instruction`
 names a target (the controller-app's Physical Agent tab does this), and returns to
-it whenever the app writes an idle document.
+it whenever the app writes an idle document. A *relaxed* idle document also turns
+the torque off on every motor, so the operator can move the arms by hand; the next
+document that is not relaxed turns it back on, holding wherever the arms were left.
 
 A skill trained with *feedbacks* returns extra `feedback_<key>` action keys (e.g.
 `feedback_done`). They ride along with each chunk step, never reach the robot, and are
@@ -54,7 +56,7 @@ from collections.abc import Callable
 from dataclasses import asdict, dataclass
 from pathlib import Path
 from pprint import pformat
-from typing import Any
+from typing import Any, cast
 
 import cv2
 import draccus
@@ -442,7 +444,9 @@ def _serve_requests(
             else:
                 active = target
             if rejected is None and target.idle:
-                logger.info("target #%d applied: idle", target.seq)
+                logger.info(
+                    "target #%d applied: idle%s", target.seq, " (motors relaxed)" if target.relaxed else ""
+                )
             elif rejected is None:
                 logger.info(
                     'target #%d applied: %s:%d "%s"',
@@ -578,6 +582,39 @@ def _clear_feedback(tracker: FeedbackTracker, seq: int) -> None:
         logger.info(format_feedback_status(seq, {}, {}))
 
 
+# Retries per torque / position transfer when relaxing or stiffening the arms —
+# as many as `bus.disconnect` allows its torque-off.
+_TORQUE_RETRIES = 5
+
+
+def _relax_motors(robot: Robot) -> None:
+    """Torque off on every motor of both arms (the head rides the left bus): movable by hand."""
+    bi = cast(bi_so_follower.BiSOFollower, robot)
+    for arm in (bi.left_arm, bi.right_arm):
+        arm.bus.disable_torque(num_retry=_TORQUE_RETRIES)
+
+
+def _stiffen_motors(robot: Robot) -> dict[str, float]:
+    """Torque back on, holding wherever the arms are now.
+
+    Each bus's goal is pinned to its present position first: the servos keep the
+    last goal they were sent, so enabling torque straight away would snap the arms
+    back to where they were before they were relaxed.
+
+    Returns:
+        That pose as an action (`left_` / `right_` + `<motor>.pos`, like
+        `BiSOFollower.send_action` takes it), for the loop to hold.
+    """
+    bi = cast(bi_so_follower.BiSOFollower, robot)
+    pose: dict[str, float] = {}
+    for prefix, arm in (("left_", bi.left_arm), ("right_", bi.right_arm)):
+        present = arm.bus.sync_read("Present_Position", num_retry=_TORQUE_RETRIES)
+        arm.bus.sync_write("Goal_Position", present, num_retry=_TORQUE_RETRIES)
+        arm.bus.enable_torque(num_retry=_TORQUE_RETRIES)
+        pose.update({f"{prefix}{motor}.pos": float(value) for motor, value in present.items()})
+    return pose
+
+
 def _run_control_loop(
     robot: Robot,
     adapter: BiSoBimanualAdapter,
@@ -592,12 +629,13 @@ def _run_control_loop(
     the startup connect, the bootstrap inference, the loop — may raise.
 
     Args:
-        robot: Connected robot.
+        robot: Connected robot — a `bi_so_follower`: relaxing reaches into its arms' buses.
         adapter: Adapter without a policy client; one is attached here.
         watcher: Control-file watcher, `None` for a CLI-only run.
         target: Startup target (see `_initial_target`). Idle skips the connect and
-            the bootstrap inference: the robot holds position, and nothing is
-            requested until the control file names a real target.
+            the bootstrap inference: the robot holds position (or goes limp, when
+            relaxed), and nothing is requested until the control file names a real
+            target.
         cfg: CLI configuration.
         connect: Opens a validated client for a target, or raises `PolicyConnectError`.
 
@@ -633,6 +671,9 @@ def _run_control_loop(
     # True while idle, and after the worker rejected a target or lost its server:
     # the robot holds its last pose and nothing is fired until a new seq arrives.
     holding = target.idle
+    # True while the motors' torque is off (a relaxed idle target): nothing is sent
+    # to the robot, not even the held pose, until a target that is not relaxed.
+    relaxed = False
     # Chunk ownership, for the policy's feedback flags. `fire_seq` is the target the
     # in-flight request was fired under, `chunk_seq` the one `current_chunk` was
     # requested under (-1: no chunk yet; real seqs are >= 0). At most one request is
@@ -652,7 +693,12 @@ def _run_control_loop(
     worker: threading.Thread | None = None
 
     try:
-        if target.idle:
+        if target.relaxed:
+            # Relax was pressed while the client was still connecting.
+            _relax_motors(robot)
+            relaxed = True
+            logger.info("No target yet — idle, motors relaxed (torque off).")
+        elif target.idle:
             logger.info("No target yet — idle, holding position until the controller-app applies one.")
         else:
             try:
@@ -700,7 +746,12 @@ def _run_control_loop(
                         chunk_exhausted_at = None
                         holding = True
                         _clear_feedback(tracker, chunk_seq)
-                        logger.info("target #%d requested: idle — holding position", target.seq)
+                        if target.relaxed:
+                            logger.info(
+                                "target #%d requested: idle — motors relaxed (torque off)", target.seq
+                            )
+                        else:
+                            logger.info("target #%d requested: idle — holding position", target.seq)
                     else:
                         logger.info(
                             'target #%d requested: %s:%d "%s"',
@@ -709,6 +760,17 @@ def _run_control_loop(
                             target.policy_port,
                             target.lang_instruction,
                         )
+                    # Torque follows the target at once — before step 3 fires, so a new
+                    # target's first observation already sees the re-stiffened arms.
+                    if target.relaxed and not relaxed:
+                        _relax_motors(robot)
+                        relaxed = True
+                    elif relaxed and not target.relaxed:
+                        # Hold (plain idle) or a new task: stiffen where the operator
+                        # left the arms, and hold that pose until a chunk arrives.
+                        last_action = _stiffen_motors(robot)
+                        relaxed = False
+                        logger.info("target #%d: motors stiffened, holding the current pose", target.seq)
 
             # 1. Try to swap in a freshly arrived chunk, time-aligned to the
             #    robot's current position. The chunk's action[0] is the policy's
@@ -830,8 +892,9 @@ def _run_control_loop(
                     if flags is not None:
                         logger.info(format_feedback_status(chunk_seq, flags, feedback))
             elif holding:
-                # Idle or on hold: keep the last pose, quietly (logged once above).
-                if last_action is not None:
+                # Idle or on hold: keep the last pose, quietly (logged once above) —
+                # unless relaxed: then the arms are the operator's.
+                if last_action is not None and not relaxed:
                     robot.send_action(last_action)
             else:
                 if chunk_exhausted_at is None:

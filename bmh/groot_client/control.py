@@ -31,6 +31,16 @@ read from an idle document, every other key is ignored:
 
     {"seq": 4, "idle": true}
 
+An idle document may also say ``"relaxed": true`` — idle with every motor's torque
+off, so the operator can move the arms by hand (the Physical Agent's "Relax"). The
+torque comes back on, holding wherever the arms were left, with the next document
+that is not relaxed: a plain idle ("Hold") or a real target. A non-idle document
+ignores the key.
+
+.. code-block:: json
+
+    {"seq": 5, "idle": true, "relaxed": true}
+
 Idle is never expressed by deleting the file — a missing file means "keep the
 current target" (see :class:`ControlFileWatcher`).
 
@@ -79,6 +89,7 @@ class InferenceTarget:
         api_token: Per-request API token (empty = none). Hidden from ``repr``.
         idle: ``True`` for "no server, no prompt" — host / instruction / token are
             empty and the port is 0. Build one with :meth:`make_idle`.
+        relaxed: Idle with every motor's torque off (only ever set on an idle target).
     """
 
     seq: int
@@ -87,11 +98,12 @@ class InferenceTarget:
     lang_instruction: str
     api_token: str = field(default="", repr=False)
     idle: bool = False
+    relaxed: bool = False
 
     @classmethod
-    def make_idle(cls, seq: int) -> InferenceTarget:
-        """The idle target for ``seq``: no server to ask, nothing to do."""
-        return cls(seq=seq, policy_host="", policy_port=0, lang_instruction="", idle=True)
+    def make_idle(cls, seq: int, relaxed: bool = False) -> InferenceTarget:
+        """The idle target for ``seq``: no server to ask, nothing to do — torque off if ``relaxed``."""
+        return cls(seq=seq, policy_host="", policy_port=0, lang_instruction="", idle=True, relaxed=relaxed)
 
     @property
     def endpoint(self) -> tuple[str, int, str]:
@@ -126,12 +138,13 @@ def parse_target(data: object) -> InferenceTarget:
 
     Returns:
         The target, with host / instruction / token whitespace-stripped — or the idle
-        target for ``seq`` when the document says ``"idle": true`` (its other keys
-        are then ignored).
+        target for ``seq`` when the document says ``"idle": true`` (of its other keys
+        only ``relaxed`` is read).
 
     Raises:
         ValueError: If a required key is missing or has the wrong type / range.
-            Bools are rejected where ints are expected, and ``idle`` must be a bool.
+            Bools are rejected where ints are expected; ``idle`` and an idle
+            document's ``relaxed`` must be bools.
     """
     if not isinstance(data, dict):
         raise ValueError(f"expected a JSON object, got {type(data).__name__}")
@@ -142,7 +155,10 @@ def parse_target(data: object) -> InferenceTarget:
     if not isinstance(idle, bool):
         raise ValueError(f"'idle' must be a boolean, got {idle!r}")
     if idle:
-        return InferenceTarget.make_idle(seq)
+        relaxed = data.get("relaxed", False)
+        if not isinstance(relaxed, bool):
+            raise ValueError(f"'relaxed' must be a boolean, got {relaxed!r}")
+        return InferenceTarget.make_idle(seq, relaxed=relaxed)
     host = data.get("policy_host")
     if not isinstance(host, str) or not host.strip():
         raise ValueError("'policy_host' must be a non-empty string")
@@ -239,7 +255,8 @@ def format_target_status(target: InferenceTarget, accepted: bool, error: str | N
 
     Args:
         target: The target that was decided on (accepted or rejected). An idle target
-            reports ``"idle": true`` with an empty host / instruction and port 0.
+            reports ``"idle": true`` with an empty host / instruction and port 0, a
+            relaxed one also ``"relaxed": true``.
         accepted: Whether the client now runs against ``target``.
         error: Reason for a rejection, ``None`` when accepted.
     """
@@ -252,6 +269,7 @@ def format_target_status(target: InferenceTarget, accepted: bool, error: str | N
             "policy_host": target.policy_host,
             "policy_port": target.policy_port,
             "lang_instruction": target.lang_instruction,
+            "relaxed": target.relaxed,
         }
     )
 
