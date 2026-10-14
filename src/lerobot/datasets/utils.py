@@ -93,6 +93,12 @@ DEFAULT_EPISODES_PATH = EPISODES_DIR + "/" + CHUNK_FILE_PATTERN + ".parquet"
 DEFAULT_DATA_PATH = DATA_DIR + "/" + CHUNK_FILE_PATTERN + ".parquet"
 DEFAULT_VIDEO_PATH = VIDEO_DIR + "/{video_key}/" + CHUNK_FILE_PATTERN + ".mp4"
 DEFAULT_IMAGE_PATH = "images/{image_key}/episode-{episode_index:06d}/frame-{frame_index:06d}.png"
+# BMH: temporary frames of `video` features (they only live until ffmpeg turns them into an
+# mp4) are written as JPEG. PNG at compress level 1 cost ~25 ms per 640x480 frame on a Pi 5 —
+# about two cores at 3 cameras x 30 fps — versus ~2 ms for JPEG at quality 95, and the frames
+# are MJPEG off the camera and AV1 at crf ~25 afterwards anyway. Permanent `image` features
+# keep DEFAULT_IMAGE_PATH (lossless PNG).
+DEFAULT_VIDEO_FRAME_PATH = "images/{image_key}/episode-{episode_index:06d}/frame-{frame_index:06d}.jpg"
 
 LEGACY_EPISODES_PATH = "meta/episodes.jsonl"
 LEGACY_EPISODES_STATS_PATH = "meta/episodes_stats.jsonl"

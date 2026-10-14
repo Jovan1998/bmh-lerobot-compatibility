@@ -437,10 +437,12 @@ def encode_video_frames(
         )
         pix_fmt = "yuv420p"
 
-    # Get input frames
-    template = "frame-" + ("[0-9]" * 6) + ".png"
+    # Get input frames. BMH: the recorder writes temporary frames as .jpg
+    # (DEFAULT_VIDEO_FRAME_PATH); .png is still accepted for callers that dump their own frames.
+    templates = ["frame-" + ("[0-9]" * 6) + ext for ext in (".png", ".jpg")]
     input_list = sorted(
-        glob.glob(str(imgs_dir / template)), key=lambda x: int(x.split("-")[-1].split(".")[0])
+        (f for template in templates for f in glob.glob(str(imgs_dir / template))),
+        key=lambda x: int(x.split("-")[-1].split(".")[0]),
     )
 
     # Define video output frame size (assuming all input frames are the same size)
@@ -1105,11 +1107,11 @@ class VideoEncodingManager:
         # Clean up any remaining images directory if it's empty
         img_dir = self.dataset.root / "images"
         if img_dir.exists():
-            png_files = list(img_dir.rglob("*.png"))
-            if len(png_files) == 0:
+            image_files = [f for f in img_dir.rglob("*") if f.suffix in (".png", ".jpg")]
+            if len(image_files) == 0:
                 shutil.rmtree(img_dir)
                 logger.debug("Cleaned up empty images directory")
             else:
-                logger.debug(f"Images directory is not empty, containing {len(png_files)} PNG files")
+                logger.debug(f"Images directory is not empty, containing {len(image_files)} image files")
 
         return False  # Don't suppress the original exception

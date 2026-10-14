@@ -48,6 +48,7 @@ from .io_utils import (
 from .utils import (
     DEFAULT_EPISODES_PATH,
     DEFAULT_IMAGE_PATH,
+    DEFAULT_VIDEO_FRAME_PATH,
     update_chunk_file_indices,
 )
 from .video_utils import (
@@ -72,7 +73,7 @@ def _encode_video_worker(
     g: int | None = None,
 ) -> Path:
     temp_path = Path(tempfile.mkdtemp(dir=root)) / f"{video_key}_{episode_index:03d}.mp4"
-    fpath = DEFAULT_IMAGE_PATH.format(image_key=video_key, episode_index=episode_index, frame_index=0)
+    fpath = DEFAULT_VIDEO_FRAME_PATH.format(image_key=video_key, episode_index=episode_index, frame_index=0)
     img_dir = (root / fpath).parent
     kwargs: dict = {}
     if crf is not None:
@@ -155,9 +156,14 @@ class DatasetWriter:
         return ep_buffer
 
     def _get_image_file_path(self, episode_index: int, image_key: str, frame_index: int) -> Path:
-        fpath = DEFAULT_IMAGE_PATH.format(
-            image_key=image_key, episode_index=episode_index, frame_index=frame_index
+        # BMH: frames that only exist until they are encoded to mp4 are JPEG (cheap to write on
+        # a Pi); frames that *are* the dataset (`image` features) stay lossless PNG.
+        template = (
+            DEFAULT_VIDEO_FRAME_PATH
+            if self._meta.features[image_key]["dtype"] == "video"
+            else DEFAULT_IMAGE_PATH
         )
+        fpath = template.format(image_key=image_key, episode_index=episode_index, frame_index=frame_index)
         return self._root / fpath
 
     def _get_image_file_dir(self, episode_index: int, image_key: str) -> Path:
@@ -224,6 +230,7 @@ class DatasetWriter:
                 )
                 if frame_index == 0:
                     img_path.parent.mkdir(parents=True, exist_ok=True)
+                # compress_level only applies to the PNG (`image`) case; `video` frames are JPEG.
                 compress_level = 1 if self._meta.features[key]["dtype"] == "video" else 6
                 self._save_image(frame[key], img_path, compress_level)
                 self.episode_buffer[key].append(str(img_path))
@@ -612,7 +619,7 @@ class DatasetWriter:
             self.image_writer.wait_until_done()
 
     def _encode_temporary_episode_video(self, video_key: str, episode_index: int) -> Path:
-        """Use ffmpeg to convert frames stored as png into mp4 videos."""
+        """Use ffmpeg to convert the temporary jpg frames into mp4 videos."""
         return _encode_video_worker(
             video_key,
             episode_index,

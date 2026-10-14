@@ -25,6 +25,11 @@ import torch
 
 logger = logging.getLogger(__name__)
 
+# BMH: quality for the temporary JPEG frames of `video` features (see
+# `lerobot.datasets.utils.DEFAULT_VIDEO_FRAME_PATH`). 95 is visually transparent at the
+# resolutions recorded here and is dwarfed by the AV1 crf applied when the frames are encoded.
+VIDEO_FRAME_JPEG_QUALITY = 95
+
 
 def safe_stop_image_writer(func):
     def wrapper(*args, **kwargs):
@@ -82,10 +87,12 @@ def write_image(image: np.ndarray | PIL.Image.Image, fpath: Path, compress_level
     Args:
         image (np.ndarray | PIL.Image.Image): The image data to save.
         fpath (Path): The destination file path for the image.
-        compress_level (int, optional): The compression level for the saved
-            image, as used by PIL.Image.save(). Defaults to 1.
+        compress_level (int, optional): The PNG compression level, as used by
+            PIL.Image.save(). Defaults to 1.
             Refer to: https://github.com/huggingface/lerobot/pull/2135
             for more details on the default value rationale.
+            BMH: ignored when `fpath` has a .jpg/.jpeg suffix — the image is then
+            written as a JPEG at `VIDEO_FRAME_JPEG_QUALITY` instead.
 
     Raises:
         TypeError: If the input 'image' is not a NumPy array or a
@@ -101,7 +108,10 @@ def write_image(image: np.ndarray | PIL.Image.Image, fpath: Path, compress_level
             img = image
         else:
             raise TypeError(f"Unsupported image type: {type(image)}")
-        img.save(fpath, compress_level=compress_level)
+        if Path(fpath).suffix.lower() in (".jpg", ".jpeg"):
+            img.save(fpath, quality=VIDEO_FRAME_JPEG_QUALITY)
+        else:
+            img.save(fpath, compress_level=compress_level)
     except Exception as e:
         logger.error("Error writing image %s: %s", fpath, e)
 
