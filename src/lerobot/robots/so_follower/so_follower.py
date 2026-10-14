@@ -18,7 +18,7 @@ import logging
 import time
 from functools import cached_property
 
-from lerobot.cameras import make_cameras_from_configs
+from lerobot.cameras import connect_cameras, make_cameras_from_configs
 from lerobot.motors import Motor, MotorCalibration, MotorNormMode
 from lerobot.motors.feetech import (
     FeetechMotorsBus,
@@ -112,8 +112,9 @@ class SOFollower(Robot):
                 logger.info("No calibration file found")
                 self.calibrate()
 
-        for cam in self.cameras.values():
-            cam.connect()
+        # BMH: cameras open + warm up side by side (see `connect_cameras`) instead of
+        # paying each camera's warmup window in sequence.
+        connect_cameras(self.cameras)
 
         self.configure()
         logger.info(f"{self} connected.")

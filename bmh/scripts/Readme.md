@@ -36,3 +36,14 @@ the matching `with_head` value.
 - **Message**: `{"shoulder_pan.pos": 45.2, "shoulder_lift.pos": -12.1, ...}` (7 floats per arm; 9 on the left arm with head enabled — adds `head_pan.pos`/`head_tilt.pos`)
 - **Socket option**: `CONFLATE=1` (latest-only, no buffering)
 - **Rate**: configurable, default 60 Hz
+
+---
+
+# Other scripts in this directory
+
+- `bmh_record.py` — `bmh-record --config <file.json>`: `lerobot-record` driven by a JSON
+  config instead of CLI flags, skipping draccus' ~5.5 s argparse build on the Pi. Used by the
+  controller-app for every recording session. Config layout and example:
+  [`../documentation/Readme.md`](../documentation/Readme.md#fast-startup-bmh-extras).
+- `bmh_groot_client.py` — `bmh-groot-client`: GR00T N inference client (see its module docstring).
+- `bmh_center_arm.py` — `bmh-center-arm`: moves an arm to its calibrated center pose.

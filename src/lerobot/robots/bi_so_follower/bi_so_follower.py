@@ -15,6 +15,7 @@
 # limitations under the License.
 
 import logging
+from concurrent.futures import ThreadPoolExecutor
 from functools import cached_property
 
 from lerobot.types import RobotAction, RobotObservation
@@ -101,8 +102,37 @@ class BiSOFollower(Robot):
 
     @check_if_already_connected
     def connect(self, calibrate: bool = True) -> None:
-        self.left_arm.connect(calibrate)
-        self.right_arm.connect(calibrate)
+        """Connect both arms side by side.
+
+        BMH: each arm sits on its own serial port with its own cameras, so their connect
+        sequences (bus handshake, calibration check, camera open + warmup, motor
+        configuration) are independent. Running them in parallel halves the startup of
+        `lerobot-record` / `bmh-groot-client` on the Pi. On failure the arm that did
+        connect is disconnected again (torque released), then the first error is re-raised.
+        """
+        arms = {"left": self.left_arm, "right": self.right_arm}
+        errors: dict[str, BaseException] = {}
+
+        def _connect(name: str) -> None:
+            try:
+                arms[name].connect(calibrate)
+            except BaseException as e:  # re-raised below, after both threads have finished
+                errors[name] = e
+
+        with ThreadPoolExecutor(max_workers=2, thread_name_prefix="bi_so_follower-connect") as pool:
+            for name in arms:
+                pool.submit(_connect, name)
+
+        if not errors:
+            return
+        for name, arm in arms.items():
+            if name in errors or not arm.is_connected:
+                continue
+            try:
+                arm.disconnect()
+            except Exception as e:  # best effort — the original error is what matters
+                logger.warning(f"Failed to disconnect {name} arm after the other arm failed to connect: {e}")
+        raise errors["left"] if "left" in errors else errors["right"]
 
     @property
     def is_calibrated(self) -> bool:

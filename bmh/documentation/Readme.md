@@ -83,6 +83,43 @@ lerobot-record \
 > controller-app sets `"preview_path": "/dev/shm/bmh-101/preview-front.jpg"` on the front camera.
 > Implementation: `src/lerobot/cameras/preview.py`.
 
+## Fast startup (BMH extras)
+
+Two changes cut the follower's startup from ~38 s to ~10 s on a Pi 5 (measured 2026-10-14):
+
+- **Parallel connect.** `SOFollower.connect` opens its cameras side by side
+  (`lerobot.cameras.connect_cameras`), and `BiSOFollower.connect` connects the two arms in
+  parallel. Each `OpenCVCamera.connect` blocks for its full `warmup_s`, so three cameras at
+  `warmup_s: 5` used to cost 16.5 s in sequence; with `warmup_s: 2` and parallel connect it is
+  ~2.5 s. On failure the devices that did connect are released again and the first error is
+  re-raised. Any script using these robots (`lerobot-record`, `lerobot-teleoperate`,
+  `bmh-groot-client`) benefits.
+- **`bmh-record --config <file.json>`** (`bmh/scripts/bmh_record.py`). `lerobot-record`'s
+  draccus CLI parse builds an argparse tree over every registered robot / teleoperator /
+  policy config and costs ~5.5 s per start on the Pi. `bmh-record` reads the same configuration
+  from a JSON file (nested dicts, ChoiceRegistry fields carry a `type` key — the layout draccus
+  uses for config files) and decodes it in milliseconds, then calls the unmodified `record()`.
+  The controller-app writes `~/.cache/bmh-101/recording-config.json` before each session.
+
+```bash
+# Equivalent of the lerobot-record command above, as JSON:
+cat > /tmp/record.json <<'JSON'
+{
+  "robot": {"type": "bi_so_follower", "id": "so_follower",
+            "left_arm_config": {"port": "/dev/ttyACM0", "with_head": true,
+                                "cameras": {"front": {"type": "opencv", "index_or_path": 4, "width": 640, "height": 480, "fps": 30, "fourcc": "MJPG", "warmup_s": 2}}},
+            "right_arm_config": {"port": "/dev/ttyACM1", "cameras": {}}},
+  "teleop": {"type": "bi_so_network_leader",
+             "left_arm_config": {"remote_ip": "192.168.0.200", "port_zmq": 5555, "with_head": true},
+             "right_arm_config": {"remote_ip": "192.168.0.200", "port_zmq": 5557}},
+  "dataset": {"repo_id": "my_local_sets/fun_set_2", "num_episodes": 5, "single_task": "Pick up the Controller",
+              "encoder_threads": 2, "push_to_hub": false},
+  "play_sounds": false
+}
+JSON
+bmh-record --config /tmp/record.json
+```
+
 ## Teleop group locks (BMH extra)
 
 `bi_so_network_leader` can **freeze the left arm, the right arm and the head independently**
