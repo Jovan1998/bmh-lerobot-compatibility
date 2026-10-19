@@ -19,6 +19,14 @@ uv sync --locked --extra all                # Everything
 git lfs install && git lfs pull             # Test artifacts
 ```
 
+## Worktrees
+
+Feature work happens in a per-issue worktree at `/Users/jovan/Desktop/bmh/.worktrees/bmh-lerobot-compatibility/<ISSUE-ID>` (workflow in the workspace `../AGENTS.md`). Notes specific to this repo:
+
+- The main branch is **`bmh-lerobot-main`**; create worktrees from `origin/bmh-lerobot-main`, never commit on or push to it (git hooks enforce this for agent sessions).
+- Create the venv **per worktree** (`uv sync --locked --extra test --extra dev`; uv's cache makes this mostly hardlinks). Don't run against the main checkout's `.venv`: lerobot is installed editable there, so you'd be testing `main`'s code, not yours.
+- The main checkout's venv is Python 3.14 and draccus parsing crashes there; see memory `fork-venv-py314-draccus-help` for the workaround before using `--help` or `draccus.parse` as a check.
+
 ## Key Commands
 
 ```bash
