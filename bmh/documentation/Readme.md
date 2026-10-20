@@ -129,7 +129,8 @@ leader pose over `unlock_blend_s` seconds (smoothstep, default 0.8 s) instead of
 Locking a group again mid-blend holds the blended pose.
 
 - Flags: `--teleop.lock_file=<path>` enables it (default `None` = off, upstream behaviour);
-  `--teleop.unlock_blend_s=0.8` tunes the release.
+  `--teleop.unlock_blend_s=0.8` tunes the release, `--teleop.home_blend_s=2.0` the move to the
+  Home position (see below).
 - State file: a JSON object `{"left": bool, "right": bool, "head": bool}`, replaced atomically
   (tmp + rename) by whoever drives the UI. The controller-app writes
   `~/.cache/bmh-101/teleop-locks.json` and passes that path on both `lerobot-teleoperate` and
@@ -138,13 +139,22 @@ Locking a group again mid-blend holds the blended pose.
 - Groups: `left` = the 7 `left_*.pos` arm keys incl. gripper, `right` = the 7 `right_*.pos` keys,
   `head` = `left_head_pan.pos` / `left_head_tilt.pos` (the head rides the left stream, hence the
   explicit key sets). Every change is logged as
-  `Teleop locks: left=on right=off head=off | head jitter: pan=+0.0 tilt=+0.0`.
+  `Teleop locks: left=on right=off head=off | head jitter: pan=+0.0 tilt=+0.0 | home: left`.
 - **Head jitter:** the state file may also carry `"head_jitter": {"pan": deg, "tilt": deg}`. A
   *frozen* head is then held at its frozen pose plus that offset (degrees, clamped to ±15) and eases
   to every new offset over `unlock_blend_s`; the offset is always relative to the frozen pose, so it
   never accumulates. It is ignored while the head is not frozen, and a file without the key means no
   offset. The controller-app writes a fresh random offset when the inter-episode reset starts
   ("Jitter head" in the recording panel), so a dataset covers small head-pose differences.
+- **Home position (lock pose):** the state file may also carry `"lock_pose": {action_key: value}`
+  (the robot's saved Home position; the controller-app lists the keys of every group set to
+  "Home"). A held group whose keys are listed eases from wherever it is to that pose over
+  `home_blend_s` (smoothstep) instead of freezing in place, then holds it; a head jitter is added
+  on top of it (Home + offset). When the pose appears, changes or disappears the hold is re-based
+  without a jump - a group whose pose entries vanish stays where it is (freeze). Release blends
+  from the pose to the leader over `unlock_blend_s` as usual. Values must be finite numbers; a
+  malformed `lock_pose` rejects that file version (logged once). An older fork ignores the key, so
+  "Home" then degrades to a plain freeze.
 - **Recording:** the lock runs inside `get_action()`, so `lerobot-record` stores the held / blended
   pose as the dataset `action` - the same values the follower was commanded, and consistent with
   `observation.state`. Locks also hold through the inter-episode reset phase.
@@ -155,3 +165,31 @@ Locking a group again mid-blend holds the blended pose.
 # Manual toggle from any shell on the follower Pi (the app does this for you):
 printf '{"left": true, "right": false, "head": true}' > /tmp/locks.tmp && mv /tmp/locks.tmp ~/.cache/bmh-101/teleop-locks.json
 ```
+
+## Home position (BMH extra)
+
+The controller-app keeps one saved **Home position** for the follower: all 16 joints (both arms
+and the head) as normalized action values (`left_shoulder_pan.pos` ... `left_head_tilt.pos`,
+`right_*.pos`; degrees for joints, 0-100 for grippers). Three pieces of the fork serve it:
+
+- **Capture - `bmh-read-pose`** (`bmh/scripts/bmh_read_pose.py`). Opens only the two serial buses
+  (no cameras, no `configure()`, torque never changed), reads `Present_Position` of every motor and
+  prints one line `POSE {json}` with the 16 keys; errors print `ERROR <message>` and exit 1. If a
+  bus's calibration registers differ from the file it rewrites them only while every motor is limp
+  (torque off), and refuses otherwise. The app runs it while no session uses the arms, after the
+  operator posed the robot by hand.
+
+  ```bash
+  bmh-read-pose --left_port /dev/ttyACM1 --right_port /dev/ttyACM0 --id so_follower
+  ```
+
+- **Teleop / recording - `lock_pose`** in the lock state file (see "Teleop group locks" above).
+- **Inference - `home`** on an idle document of the `bmh-groot-client` control file
+  (`~/.cache/bmh-101/inference-control.json`):
+  `{"seq": 6, "idle": true, "home": {"left_shoulder_pan.pos": 0.5, ...}}`. The client stiffens the
+  motors if they were relaxed, ramps from the pose it last commanded (or the present one) to
+  `home` over `--home_ramp_s` (default 2.5 s, smoothstep), then holds it. It reports the seq like
+  any idle target (`BMH_TARGET {..., "home": true, "home_reached": false}`) and logs a second line
+  with `"home_reached": true` on arrival. Keys the robot has no action for are dropped with a
+  warning; `home` together with `"relaxed": true` is rejected; any newer document stops the ramp
+  where the robot is. Contract details: `bmh/groot_client/control.py`.

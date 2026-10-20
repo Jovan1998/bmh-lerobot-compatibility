@@ -59,6 +59,7 @@ class BiSONetworkLeader(Teleoperator):
         self._lock = ActionGroupLock(
             bimanual_lock_groups(left_with_head=config.left_arm_config.with_head),
             blend_s=config.unlock_blend_s,
+            pose_blend_s=config.home_blend_s,
         )
         self._lock_watcher = (
             LockFileWatcher(Path(config.lock_file).expanduser()) if config.lock_file else None
@@ -66,7 +67,7 @@ class BiSONetworkLeader(Teleoperator):
         if self._lock_watcher is not None:
             logger.info(
                 f"Teleop group locks enabled via {self._lock_watcher.path} "
-                f"(unlock blend {config.unlock_blend_s:.2f}s)"
+                f"(unlock blend {config.unlock_blend_s:.2f}s, home blend {config.home_blend_s:.2f}s)"
             )
 
     @cached_property
@@ -125,10 +126,13 @@ class BiSONetworkLeader(Teleoperator):
             # Head jitter: the offset a frozen head is held at (ignored while the head tracks).
             head_jitter = self._lock_watcher.head_jitter
             self._lock.set_offsets(head_jitter_offsets(head_jitter))
+            # Home position: held groups listed in the lock pose ease to it instead of freezing.
+            self._lock.set_lock_pose(self._lock_watcher.lock_pose)
             logger.info(
-                "Teleop locks: %s | head jitter: %s",
+                "Teleop locks: %s | head jitter: %s | home: %s",
                 " ".join(f"{group}={'on' if locked else 'off'}" for group, locked in new_locks.items()),
                 " ".join(f"{axis}={degrees:+.1f}" for axis, degrees in head_jitter.items()),
+                ",".join(self._lock.posed_groups()) or "none",
             )
         return self._lock.apply(action_dict, now)
 

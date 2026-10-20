@@ -47,3 +47,6 @@ the matching `with_head` value.
   [`../documentation/Readme.md`](../documentation/Readme.md#fast-startup-bmh-extras).
 - `bmh_groot_client.py` — `bmh-groot-client`: GR00T N inference client (see its module docstring).
 - `bmh_center_arm.py` — `bmh-center-arm`: moves an arm to its calibrated center pose.
+- `bmh_read_pose.py` — `bmh-read-pose`: prints both follower arms' present pose (head included) as
+  one `POSE {json}` line without moving anything; the controller-app saves it as the Home position.
+  See [`../documentation/Readme.md`](../documentation/Readme.md#home-position-bmh-extra).
