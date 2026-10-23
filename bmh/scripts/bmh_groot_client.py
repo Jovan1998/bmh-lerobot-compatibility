@@ -49,6 +49,13 @@ A skill trained with *feedbacks* returns extra `feedback_<key>` action keys (e.g
 turned into debounced booleans that the controller-app reads from `BMH_FEEDBACK {json}`
 log lines — one per change, tagged with the `seq` of the target whose chunk set them
 (see bmh/groot_client/feedback.py). Display only: the client does not act on them.
+
+The *loop settings* — action horizon, refetch point and playback speed (`speed_pct` of
+the recorded fps) — come from the CLI flags or, when `--loop_file` points at the
+controller-app's loop-settings file, from that file, which is polled every tick like the
+control file but carries its own `seq`: a settings change applies from the next tick
+without re-requesting a chunk. Each decided seq is answered with a `BMH_LOOP {json}`
+line; a document that breaks a rule is rejected as a whole and the old values stay.
 """
 
 import logging
@@ -56,7 +63,7 @@ import queue
 import threading
 import time
 from collections.abc import Callable
-from dataclasses import asdict, dataclass
+from dataclasses import asdict, dataclass, replace
 from pathlib import Path
 from pprint import pformat
 from typing import Any, cast
@@ -71,10 +78,14 @@ from bmh.groot_client.control import (
     Hold,
     Idle,
     InferenceTarget,
+    LoopFileWatcher,
+    LoopSettings,
     format_feedback_status,
+    format_loop_status,
     format_target_status,
     ramp_pose,
     smoothstep,
+    validate_loop_settings,
 )
 from bmh.groot_client.feedback import FeedbackTracker
 from bmh.groot_client.layout import (
@@ -350,7 +361,6 @@ def _inference_worker(
     adapter: BiSoBimanualAdapter,
     obs_queue: "queue.Queue[tuple[InferenceTarget, dict[str, Any]] | None]",
     chunk_queue: "queue.Queue[list[dict[str, float]] | Hold | Idle | None]",
-    action_horizon: int,
     stop_event: threading.Event,
     active: InferenceTarget,
     connect: Callable[[InferenceTarget], PolicyClient],
@@ -379,11 +389,14 @@ def _inference_worker(
     active seq is re-reported as `accepted: false`, the reply is a `Hold`, and the
     next seq re-probes its server even when the endpoint did not change.
 
+    Chunks are replied whole: the main loop cuts them to the live `action_horizon` when
+    they arrive, so the loop settings are only ever touched by one thread.
+
     A `None` item is the shutdown sentinel. A `None` *reply* means the worker itself
     crashed; the main thread aborts on it.
     """
     try:
-        _serve_requests(adapter, obs_queue, chunk_queue, action_horizon, stop_event, active, connect)
+        _serve_requests(adapter, obs_queue, chunk_queue, stop_event, active, connect)
     except Exception:
         logger.exception("inference worker crashed")
         chunk_queue.put(None)
@@ -393,7 +406,6 @@ def _serve_requests(
     adapter: BiSoBimanualAdapter,
     obs_queue: "queue.Queue[tuple[InferenceTarget, dict[str, Any]] | None]",
     chunk_queue: "queue.Queue[list[dict[str, float]] | Hold | Idle | None]",
-    action_horizon: int,
     stop_event: threading.Event,
     active: InferenceTarget,
     connect: Callable[[InferenceTarget], PolicyClient],
@@ -469,7 +481,7 @@ def _serve_requests(
 
         obs["lang"] = active.lang_instruction
         try:
-            chunk = adapter.get_action(obs)[:action_horizon]
+            chunk = adapter.get_action(obs)
         except Exception as e:
             # Typically the server was stopped or became unreachable. Hold instead of
             # exiting, and tell the app under the *same* seq so that re-applying the
@@ -491,7 +503,9 @@ class BmhInferenceConfig:
     policy_host: str = "localhost"
     policy_port: int = 5555
     lang_instruction: str = ""
+    # Actions kept of each arriving chunk; the rest is cut off. `--loop_file` overrides it.
     action_horizon: int = 8
+    # Recorded control rate. Actions are played at `fps * speed_pct / 100` ticks per second.
     fps: int = 30
     timeout_ms: int = 15000
     jpeg_quality: int = 95
@@ -509,8 +523,18 @@ class BmhInferenceConfig:
     # from the freshly swapped-in chunk. Kept small so we re-sync to the latest
     # observation often. The in-flight guard means the effective request cadence
     # is max(refetch_after, server-latency-in-frames). Must be in
-    # [1, action_horizon).
+    # [1, action_horizon). A chunk with fewer actions left than this fires at its end.
+    # `--loop_file` overrides it.
     refetch_after: int = 3
+    # Playback speed in percent of `fps` (100 = recorded speed), in [50, 150]. One
+    # action is still played per tick; only the tick period changes. `--loop_file`
+    # overrides it.
+    speed_pct: int = 100
+    # Path of the controller-app's loop-settings file (see bmh/groot_client/control.py).
+    # When set, the file is read at startup — overriding --action_horizon /
+    # --refetch_after / --speed_pct — and polled every tick so the app can change them
+    # live. A missing file means "use the CLI flags".
+    loop_file: str | None = None
     # Number of leading actions of a freshly arrived chunk to *crossfade* with the
     # tail of the old chunk instead of switching to them outright. At a chunk swap
     # the new chunk's first kept action and the old chunk's next action describe the
@@ -527,7 +551,8 @@ class BmhInferenceConfig:
     # above `feedback_on_threshold` for `feedback_debounce_ticks` consecutive control
     # ticks, and off again once it stayed at or below `feedback_off_threshold` for as
     # many. The gap between the thresholds keeps a value hovering around one of them
-    # from flapping the flag. Need off <= on and at least 1 tick.
+    # from flapping the flag. Need off <= on and at least 1 tick. Counted in ticks, so
+    # its wall-clock length follows `speed_pct` (5 ticks: 333 ms at 50 %, 111 ms at 150 %).
     feedback_on_threshold: float = 0.6
     feedback_off_threshold: float = 0.4
     feedback_debounce_ticks: int = 5
@@ -574,6 +599,51 @@ def _initial_target(
     if watcher is not None:
         return InferenceTarget.make_idle(0)
     raise SystemExit("--lang_instruction must not be empty (starting idle needs --control_file).")
+
+
+def _cli_loop_settings(cfg: BmhInferenceConfig) -> LoopSettings:
+    """The loop settings the CLI flags describe, as seq 0 (not validated)."""
+    return LoopSettings(
+        seq=0, action_horizon=cfg.action_horizon, refetch_after=cfg.refetch_after, speed_pct=cfg.speed_pct
+    )
+
+
+def _initial_loop_settings(watcher: LoopFileWatcher | None, cfg: BmhInferenceConfig) -> LoopSettings:
+    """Pick the loop settings the client starts with, and check them.
+
+    The controller-app's loop file wins when it exists (the app writes it before
+    spawning us); else the CLI flags, as seq 0. Either way the settings pass
+    `validate_loop_settings` against `--blend_frames` — the same rules as a live change.
+
+    Raises:
+        SystemExit: On an invalid loop file (the app is its only writer, so that is a
+            contract bug), or on invalid CLI values.
+    """
+    settings: LoopSettings | None = None
+    source = "CLI flags"
+    if watcher is not None:
+        try:
+            settings = watcher.read_initial()
+        except ValueError as e:
+            raise SystemExit(f"--loop_file {watcher.path}: {e}") from e
+        if settings is None:
+            logger.warning("Loop file %s does not exist yet; starting from CLI flags.", watcher.path)
+        else:
+            source = f"--loop_file {watcher.path}"
+            logger.info(
+                "Initial loop settings #%d read from %s: horizon=%d refetch_after=%d speed=%d%%",
+                settings.seq,
+                watcher.path,
+                settings.action_horizon,
+                settings.refetch_after,
+                settings.speed_pct,
+            )
+    if settings is None:
+        settings = _cli_loop_settings(cfg)
+    reason = validate_loop_settings(settings, cfg.blend_frames)
+    if reason is not None:
+        raise SystemExit(f"Invalid loop settings ({source}): {reason}")
+    return settings
 
 
 def _clear_feedback(tracker: FeedbackTracker, seq: int) -> None:
@@ -647,6 +717,16 @@ def _idle_suffix(target: InferenceTarget) -> str:
     return ""
 
 
+def _warn_short_chunk(length: int, settings: LoopSettings) -> None:
+    """Log that the policy's chunks are shorter than the horizon (once per settings seq)."""
+    logger.warning(
+        "policy returns %d-step chunks, shorter than action_horizon=%d%s",
+        length,
+        settings.action_horizon,
+        " — the loop refetches at chunk end" if length <= settings.refetch_after else "",
+    )
+
+
 @dataclass
 class _HomeRamp:
     """A running move to the Home position: `start` → `target` over `duration` s from `t0`.
@@ -693,6 +773,9 @@ def _run_control_loop(
     target: InferenceTarget,
     cfg: BmhInferenceConfig,
     connect: Callable[[InferenceTarget], PolicyClient],
+    *,
+    loop_watcher: LoopFileWatcher | None = None,
+    settings: LoopSettings | None = None,
 ) -> None:
     """Closed control loop, from the initial connect to the worker / client teardown.
 
@@ -709,12 +792,21 @@ def _run_control_loop(
             target.
         cfg: CLI configuration.
         connect: Opens a validated client for a target, or raises `PolicyConnectError`.
+        loop_watcher: Loop-settings file watcher, `None` for fixed settings. Polled
+            once per tick, after the control file.
+        settings: Startup loop settings, already validated (see
+            `_initial_loop_settings`); `None` = built from `cfg` as seq 0.
 
     Raises:
         SystemExit: If the startup target's server is rejected.
         RuntimeError: If the inference worker crashed.
     """
-    period = 1.0 / cfg.fps
+    if settings is None:
+        settings = _cli_loop_settings(cfg)
+    # Settings seq the "chunks shorter than action_horizon" warning was logged for.
+    short_chunk_warned_seq: int | None = None
+    # When the tick-overrun warning was last logged (rate-limited like `late chunk`).
+    overrun_logged_at: float | None = None
     current_chunk: list[dict[str, float]] = []
     idx = 0
     inflight = False
@@ -723,7 +815,7 @@ def _run_control_loop(
     # When the `late chunk` warning was last logged for the current gap (it repeats
     # every tick otherwise).
     late_logged_at: float | None = None
-    # Monotonic per-tick frame counter (one tick == one control period at `fps`).
+    # Monotonic per-tick frame counter (one tick == one action == one control period).
     # Used to measure how many frames a request spent in flight so we can drop
     # the chunk's stale leading actions on arrival.
     frame_counter = 0
@@ -793,6 +885,8 @@ def _run_control_loop(
                 raise SystemExit(str(e)) from e
         logger.info(format_target_status(target, True, None))
         accepted_seq = target.seq
+        # The effective loop settings, also when there is no loop file (seq 0, CLI values).
+        logger.info(format_loop_status(settings, True, None))
 
         if not target.idle:
             logger.info('Running inference with instruction: "%s"', target.lang_instruction)
@@ -801,12 +895,16 @@ def _run_control_loop(
             # PolicyClient.
             bootstrap_obs = robot.get_observation()
             bootstrap_obs["lang"] = target.lang_instruction
-            current_chunk = adapter.get_action(bootstrap_obs)[: cfg.action_horizon]
+            current_chunk = adapter.get_action(bootstrap_obs)
+            if len(current_chunk) < settings.action_horizon:
+                _warn_short_chunk(len(current_chunk), settings)
+                short_chunk_warned_seq = settings.seq
+            current_chunk = current_chunk[: settings.action_horizon]
             chunk_seq = target.seq
 
         worker = threading.Thread(
             target=_inference_worker,
-            args=(adapter, obs_queue, chunk_queue, cfg.action_horizon, stop_event, target, connect),
+            args=(adapter, obs_queue, chunk_queue, stop_event, target, connect),
             name="bmh-inference-worker",
             daemon=True,
         )
@@ -868,6 +966,31 @@ def _run_control_loop(
                     if target.home:
                         home_ramp = _begin_home(robot, target, last_action, cfg.home_ramp_s)
 
+            # 0b. Pick up new loop settings (after the target: that order is defined).
+            #     They apply from this tick on: the period at step 4, the refetch point
+            #     at step 3, the horizon when the next chunk arrives at step 1. Nothing is
+            #     re-requested. A document breaking a rule is rejected whole; the line
+            #     carries its seq with the values that stay in effect.
+            if loop_watcher is not None:
+                new_settings = loop_watcher.poll()
+                if new_settings is not None and new_settings.seq != settings.seq:
+                    reason = validate_loop_settings(new_settings, cfg.blend_frames)
+                    if reason is not None:
+                        logger.error("loop settings #%d rejected: %s", new_settings.seq, reason)
+                        logger.info(
+                            format_loop_status(replace(settings, seq=new_settings.seq), False, reason)
+                        )
+                    else:
+                        settings = new_settings
+                        logger.info(
+                            "loop settings #%d applied: horizon=%d refetch_after=%d speed=%d%%",
+                            settings.seq,
+                            settings.action_horizon,
+                            settings.refetch_after,
+                            settings.speed_pct,
+                        )
+                        logger.info(format_loop_status(settings, True, None))
+
             # 1. Try to swap in a freshly arrived chunk, time-aligned to the
             #    robot's current position. The chunk's action[0] is the policy's
             #    response to the observation captured when the request fired,
@@ -916,6 +1039,12 @@ def _run_control_loop(
                     _clear_feedback(tracker, chunk_seq)
                 else:
                     holding = False
+                    # Cut to the horizon on arrival, here on the main thread, so a live
+                    # change also applies to a request that was already in flight.
+                    if len(new_chunk) < settings.action_horizon and short_chunk_warned_seq != settings.seq:
+                        _warn_short_chunk(len(new_chunk), settings)
+                        short_chunk_warned_seq = settings.seq
+                    new_chunk = new_chunk[: settings.action_horizon]
                     elapsed = frame_counter - fire_frame
                     # Drop the `elapsed` frames the robot already advanced along the
                     # old chunk (capped at what it could actually consume), so the new
@@ -930,7 +1059,7 @@ def _run_control_loop(
                     # position forever (the bug seen when ping exceeds the action
                     # horizon). Capping here guarantees the loop always re-fires.
                     drop = min(elapsed, remaining_at_fire)
-                    drop = min(drop, max(len(new_chunk) - cfg.refetch_after, 0))
+                    drop = min(drop, max(len(new_chunk) - settings.refetch_after, 0))
 
                     # Crossfade the seam. `current_chunk[idx:]` are the old chunk's
                     # next actions and `new_chunk[drop:]` are the new chunk's first
@@ -1030,7 +1159,18 @@ def _run_control_loop(
             #    instruction is attached by the worker from the target it accepted.
             #    An idle target is handed over once, without an observation (the
             #    worker only drops its client); after that nothing fires while idle.
-            if not inflight and (fire_now or consumed_since_swap >= cfg.refetch_after):
+            #
+            #    Stall guard: fire at `min(refetch_after, len(current_chunk))`, i.e. at
+            #    the chunk's end at the latest. Otherwise the counter could never reach
+            #    `refetch_after` (it only advances while actions are left) when (a) a live
+            #    change raised it above what an already-trimmed chunk holds, or (b) the
+            #    policy's chunks are shorter than it — and the robot would hold forever.
+            #    With unchanged settings and full chunks this is plain `refetch_after`:
+            #    the drop cap at step 1 keeps at least that many actions. An empty chunk
+            #    (idle / hold) never fires, as before; during a late-chunk gap a request
+            #    is in flight, so this is not evaluated.
+            refetch_at = min(settings.refetch_after, len(current_chunk))
+            if not inflight and (fire_now or (len(current_chunk) > 0 and consumed_since_swap >= refetch_at)):
                 t_start = time.perf_counter()
                 obs = {} if target.idle else robot.get_observation()
                 obs_queue.put((target, obs))
@@ -1049,10 +1189,23 @@ def _run_control_loop(
                         time.perf_counter() - t_start,
                     )
 
-            # 4. Sleep to next tick.
-            sleep = period - (time.perf_counter() - tick_start)
+            # 4. Sleep to next tick. The period follows the live `speed_pct`. A tick that
+            #    took longer than its period (typically the fire tick, which reads the
+            #    cameras on this thread) slows playback below the requested speed; say so
+            #    once per second at most.
+            period = settings.period_s(cfg.fps)
+            now = time.perf_counter()
+            sleep = period - (now - tick_start)
             if sleep > 0:
                 time.sleep(sleep)
+            elif sleep < 0 and (overrun_logged_at is None or now - overrun_logged_at >= 1.0):
+                logger.warning(
+                    "tick overran the %.1f ms period by %.1f ms — effective speed is below %d%%",
+                    period * 1000.0,
+                    -sleep * 1000.0,
+                    settings.speed_pct,
+                )
+                overrun_logged_at = now
     except KeyboardInterrupt:
         logger.info("Shutting down inference loop…")
     finally:
@@ -1078,14 +1231,6 @@ def main(cfg: BmhInferenceConfig) -> None:
 
     if not 1 <= cfg.jpeg_quality <= 100:
         raise SystemExit("--jpeg_quality must be in [1, 100].")
-    if not 1 <= cfg.refetch_after < cfg.action_horizon:
-        raise SystemExit(
-            f"--refetch_after must be in [1, action_horizon={cfg.action_horizon}); got {cfg.refetch_after}."
-        )
-    if not 0 <= cfg.blend_frames < cfg.action_horizon:
-        raise SystemExit(
-            f"--blend_frames must be in [0, action_horizon={cfg.action_horizon}); got {cfg.blend_frames}."
-        )
     if cfg.feedback_off_threshold > cfg.feedback_on_threshold:
         raise SystemExit(
             f"--feedback_off_threshold ({cfg.feedback_off_threshold}) must not exceed "
@@ -1101,6 +1246,10 @@ def main(cfg: BmhInferenceConfig) -> None:
     # modality) in `_run_control_loop`, before the robot moves.
     watcher = ControlFileWatcher(Path(cfg.control_file).expanduser()) if cfg.control_file else None
     target = _initial_target(watcher, cfg.policy_host, cfg.policy_port, cfg.lang_instruction, cfg.api_token)
+    # Loop settings: the app's loop file when given (and present), else the CLI flags —
+    # checked against --blend_frames with the same rules as a live change.
+    loop_watcher = LoopFileWatcher(Path(cfg.loop_file).expanduser()) if cfg.loop_file else None
+    settings = _initial_loop_settings(loop_watcher, cfg)
 
     robot = make_robot_from_config(cfg.robot)
     robot.connect()
@@ -1120,7 +1269,9 @@ def main(cfg: BmhInferenceConfig) -> None:
         def connect(t: InferenceTarget) -> PolicyClient:
             return _connect_policy(t, adapter, cfg.probe_timeout_ms, cfg.timeout_ms)
 
-        _run_control_loop(robot, adapter, watcher, target, cfg, connect)
+        _run_control_loop(
+            robot, adapter, watcher, target, cfg, connect, loop_watcher=loop_watcher, settings=settings
+        )
     finally:
         try:
             robot.disconnect()

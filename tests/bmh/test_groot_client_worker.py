@@ -33,7 +33,6 @@ from bmh.scripts.bmh_groot_client import (  # noqa: E402
     _initial_target,
 )
 
-HORIZON = 4
 CHUNK_LEN = 8
 
 
@@ -99,7 +98,7 @@ class _Worker:
         self.adapter = _FakeAdapter(self.initial_client)
         self.thread = threading.Thread(
             target=_inference_worker,
-            args=(self.adapter, self.obs_queue, self.chunk_queue, HORIZON, self.stop, initial, connect),
+            args=(self.adapter, self.obs_queue, self.chunk_queue, self.stop, initial, connect),
             daemon=True,
         )
         self.thread.start()
@@ -132,9 +131,10 @@ def worker_factory():
 # --------------------------------------------------------------------------- worker
 
 
-def test_same_seq_serves_active_target_and_truncates(worker_factory):
+def test_same_seq_serves_active_target_and_returns_the_full_chunk(worker_factory):
+    # The horizon cut happens in the main loop when the chunk arrives, not here.
     worker = worker_factory()
-    assert len(worker.ask(INITIAL)) == HORIZON
+    assert len(worker.ask(INITIAL)) == CHUNK_LEN
     worker.ask(INITIAL)
     assert worker.adapter.calls == [("h1", 5555, "t1", "task A")] * 2
 
