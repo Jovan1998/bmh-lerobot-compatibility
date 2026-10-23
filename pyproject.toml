@@ -301,6 +301,7 @@ lerobot-rollout="lerobot.scripts.lerobot_rollout:main"
 bmh-groot-client="bmh.scripts.bmh_groot_client:main"
 bmh-center-arm="bmh.scripts.bmh_center_arm:main"
 bmh-record="bmh.scripts.bmh_record:main"
+bmh-read-pose="bmh.scripts.bmh_read_pose:main"
 
 # ---------------- Tool Configurations ----------------
 [tool.setuptools.package-data]

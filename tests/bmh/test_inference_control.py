@@ -1,6 +1,6 @@
 """Unit tests for the BMH-101 inference control file - no ZMQ, no hardware.
 
-Covers ``parse_target`` validation (incl. the idle and the relaxed idle document), ``InferenceTarget.endpoint``
+Covers ``parse_target`` validation (incl. the idle, the relaxed and the Home idle document), ``InferenceTarget.endpoint``
 equality, ``ControlFileWatcher`` change detection (stat-based, like the teleop lock watcher)
 and the ``BMH_TARGET`` / ``BMH_FEEDBACK`` status lines. Pure stdlib module, so this runs anywhere.
 Run with ``uv run --no-sync pytest tests/bmh/test_inference_control.py -q``.
@@ -19,6 +19,8 @@ from bmh.groot_client.control import (
     format_feedback_status,
     format_target_status,
     parse_target,
+    ramp_pose,
+    smoothstep,
 )
 
 VALID = {
@@ -84,6 +86,14 @@ def test_parse_target_token_defaults_to_empty():
         {"seq": 1, "idle": True, "relaxed": "true"},
         {"seq": 1, "idle": True, "relaxed": 1},
         {"seq": 1, "idle": True, "relaxed": None},
+        {"seq": 1, "idle": True, "home": {}},
+        {"seq": 1, "idle": True, "home": [1.0]},
+        {"seq": 1, "idle": True, "home": "home"},
+        {"seq": 1, "idle": True, "home": {"left_gripper.pos": True}},
+        {"seq": 1, "idle": True, "home": {"left_gripper.pos": "5"}},
+        {"seq": 1, "idle": True, "home": {"left_gripper.pos": None}},
+        {"seq": 1, "idle": True, "home": {"left_gripper.pos": float("nan")}},
+        {"seq": 1, "idle": True, "home": {"left_gripper.pos": float("inf")}},
     ],
 )
 def test_parse_target_rejects(bad):
@@ -111,6 +121,36 @@ def test_parse_target_relaxed_idle():
     assert target.idle is True and target.relaxed is True
     assert parse_target({"seq": 6, "idle": True, "relaxed": False}) == InferenceTarget.make_idle(6)
     assert parse_target({"seq": 6, "idle": True}).relaxed is False
+
+
+HOME = {"right_gripper.pos": 2, "left_shoulder_pan.pos": -1.5}
+
+
+def test_parse_target_home_idle():
+    target = parse_target({"seq": 7, "idle": True, "home": HOME})
+    assert target == InferenceTarget.make_idle(7, home=HOME)
+    assert target.idle is True and target.relaxed is False
+    assert target.home_pose == {"right_gripper.pos": 2.0, "left_shoulder_pan.pos": -1.5}
+    assert target.home == (("left_shoulder_pan.pos", -1.5), ("right_gripper.pos", 2.0))  # sorted
+    hash(target)  # still a hashable frozen dataclass
+    # relaxed: false is just the default, not a conflict.
+    assert parse_target({"seq": 7, "idle": True, "relaxed": False, "home": HOME}) == target
+
+
+def test_parse_target_home_and_relaxed_exclude_each_other():
+    with pytest.raises(ValueError, match="exclude each other"):
+        parse_target({"seq": 8, "idle": True, "relaxed": True, "home": HOME})
+
+
+def test_parse_target_non_idle_ignores_home():
+    target = parse_target({**VALID, "home": "nope"})
+    assert target == parse_target(VALID)
+    assert target.home == () and target.home_pose == {}
+
+
+def test_plain_idle_has_no_home():
+    assert InferenceTarget.make_idle(1).home_pose == {}
+    assert InferenceTarget.make_idle(1) != InferenceTarget.make_idle(1, home=HOME)
 
 
 def test_parse_target_non_idle_ignores_relaxed():
@@ -248,6 +288,8 @@ def test_format_target_status_round_trips_without_token():
         "policy_port": 5555,
         "lang_instruction": 'say "hi" ✓',
         "relaxed": False,
+        "home": False,
+        "home_reached": False,
     }
 
     accepted = json.loads(format_target_status(target, True, None)[len(STATUS_PREFIX) :])
@@ -266,6 +308,8 @@ def test_format_target_status_idle():
         "policy_port": 0,
         "lang_instruction": "",
         "relaxed": False,
+        "home": False,
+        "home_reached": False,
     }
 
 
@@ -275,6 +319,34 @@ def test_format_target_status_relaxed():
     )
     assert status["idle"] is True
     assert status["relaxed"] is True
+    assert status["home"] is False
+
+
+def test_format_target_status_home():
+    target = InferenceTarget.make_idle(6, home=HOME)
+    moving = json.loads(format_target_status(target, True, None)[len(STATUS_PREFIX) :])
+    reached = json.loads(format_target_status(target, True, None, home_reached=True)[len(STATUS_PREFIX) :])
+    assert (moving["idle"], moving["home"], moving["home_reached"]) == (True, True, False)
+    assert (reached["seq"], reached["home"], reached["home_reached"]) == (6, True, True)
+    assert "left_shoulder_pan" not in json.dumps(moving)  # the pose itself is not echoed
+
+
+# --------------------------------------------------------------------------- ramp
+
+
+def test_smoothstep_endpoints():
+    assert smoothstep(-1.0) == 0.0 and smoothstep(0.0) == 0.0
+    assert smoothstep(0.5) == 0.5
+    assert smoothstep(1.0) == 1.0 and smoothstep(2.0) == 1.0
+
+
+def test_ramp_pose_interpolates_listed_keys_only():
+    start = {"a": 0.0, "b": 10.0, "c": 5.0}
+    target = {"a": 10.0, "b": -10.0}
+    assert ramp_pose(start, target, 0.0) == start
+    assert ramp_pose(start, target, 0.5) == {"a": 5.0, "b": 0.0, "c": 5.0}
+    assert ramp_pose(start, target, 1.0) == {"a": 10.0, "b": -10.0, "c": 5.0}
+    assert ramp_pose(start, {"z": 1.0}, 1.0) == start  # keys outside start are not added
 
 
 # --------------------------------------------------------------------------- feedback

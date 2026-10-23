@@ -41,6 +41,18 @@ ignores the key.
 
     {"seq": 5, "idle": true, "relaxed": true}
 
+An idle document may instead carry ``"home": {action_key: value}`` — the robot's saved
+Home position (the Physical Agent's "Home position" button and a script's ``goHome()``).
+The client stiffens the motors if they were relaxed, ramps every listed joint from where
+it is to that pose, and then holds it like a plain idle. It answers the ``seq`` with a
+second ``BMH_TARGET`` line once the pose is reached (``"home_reached": true``), never
+before the first one: a status line of an older ``seq`` cannot land between them. ``home``
+and ``relaxed: true`` exclude each other; a non-idle document ignores ``home``.
+
+.. code-block:: json
+
+    {"seq": 6, "idle": true, "home": {"left_shoulder_pan.pos": 0.5, "right_gripper.pos": 2.0}}
+
 Idle is never expressed by deleting the file — a missing file means "keep the
 current target" (see :class:`ControlFileWatcher`).
 
@@ -90,6 +102,9 @@ class InferenceTarget:
         idle: ``True`` for "no server, no prompt" — host / instruction / token are
             empty and the port is 0. Build one with :meth:`make_idle`.
         relaxed: Idle with every motor's torque off (only ever set on an idle target).
+        home: Idle at the Home position: ``(action key, value)`` pairs, sorted by key, the
+            robot ramps to and then holds. Empty for every other target; a tuple so the
+            frozen dataclass stays hashable. Read it as a dict via :attr:`home_pose`.
     """
 
     seq: int
@@ -99,11 +114,28 @@ class InferenceTarget:
     api_token: str = field(default="", repr=False)
     idle: bool = False
     relaxed: bool = False
+    home: tuple[tuple[str, float], ...] = ()
 
     @classmethod
-    def make_idle(cls, seq: int, relaxed: bool = False) -> InferenceTarget:
-        """The idle target for ``seq``: no server to ask, nothing to do — torque off if ``relaxed``."""
-        return cls(seq=seq, policy_host="", policy_port=0, lang_instruction="", idle=True, relaxed=relaxed)
+    def make_idle(
+        cls, seq: int, relaxed: bool = False, home: Mapping[str, float] | None = None
+    ) -> InferenceTarget:
+        """The idle target for ``seq``: no server to ask, nothing to do — torque off if
+        ``relaxed``, moving to and holding ``home`` if given."""
+        return cls(
+            seq=seq,
+            policy_host="",
+            policy_port=0,
+            lang_instruction="",
+            idle=True,
+            relaxed=relaxed,
+            home=tuple(sorted((key, float(value)) for key, value in (home or {}).items())),
+        )
+
+    @property
+    def home_pose(self) -> dict[str, float]:
+        """The Home position to move to, as ``{action key: value}`` (empty when none)."""
+        return dict(self.home)
 
     @property
     def endpoint(self) -> tuple[str, int, str]:
@@ -139,12 +171,13 @@ def parse_target(data: object) -> InferenceTarget:
     Returns:
         The target, with host / instruction / token whitespace-stripped — or the idle
         target for ``seq`` when the document says ``"idle": true`` (of its other keys
-        only ``relaxed`` is read).
+        only ``relaxed`` and ``home`` are read).
 
     Raises:
         ValueError: If a required key is missing or has the wrong type / range.
             Bools are rejected where ints are expected; ``idle`` and an idle
-            document's ``relaxed`` must be bools.
+            document's ``relaxed`` must be bools, its ``home`` a non-empty object of
+            finite numbers, and ``home`` cannot be combined with ``relaxed: true``.
     """
     if not isinstance(data, dict):
         raise ValueError(f"expected a JSON object, got {type(data).__name__}")
@@ -158,7 +191,10 @@ def parse_target(data: object) -> InferenceTarget:
         relaxed = data.get("relaxed", False)
         if not isinstance(relaxed, bool):
             raise ValueError(f"'relaxed' must be a boolean, got {relaxed!r}")
-        return InferenceTarget.make_idle(seq, relaxed=relaxed)
+        home = _parse_home(data.get("home"))
+        if home and relaxed:
+            raise ValueError("'home' and 'relaxed' exclude each other")
+        return InferenceTarget.make_idle(seq, relaxed=relaxed, home=home)
     host = data.get("policy_host")
     if not isinstance(host, str) or not host.strip():
         raise ValueError("'policy_host' must be a non-empty string")
@@ -178,6 +214,43 @@ def parse_target(data: object) -> InferenceTarget:
         lang_instruction=lang.strip(),
         api_token=token.strip(),
     )
+
+
+def _parse_home(value: object) -> dict[str, float] | None:
+    """An idle document's optional ``home``: ``None`` when absent, else ``{key: finite number}``."""
+    if value is None:
+        return None
+    if not isinstance(value, dict) or not value:
+        raise ValueError("'home' must be a non-empty object of joint positions")
+    home: dict[str, float] = {}
+    for key, position in value.items():
+        if (
+            isinstance(position, bool)
+            or not isinstance(position, (int, float))
+            or not math.isfinite(position)
+        ):
+            raise ValueError(f"'home' position for {key!r} must be a finite number, got {position!r}")
+        home[key] = float(position)
+    return home
+
+
+def smoothstep(t: float) -> float:
+    """Cubic ease-in/ease-out on [0, 1]; clamps outside that range."""
+    if t <= 0.0:
+        return 0.0
+    if t >= 1.0:
+        return 1.0
+    return t * t * (3.0 - 2.0 * t)
+
+
+def ramp_pose(start: Mapping[str, float], target: Mapping[str, float], alpha: float) -> dict[str, float]:
+    """Pose ``alpha`` of the way from ``start`` to ``target`` (0 = start, 1 = target).
+
+    Covers exactly the keys of ``start``; a key ``target`` does not list keeps its start value.
+    """
+    return {
+        key: value + (target[key] - value) * alpha if key in target else value for key, value in start.items()
+    }
 
 
 class ControlFileWatcher:
@@ -250,15 +323,19 @@ class ControlFileWatcher:
         return parse_target(json.loads(self._path.read_text()))
 
 
-def format_target_status(target: InferenceTarget, accepted: bool, error: str | None) -> str:
+def format_target_status(
+    target: InferenceTarget, accepted: bool, error: str | None, home_reached: bool = False
+) -> str:
     """One-line ``BMH_TARGET {json}`` status for the app to parse. Never includes the token.
 
     Args:
         target: The target that was decided on (accepted or rejected). An idle target
             reports ``"idle": true`` with an empty host / instruction and port 0, a
-            relaxed one also ``"relaxed": true``.
+            relaxed one also ``"relaxed": true``, one at the Home position ``"home": true``.
         accepted: Whether the client now runs against ``target``.
         error: Reason for a rejection, ``None`` when accepted.
+        home_reached: ``True`` on the second line of a Home target, logged once the
+            robot arrived at the pose (same ``seq``).
     """
     return STATUS_PREFIX + json.dumps(
         {
@@ -270,6 +347,8 @@ def format_target_status(target: InferenceTarget, accepted: bool, error: str | N
             "policy_port": target.policy_port,
             "lang_instruction": target.lang_instruction,
             "relaxed": target.relaxed,
+            "home": bool(target.home),
+            "home_reached": home_reached,
         }
     )
 

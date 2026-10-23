@@ -40,6 +40,9 @@ names a target (the controller-app's Physical Agent tab does this), and returns 
 it whenever the app writes an idle document. A *relaxed* idle document also turns
 the torque off on every motor, so the operator can move the arms by hand; the next
 document that is not relaxed turns it back on, holding wherever the arms were left.
+An idle document with a *home* pose (the robot's saved Home position) ramps the arms
+and head there over `--home_ramp_s` seconds and then holds it, reporting the arrival
+with a second `BMH_TARGET` line (`"home_reached": true`).
 
 A skill trained with *feedbacks* returns extra `feedback_<key>` action keys (e.g.
 `feedback_done`). They ride along with each chunk step, never reach the robot, and are
@@ -70,6 +73,8 @@ from bmh.groot_client.control import (
     InferenceTarget,
     format_feedback_status,
     format_target_status,
+    ramp_pose,
+    smoothstep,
 )
 from bmh.groot_client.feedback import FeedbackTracker
 from bmh.groot_client.layout import (
@@ -444,9 +449,7 @@ def _serve_requests(
             else:
                 active = target
             if rejected is None and target.idle:
-                logger.info(
-                    "target #%d applied: idle%s", target.seq, " (motors relaxed)" if target.relaxed else ""
-                )
+                logger.info("target #%d applied: idle%s", target.seq, _idle_suffix(target))
             elif rejected is None:
                 logger.info(
                     'target #%d applied: %s:%d "%s"',
@@ -528,6 +531,9 @@ class BmhInferenceConfig:
     feedback_on_threshold: float = 0.6
     feedback_off_threshold: float = 0.4
     feedback_debounce_ticks: int = 5
+    # Seconds the robot takes to ramp from where it is to the Home position of an idle
+    # document's `home` pose (smoothstep, like `bmh-center-arm`). Must be > 0.
+    home_ramp_s: float = 2.5
 
 
 def _initial_target(
@@ -587,11 +593,29 @@ def _clear_feedback(tracker: FeedbackTracker, seq: int) -> None:
 _TORQUE_RETRIES = 5
 
 
+def _arm_buses(robot: Robot) -> list[tuple[str, Any]]:
+    """`(action-key prefix, motor bus)` per arm of a `bi_so_follower` (the head rides the left bus)."""
+    bi = cast(bi_so_follower.BiSOFollower, robot)
+    return [("left_", bi.left_arm.bus), ("right_", bi.right_arm.bus)]
+
+
+def _as_action(prefix: str, positions: dict[str, Any]) -> dict[str, float]:
+    """One bus's `{motor: position}` as action keys (`<prefix><motor>.pos`)."""
+    return {f"{prefix}{motor}.pos": float(value) for motor, value in positions.items()}
+
+
 def _relax_motors(robot: Robot) -> None:
     """Torque off on every motor of both arms (the head rides the left bus): movable by hand."""
-    bi = cast(bi_so_follower.BiSOFollower, robot)
-    for arm in (bi.left_arm, bi.right_arm):
-        arm.bus.disable_torque(num_retry=_TORQUE_RETRIES)
+    for _, bus in _arm_buses(robot):
+        bus.disable_torque(num_retry=_TORQUE_RETRIES)
+
+
+def _present_pose(robot: Robot) -> dict[str, float]:
+    """Where the arms are now, as an action (`left_` / `right_` + `<motor>.pos`)."""
+    pose: dict[str, float] = {}
+    for prefix, bus in _arm_buses(robot):
+        pose.update(_as_action(prefix, bus.sync_read("Present_Position", num_retry=_TORQUE_RETRIES)))
+    return pose
 
 
 def _stiffen_motors(robot: Robot) -> dict[str, float]:
@@ -605,14 +629,61 @@ def _stiffen_motors(robot: Robot) -> dict[str, float]:
         That pose as an action (`left_` / `right_` + `<motor>.pos`, like
         `BiSOFollower.send_action` takes it), for the loop to hold.
     """
-    bi = cast(bi_so_follower.BiSOFollower, robot)
     pose: dict[str, float] = {}
-    for prefix, arm in (("left_", bi.left_arm), ("right_", bi.right_arm)):
-        present = arm.bus.sync_read("Present_Position", num_retry=_TORQUE_RETRIES)
-        arm.bus.sync_write("Goal_Position", present, num_retry=_TORQUE_RETRIES)
-        arm.bus.enable_torque(num_retry=_TORQUE_RETRIES)
-        pose.update({f"{prefix}{motor}.pos": float(value) for motor, value in present.items()})
+    for prefix, bus in _arm_buses(robot):
+        present = bus.sync_read("Present_Position", num_retry=_TORQUE_RETRIES)
+        bus.sync_write("Goal_Position", present, num_retry=_TORQUE_RETRIES)
+        bus.enable_torque(num_retry=_TORQUE_RETRIES)
+        pose.update(_as_action(prefix, present))
     return pose
+
+
+def _idle_suffix(target: InferenceTarget) -> str:
+    """Log suffix naming what an idle target does beyond holding position."""
+    if target.relaxed:
+        return " (motors relaxed)"
+    if target.home:
+        return " (Home position)"
+    return ""
+
+
+@dataclass
+class _HomeRamp:
+    """A running move to the Home position: `start` → `target` over `duration` s from `t0`.
+
+    `t0` is the first ramp tick (`None` until then), so that tick sends exactly `start`.
+    """
+
+    start: dict[str, float]
+    target: dict[str, float]
+    duration: float
+    t0: float | None = None
+
+
+def _begin_home(
+    robot: Robot,
+    target: InferenceTarget,
+    last_action: dict[str, float] | None,
+    duration: float,
+) -> _HomeRamp | None:
+    """Start ramping to a Home target's pose from the last commanded pose (or the present one).
+
+    Pose keys the robot has no action for are logged and dropped; `None` when none is left.
+    """
+    pose = target.home_pose
+    unknown = sorted(key for key in pose if key not in robot.action_features)
+    if unknown:
+        logger.warning(
+            "target #%d: ignoring Home position keys the robot does not have: %s",
+            target.seq,
+            ", ".join(unknown),
+        )
+    goal = {key: value for key, value in pose.items() if key in robot.action_features}
+    if not goal:
+        logger.warning("target #%d: the Home position names no joint of this robot — holding", target.seq)
+        return None
+    start = dict(last_action) if last_action is not None else _present_pose(robot)
+    return _HomeRamp(start=start, target=goal, duration=duration)
 
 
 def _run_control_loop(
@@ -674,6 +745,17 @@ def _run_control_loop(
     # True while the motors' torque is off (a relaxed idle target): nothing is sent
     # to the robot, not even the held pose, until a target that is not relaxed.
     relaxed = False
+    # Set while an idle target with a Home pose ramps the robot there; cleared on arrival
+    # (the hold branch then keeps sending the pose) or by any newer target.
+    home_ramp: _HomeRamp | None = None
+    # The arrival line (`home_reached`) goes out only after the target's accepted line:
+    # `accepted_seq` is the seq whose accepted line is out (logged at startup, or by the
+    # worker before it answers an idle target with `Idle`), `reached_seq` the seq that
+    # arrived but is not reported yet. A worker still busy with an older seq would
+    # otherwise log that seq's status between the two, and the app reads the arrival as
+    # superseded.
+    accepted_seq = -1
+    reached_seq: int | None = None
     # Chunk ownership, for the policy's feedback flags. `fire_seq` is the target the
     # in-flight request was fired under, `chunk_seq` the one `current_chunk` was
     # requested under (-1: no chunk yet; real seqs are >= 0). At most one request is
@@ -698,6 +780,10 @@ def _run_control_loop(
             _relax_motors(robot)
             relaxed = True
             logger.info("No target yet — idle, motors relaxed (torque off).")
+        elif target.home:
+            # Home was pressed while the client was still connecting.
+            home_ramp = _begin_home(robot, target, None, cfg.home_ramp_s)
+            logger.info("No target yet — idle, moving to the Home position.")
         elif target.idle:
             logger.info("No target yet — idle, holding position until the controller-app applies one.")
         else:
@@ -706,6 +792,7 @@ def _run_control_loop(
             except PolicyConnectError as e:
                 raise SystemExit(str(e)) from e
         logger.info(format_target_status(target, True, None))
+        accepted_seq = target.seq
 
         if not target.idle:
             logger.info('Running inference with instruction: "%s"', target.lang_instruction)
@@ -737,6 +824,8 @@ def _run_control_loop(
                 if new_target is not None and new_target.seq != target.seq:
                     target = new_target
                     fire_now = True
+                    home_ramp = None
+                    reached_seq = None
                     if target.idle:
                         # Stop at once instead of playing out the rest of the chunk;
                         # the worker is told below so it can drop its client.
@@ -749,6 +838,10 @@ def _run_control_loop(
                         if target.relaxed:
                             logger.info(
                                 "target #%d requested: idle — motors relaxed (torque off)", target.seq
+                            )
+                        elif target.home:
+                            logger.info(
+                                "target #%d requested: idle — moving to the Home position", target.seq
                             )
                         else:
                             logger.info("target #%d requested: idle — holding position", target.seq)
@@ -771,6 +864,9 @@ def _run_control_loop(
                         last_action = _stiffen_motors(robot)
                         relaxed = False
                         logger.info("target #%d: motors stiffened, holding the current pose", target.seq)
+                    # Home: ramp from the pose just commanded (or stiffened at) to the saved one.
+                    if target.home:
+                        home_ramp = _begin_home(robot, target, last_action, cfg.home_ramp_s)
 
             # 1. Try to swap in a freshly arrived chunk, time-aligned to the
             #    robot's current position. The chunk's action[0] is the policy's
@@ -809,6 +905,8 @@ def _run_control_loop(
                             new_chunk.seq,
                             new_chunk.error,
                         )
+                    elif isinstance(new_chunk, Idle):
+                        accepted_seq = new_chunk.seq
                     current_chunk = []
                     idx = 0
                     inflight = False
@@ -877,7 +975,8 @@ def _run_control_loop(
             #    A step also carries the policy's feedback values (see `get_action`);
             #    only the joints go to the robot — and into `last_action`, which both
             #    hold branches re-send. Hold / late-chunk ticks leave the tracker alone:
-            #    they are neither evidence for nor against a flag.
+            #    they are neither evidence for nor against a flag. A Home ramp (idle, so
+            #    no chunk) sends its next pose until it arrives, then the hold re-sends it.
             if idx < len(current_chunk):
                 action, feedback = split_feedback(current_chunk[idx])
                 robot.send_action(action)
@@ -891,6 +990,17 @@ def _run_control_loop(
                     flags = tracker.update(feedback)
                     if flags is not None:
                         logger.info(format_feedback_status(chunk_seq, flags, feedback))
+            elif home_ramp is not None and not relaxed:
+                if home_ramp.t0 is None:
+                    home_ramp.t0 = tick_start
+                alpha = smoothstep(min(1.0, (tick_start - home_ramp.t0) / home_ramp.duration))
+                action = ramp_pose(home_ramp.start, home_ramp.target, alpha)
+                robot.send_action(action)
+                last_action = action
+                if alpha >= 1.0:
+                    logger.info("target #%d: Home position reached", target.seq)
+                    reached_seq = target.seq
+                    home_ramp = None
             elif holding:
                 # Idle or on hold: keep the last pose, quietly (logged once above) —
                 # unless relaxed: then the arms are the operator's.
@@ -907,6 +1017,9 @@ def _run_control_loop(
                 if late_logged_at is None or tick_start - late_logged_at >= 1.0:
                     logger.warning("late chunk: gap=%.1f ms (holding position)", gap_ms)
                     late_logged_at = tick_start
+            if reached_seq == target.seq and accepted_seq == target.seq:
+                logger.info(format_target_status(target, True, None, home_reached=True))
+                reached_seq = None
 
             # 3. Fire the next request once we've consumed `refetch_after`
             #    actions from the current chunk and nothing is already in flight.
@@ -980,6 +1093,8 @@ def main(cfg: BmhInferenceConfig) -> None:
         )
     if cfg.feedback_debounce_ticks < 1:
         raise SystemExit(f"--feedback_debounce_ticks must be >= 1; got {cfg.feedback_debounce_ticks}.")
+    if not cfg.home_ramp_s > 0:
+        raise SystemExit(f"--home_ramp_s must be > 0; got {cfg.home_ramp_s}.")
 
     # Initial target: the controller-app's control file when given, else the CLI
     # flags, else idle. A real target is validated by `_connect_policy` (ping +

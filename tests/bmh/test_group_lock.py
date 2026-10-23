@@ -1,6 +1,6 @@
 """Unit tests for the BMH-101 teleop group lock - no ZMQ, no hardware.
 
-Covers ``ActionGroupLock`` (freeze + smoothstep unlock blend + head-jitter offsets) and
+Covers ``ActionGroupLock`` (freeze + smoothstep unlock blend + head-jitter offsets + Home lock pose) and
 ``LockFileWatcher`` (stat-based change detection of the controller-app's JSON file). Needs ``draccus``
 because importing the teleoperator package registers draccus configs. Run with
 ``uv run --no-sync pytest tests/bmh/test_group_lock.py -q``.
@@ -29,6 +29,7 @@ from lerobot.teleoperators.so_network_leader.so_network_leader import (  # noqa:
 )
 
 BLEND_S = 0.8
+POSE_BLEND_S = 2.0
 GROUPS = bimanual_lock_groups(left_with_head=True)
 LEFT, RIGHT, HEAD = GROUPS["left"], GROUPS["right"], GROUPS["head"]
 ALL_UNLOCKED = {"left": False, "right": False, "head": False}
@@ -42,8 +43,10 @@ def _action(left: float = 0.0, right: float = 0.0, head: float = 0.0) -> dict[st
     return action
 
 
-def _lock(blend_s: float = BLEND_S) -> ActionGroupLock:
-    return ActionGroupLock(bimanual_lock_groups(left_with_head=True), blend_s=blend_s)
+def _lock(blend_s: float = BLEND_S, pose_blend_s: float = POSE_BLEND_S) -> ActionGroupLock:
+    return ActionGroupLock(
+        bimanual_lock_groups(left_with_head=True), blend_s=blend_s, pose_blend_s=pose_blend_s
+    )
 
 
 def _all(out: dict[str, float], keys: list[str], value: float) -> bool:
@@ -223,6 +226,8 @@ def test_zero_blend_duration_snaps_to_leader():
 def test_negative_blend_duration_rejected():
     with pytest.raises(ValueError):
         _lock(blend_s=-0.1)
+    with pytest.raises(ValueError):
+        _lock(pose_blend_s=-0.1)
 
 
 # --------------------------------------------------------------------------- offsets (head jitter)
@@ -376,6 +381,159 @@ def test_zero_blend_duration_snaps_to_the_offset():
     assert out[PAN] == 4.0 and out[TILT] == -2.0
 
 
+# --------------------------------------------------------------------------- lock pose (Home position)
+
+
+def _pose(left: float | None = None, right: float | None = None, head: float | None = None) -> dict:
+    """Lock pose with every joint of the listed groups at the same value."""
+    pose: dict[str, float] = {}
+    for keys, value in ((LEFT, left), (RIGHT, right), (HEAD, head)):
+        if value is not None:
+            pose.update(dict.fromkeys(keys, value))
+    return pose
+
+
+def _locked(group: str, at: float, pose: dict | None = None) -> ActionGroupLock:
+    """Lock with ``group`` engaged at ``at`` (all groups' leader values) on tick 0."""
+    lock = _lock()
+    if pose is not None:
+        lock.set_lock_pose(pose)
+    lock.set_locks({group: True})
+    lock.apply(_action(left=at, right=at, head=at), now=0.0)
+    return lock
+
+
+def _samples(lock: ActionGroupLock, start: float, seconds: float, key: str, leader: float = 0.0):
+    """Tick at 30 Hz for ``seconds``; returns ``key``'s outputs and the last tick time."""
+    now, samples = start, []
+    for _ in range(round(seconds / TICK_S)):
+        now += TICK_S
+        samples.append(lock.apply(_action(left=leader, right=leader, head=leader), now=now)[key])
+    return samples, now
+
+
+def test_posed_engage_eases_from_the_current_pose_to_home():
+    lock = _lock()
+    lock.apply(_action(left=10.0), now=0.0)
+    lock.set_lock_pose(_pose(left=40.0, right=-5.0))
+    lock.set_locks({"left": True})
+
+    # The engage tick still outputs where the group was (no jump), whatever the leader does.
+    out = lock.apply(_action(left=99.0), now=TICK_S)
+    assert _all(out, LEFT, 10.0)
+    samples, now = _samples(lock, TICK_S, POSE_BLEND_S, "left_shoulder_pan.pos", leader=99.0)
+    assert all(b >= a for a, b in pairwise([10.0, *samples]))
+    # Not there after the unlock blend time, there after pose_blend_s - and it stays.
+    assert samples[round(BLEND_S / TICK_S)] < 40.0 - 5.0
+    assert samples[-1] == pytest.approx(40.0)
+    out = lock.apply(_action(left=-99.0, right=3.0), now=now + 5.0)
+    assert _all(out, LEFT, 40.0)
+    assert _all(out, RIGHT, 3.0)  # right tracks: a pose only acts on held groups
+
+
+def test_pose_set_while_held_rebases_from_the_held_pose():
+    lock = _locked("right", at=20.0)
+    _, now = _samples(lock, 0.0, 1.0, "right_gripper.pos", leader=70.0)
+
+    lock.set_lock_pose(_pose(right=0.0))
+    samples, _ = _samples(lock, now, POSE_BLEND_S + TICK_S, "right_gripper.pos", leader=70.0)
+    assert samples[0] == 20.0
+    assert all(b <= a for a, b in pairwise(samples))
+    assert samples[-1] == pytest.approx(0.0)
+
+
+def test_frozen_group_without_pose_entries_never_moves():
+    lock = _locked("head", at=12.0, pose=_pose(left=0.0, right=0.0))
+    samples, _ = _samples(lock, 0.0, 2 * POSE_BLEND_S, PAN, leader=-30.0)
+    assert set(samples) == {12.0}
+    assert lock.posed_groups() == ["left", "right"]
+
+
+@pytest.mark.parametrize("seconds", [POSE_BLEND_S / 2, 2 * POSE_BLEND_S])
+def test_home_to_freeze_stays_where_the_group_is(seconds):
+    lock = _locked("left", at=0.0, pose=_pose(left=50.0))
+    samples, now = _samples(lock, 0.0, seconds, "left_elbow_flex.pos")
+    here = samples[-1]
+
+    lock.set_lock_pose({})
+    samples, _ = _samples(lock, now, 2 * POSE_BLEND_S, "left_elbow_flex.pos", leader=-40.0)
+    assert samples == pytest.approx([here] * len(samples))
+
+
+def test_head_jitter_eases_around_home():
+    lock = _locked("head", at=0.0, pose=_pose(head=20.0))
+    lock.set_offsets(_jitter(3.0, -2.0))
+    out, now = _run(lock, 0.0, POSE_BLEND_S + TICK_S)
+    assert out[PAN] == pytest.approx(23.0) and out[TILT] == pytest.approx(18.0)
+
+    # Home -> Freeze while jittered keeps the pose (the jitter is not applied twice) ...
+    lock.set_lock_pose({})
+    out, now = _run(lock, now, 2.0)
+    assert out[PAN] == pytest.approx(23.0) and out[TILT] == pytest.approx(18.0)
+    # ... and a re-roll still moves around the same base.
+    lock.set_offsets(_jitter(-1.0, 0.0))
+    out, _ = _run(lock, now, 2.0)
+    assert out[PAN] == pytest.approx(19.0) and out[TILT] == pytest.approx(20.0)
+
+
+def test_jitter_roll_mid_ramp_does_not_shorten_the_ramp():
+    lock = _locked("head", at=0.0, pose=_pose(head=60.0))
+    samples, now = _samples(lock, 0.0, POSE_BLEND_S / 4, PAN)
+
+    lock.set_offsets(_jitter(5.0, 5.0))
+    rest, _ = _samples(lock, now, POSE_BLEND_S + TICK_S, PAN)
+    steps = [b - a for a, b in pairwise([samples[-1], *rest])]
+    # No step faster than a full-length ramp allows (smoothstep peaks at 1.5x the mean slope).
+    assert max(steps) <= 1.5 * 65.0 * TICK_S / POSE_BLEND_S + 1e-6
+    assert rest[-1] == pytest.approx(65.0)
+
+
+def test_release_from_home_blends_to_the_leader_over_pose_blend_s():
+    lock = _locked("left", at=0.0, pose=_pose(left=30.0))
+    _run(lock, 0.0, POSE_BLEND_S + 1.0)
+
+    lock.set_locks({"left": False})
+    out = lock.apply(_action(left=10.0), now=10.0)
+    assert _all(out, LEFT, 30.0)
+    # Still on the way after the release time of a freeze: Home is left as slowly as it was reached.
+    out = lock.apply(_action(left=10.0), now=10.0 + BLEND_S)
+    assert out["left_elbow_flex.pos"] > 20.0
+    out = lock.apply(_action(left=10.0), now=10.0 + POSE_BLEND_S / 2)
+    assert _all(out, LEFT, 20.0)
+    out = lock.apply(_action(left=10.0), now=10.0 + POSE_BLEND_S)
+    assert _all(out, LEFT, 10.0)
+    assert lock.modes["left"] == "track"
+
+    # Re-engaging freezes in place again once Home is gone, and releases at the freeze pace.
+    lock.set_lock_pose({})
+    lock.set_locks({"left": True})
+    out, now = _run(lock, 10.0 + POSE_BLEND_S, 3.0)
+    assert _all(out, LEFT, 10.0)
+    lock.set_locks({"left": False})
+    lock.apply(_action(left=-10.0), now=now)
+    out = lock.apply(_action(left=-10.0), now=now + BLEND_S)
+    assert _all(out, LEFT, -10.0)
+
+
+def test_pose_ease_resumes_after_a_pause():
+    lock = _locked("right", at=0.0, pose=_pose(right=40.0))
+    before, now = _samples(lock, 0.0, POSE_BLEND_S / 2, "right_wrist_flex.pos")
+    assert before[-1] == pytest.approx(20.0, abs=1.0)
+
+    after = lock.apply(_action(), now=now + 120.0)["right_wrist_flex.pos"]
+    assert 0.0 < after - before[-1] < 5.0
+    rest, _ = _samples(lock, now + 120.0, POSE_BLEND_S, "right_wrist_flex.pos")
+    assert rest[-1] == pytest.approx(40.0)
+
+
+def test_zero_pose_blend_snaps_to_home():
+    lock = _lock(pose_blend_s=0.0)
+    lock.set_lock_pose(_pose(left=7.0))
+    lock.set_locks({"left": True})
+    out = lock.apply(_action(left=1.0), now=0.0)
+    assert _all(out, LEFT, 7.0)
+
+
 # --------------------------------------------------------------------------- watcher
 
 
@@ -493,3 +651,45 @@ def test_watcher_non_finite_head_jitter_is_rejected(tmp_path):
     path.write_text('{"head": true, "head_jitter": {"pan": NaN, "tilt": Infinity}}')
     assert watcher.poll() is None
     assert watcher.head_jitter == NO_JITTER
+
+
+def test_watcher_reads_and_clears_lock_pose(tmp_path):
+    path = tmp_path / "locks.json"
+    watcher = LockFileWatcher(path)
+    assert watcher.lock_pose == {}
+    _write(path, {"left": True, "lock_pose": {"left_gripper.pos": 12, "left_elbow_flex.pos": -3.5}}, 1_000)
+    assert watcher.poll() == {"left": True, "right": False, "head": False}
+    assert watcher.lock_pose == {"left_gripper.pos": 12.0, "left_elbow_flex.pos": -3.5}
+
+    _write(path, {"left": True}, 2_000)
+    assert watcher.poll() is not None
+    assert watcher.lock_pose == {}
+
+    _write(path, {"left": True, "lock_pose": {"left_gripper.pos": 1}}, 3_000)
+    watcher.poll()
+    path.unlink()
+    assert watcher.poll() == ALL_UNLOCKED
+    assert watcher.lock_pose == {}
+
+
+@pytest.mark.parametrize("bad", [[1, 2], "5", {"left_gripper.pos": True}, {"left_gripper.pos": "5"}])
+def test_watcher_malformed_lock_pose_keeps_previous_state(tmp_path, caplog, bad):
+    path = tmp_path / "locks.json"
+    watcher = LockFileWatcher(path)
+    _write(path, {"left": True, "lock_pose": {"left_gripper.pos": 2.0}}, 1_000)
+    assert watcher.poll()["left"] is True
+
+    _write(path, {"left": False, "lock_pose": bad}, 2_000)
+    with caplog.at_level("WARNING"):
+        assert watcher.poll() is None
+        assert watcher.poll() is None
+    assert caplog.text.count("lock_pose") == 1
+    assert watcher.lock_pose == {"left_gripper.pos": 2.0}
+
+
+def test_watcher_non_finite_lock_pose_is_rejected(tmp_path):
+    path = tmp_path / "locks.json"
+    watcher = LockFileWatcher(path)
+    path.write_text('{"left": true, "lock_pose": {"left_gripper.pos": NaN}}')
+    assert watcher.poll() is None
+    assert watcher.lock_pose == {}

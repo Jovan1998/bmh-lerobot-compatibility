@@ -6,7 +6,8 @@ the control file connects and moves, an idle update stops motion at once and dis
 chunk that was still in flight, a failing request holds instead of ending the process,
 and a failing startup never leaks a connected (torqued) robot. A relaxed idle target turns
 the torque off on both arms' buses and sends nothing until a Hold or a new task, which
-stiffen the arms where they were left. The policy's feedback
+stiffen the arms where they were left. A Home idle target ramps the arms from where they
+are to the saved pose, holds it and reports the arrival; a newer target stops the ramp. The policy's feedback
 values (``feedback_*``) never reach the robot, and come back as ``BMH_FEEDBACK`` lines
 under the seq of the target whose chunk set them.
 
@@ -386,6 +387,139 @@ def test_new_task_after_relax_stiffens_before_it_observes():
     assert {"j": 100.0} in robot.sent  # ...then the task runs
 
 
+# --------------------------------------------------------------------------- home position
+
+HOME = {"left_j.pos": 51.0, "right_j.pos": -18.0}
+
+
+class _HomeRobot(_FakeBiRobot):
+    """`_FakeBiRobot` whose action keys match its buses (`left_j.pos` / `right_j.pos`)."""
+
+    action_features = dict.fromkeys(LEFT_AT_HAND, float)
+
+
+def _home_statuses(caplog, seq: int) -> list[bool]:
+    """`home_reached` of every `BMH_TARGET` line for `seq`, in log order."""
+    lines = [_status_json(s) for s in _statuses(caplog)]
+    assert all(line["home"] for line in lines if line["seq"] == seq)
+    return [line["home_reached"] for line in lines if line["seq"] == seq]
+
+
+def _monotonic(values: list[float]) -> bool:
+    return all(b >= a for a, b in zip(values, values[1:], strict=False)) or all(
+        b <= a for a, b in zip(values, values[1:], strict=False)
+    )
+
+
+def test_home_ramps_from_the_present_pose_then_holds_and_reports_arrival(caplog):
+    robot, adapter, connect = _HomeRobot(), _FakeAdapter(), _Connect()
+    watcher = _ScriptedWatcher({3: lambda: InferenceTarget.make_idle(1, home=HOME)})
+    with caplog.at_level("INFO"):
+        _run_control_loop(
+            robot, adapter, watcher, InferenceTarget.make_idle(0), _cfg(home_ramp_s=0.05), connect
+        )
+
+    # Nothing was sent before; the ramp starts from the pose read off the buses, torque untouched.
+    assert robot.bus_calls() == [("left", "read Present_Position"), ("right", "read Present_Position")]
+    assert robot.sent[0] == LEFT_AT_HAND
+    for key in HOME:
+        assert _monotonic([a[key] for a in robot.sent])
+    assert robot.sent[-1] == HOME
+    assert robot.sent.count(HOME) > 10  # ...and held there every tick after the arrival
+    assert len(robot.sent) == TICKS - 2
+    assert _home_statuses(caplog, 1) == [False, True]
+    assert connect.calls == [] and adapter.calls == []
+
+
+def test_home_at_startup_ramps_from_the_present_pose(caplog):
+    robot, adapter, connect = _HomeRobot(), _FakeAdapter(), _Connect()
+    with caplog.at_level("INFO"):
+        _run_control_loop(
+            robot,
+            adapter,
+            _ScriptedWatcher(),
+            InferenceTarget.make_idle(0, home=HOME),
+            _cfg(home_ramp_s=0.05),
+            connect,
+        )
+    assert robot.sent[0] == LEFT_AT_HAND and robot.sent[-1] == HOME
+    assert _home_statuses(caplog, 0) == [False, True]
+
+
+def test_home_after_relax_stiffens_first_and_starts_from_the_hand_pose(caplog):
+    robot, adapter, connect = _HomeRobot(), _FakeAdapter(), _Connect()
+    watcher = _ScriptedWatcher(
+        {
+            3: lambda: InferenceTarget.make_idle(1, relaxed=True),
+            6: lambda: InferenceTarget.make_idle(2, home=HOME),
+        }
+    )
+    with caplog.at_level("INFO"):
+        _run_control_loop(
+            robot, adapter, watcher, InferenceTarget.make_idle(0), _cfg(home_ramp_s=0.05), connect
+        )
+
+    # Stiffened where the operator left the arms; no second read - the ramp starts there.
+    assert robot.bus_calls() == RELAX_CALLS + STIFFEN_CALLS
+    assert robot.sent[0] == LEFT_AT_HAND
+    assert robot.sent[-1] == HOME
+    assert _home_statuses(caplog, 2) == [False, True]
+
+
+def test_new_target_mid_ramp_holds_where_the_robot_is(caplog):
+    robot, adapter, connect = _HomeRobot(), _FakeAdapter(), _Connect()
+    sent_at_hold: list[int] = []
+
+    def hold() -> InferenceTarget:
+        sent_at_hold.append(len(robot.sent))
+        return InferenceTarget.make_idle(2)
+
+    watcher = _ScriptedWatcher({3: lambda: InferenceTarget.make_idle(1, home=HOME), 13: hold})
+    with caplog.at_level("INFO"):
+        _run_control_loop(
+            robot, adapter, watcher, InferenceTarget.make_idle(0), _cfg(home_ramp_s=10.0), connect
+        )
+
+    here = robot.sent[sent_at_hold[0] - 1]
+    assert LEFT_AT_HAND["left_j.pos"] < here["left_j.pos"] < HOME["left_j.pos"]
+    assert robot.sent[sent_at_hold[0] :] == [here] * (len(robot.sent) - sent_at_hold[0])
+    assert _home_statuses(caplog, 1) == [False]  # never reached
+
+
+def test_home_arrival_is_reported_after_the_worker_accepted_the_seq(caplog):
+    # Request 2 hangs until tick 40 and then fails; Home (seq 2) arrives at tick 5 and the
+    # ramp ends long before the worker gets to seq 2. Its failure line for seq 1 must not
+    # land between seq 2's accepted and reached lines.
+    gate = threading.Event()
+    robot, adapter, connect = _HomeRobot(), _FakeAdapter(fail_on=(2,), gates={2: gate}), _Connect()
+    watcher = _ScriptedWatcher({5: lambda: InferenceTarget.make_idle(2, home=HOME), 40: lambda: gate.set()})
+    with caplog.at_level("INFO"):
+        _run_control_loop(robot, adapter, watcher, _target(1), _cfg(home_ramp_s=0.05), connect)
+
+    lines = [_status_json(s) for s in _statuses(caplog)]
+    assert [(line["seq"], line["accepted"], line["home_reached"]) for line in lines] == [
+        (1, True, False),
+        (1, False, False),
+        (2, True, False),
+        (2, True, True),
+    ]
+
+
+def test_home_keys_the_robot_does_not_have_are_dropped(caplog):
+    robot, adapter, connect = _HomeRobot(), _FakeAdapter(), _Connect()
+    home = {"left_j.pos": 30.0, "left_head_pan.pos": 5.0}
+    watcher = _ScriptedWatcher({3: lambda: InferenceTarget.make_idle(1, home=home)})
+    with caplog.at_level("INFO"):
+        _run_control_loop(
+            robot, adapter, watcher, InferenceTarget.make_idle(0), _cfg(home_ramp_s=0.05), connect
+        )
+
+    assert "left_head_pan.pos" in caplog.text
+    assert all(set(a) == set(LEFT_AT_HAND) for a in robot.sent)
+    assert robot.sent[-1] == {"left_j.pos": 30.0, "right_j.pos": 22.0}  # right arm stays put
+    assert _home_statuses(caplog, 1) == [False, True]
+
+
 def test_late_chunk_warning_is_rate_limited(caplog):
     # Request 2 hangs until the last tick: the bootstrap chunk runs dry at tick 9 and the
     # robot waits ~50 ticks (0.25 s) for it.
@@ -600,6 +734,14 @@ def test_main_rejects_bad_feedback_settings_before_touching_the_robot(fake_main,
     robot, _adapter, _state = fake_main
     with pytest.raises(SystemExit, match="--feedback_"):
         main(_cfg(lang_instruction="task A", **overrides))
+    assert robot.connected == 0
+
+
+@pytest.mark.parametrize("home_ramp_s", [0.0, -1.0])
+def test_main_rejects_a_non_positive_home_ramp_before_touching_the_robot(fake_main, home_ramp_s):
+    robot, _adapter, _state = fake_main
+    with pytest.raises(SystemExit, match="--home_ramp_s"):
+        main(_cfg(lang_instruction="task A", home_ramp_s=home_ramp_s))
     assert robot.connected == 0
 
 
