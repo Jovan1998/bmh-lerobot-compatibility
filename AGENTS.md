@@ -21,10 +21,20 @@ git lfs install && git lfs pull             # Test artifacts
 
 ## Worktrees
 
-Feature work happens in a per-issue worktree at `/Users/jovan/Desktop/bmh/.worktrees/bmh-lerobot-compatibility/<ISSUE-ID>` (workflow in the workspace `../AGENTS.md`). Notes specific to this repo:
+Feature work happens in a per-issue worktree **inside this repo** at `/Users/jovan/Desktop/bmh/bmh-lerobot-compatibility/.claude/worktrees/<ISSUE-ID>` (full workflow: the workspace `/Users/jovan/Desktop/bmh/AGENTS.md`, "Working on a task"). Create it from the main checkout, `cd` into the main checkout, then enter it — a path under `.claude/worktrees/` enters without a permission prompt:
 
-- The main branch is **`bmh-lerobot-main`**; create worktrees from `origin/bmh-lerobot-main`, never commit on or push to it (git hooks enforce this for agent sessions).
-- Create the venv **per worktree** (`uv sync --locked --extra test --extra dev`; uv's cache makes this mostly hardlinks). Don't run against the main checkout's `.venv`: lerobot is installed editable there, so you'd be testing `main`'s code, not yours.
+```bash
+cd /Users/jovan/Desktop/bmh/bmh-lerobot-compatibility
+git fetch origin
+git worktree add .claude/worktrees/<ISSUE-ID> -b <ISSUE-ID> origin/bmh-lerobot-main
+# then: EnterWorktree(path="/Users/jovan/Desktop/bmh/bmh-lerobot-compatibility/.claude/worktrees/<ISSUE-ID>")
+```
+
+Notes specific to this repo:
+
+- The main branch is **`bmh-lerobot-main`**; create worktrees from `origin/bmh-lerobot-main` (not `origin/main`, which is what `EnterWorktree(name=…)` would pick), never commit on or push to it (git hooks enforce this for agent sessions).
+- The main checkout's `.git/info/exclude` ignores `/.claude/worktrees/`, so worktrees never show up as untracked there. The folder above `.claude/` is Jovan's main checkout: never edit files or run git in it. Worktrees created before 2026-10-23 still live at `/Users/jovan/Desktop/bmh/.worktrees/bmh-lerobot-compatibility/<ISSUE-ID>`; keep using them where they are (entering one asks Jovan once).
+- Create the venv **per worktree** (`uv sync --locked --extra test --extra dev`; uv's cache makes this mostly hardlinks). Don't run against the main checkout's `.venv`: lerobot is installed editable there, so you'd be testing `main`'s code, not yours. That `.venv` now sits in a parent folder of your worktree; `uv` still picks the worktree's own `pyproject.toml` and `.venv`, so just never activate or point at the parent one.
 - The main checkout's venv is Python 3.14 and draccus parsing crashes there; see memory `fork-venv-py314-draccus-help` for the workaround before using `--help` or `draccus.parse` as a check.
 
 ## Key Commands
