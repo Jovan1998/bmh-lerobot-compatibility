@@ -486,6 +486,25 @@ def test_new_target_mid_ramp_holds_where_the_robot_is(caplog):
     assert _home_statuses(caplog, 1) == [False]  # never reached
 
 
+def test_home_arrival_is_reported_after_the_worker_accepted_the_seq(caplog):
+    # Request 2 hangs until tick 40 and then fails; Home (seq 2) arrives at tick 5 and the
+    # ramp ends long before the worker gets to seq 2. Its failure line for seq 1 must not
+    # land between seq 2's accepted and reached lines.
+    gate = threading.Event()
+    robot, adapter, connect = _HomeRobot(), _FakeAdapter(fail_on=(2,), gates={2: gate}), _Connect()
+    watcher = _ScriptedWatcher({5: lambda: InferenceTarget.make_idle(2, home=HOME), 40: lambda: gate.set()})
+    with caplog.at_level("INFO"):
+        _run_control_loop(robot, adapter, watcher, _target(1), _cfg(home_ramp_s=0.05), connect)
+
+    lines = [_status_json(s) for s in _statuses(caplog)]
+    assert [(line["seq"], line["accepted"], line["home_reached"]) for line in lines] == [
+        (1, True, False),
+        (1, False, False),
+        (2, True, False),
+        (2, True, True),
+    ]
+
+
 def test_home_keys_the_robot_does_not_have_are_dropped(caplog):
     robot, adapter, connect = _HomeRobot(), _FakeAdapter(), _Connect()
     home = {"left_j.pos": 30.0, "left_head_pan.pos": 5.0}

@@ -129,8 +129,8 @@ leader pose over `unlock_blend_s` seconds (smoothstep, default 0.8 s) instead of
 Locking a group again mid-blend holds the blended pose.
 
 - Flags: `--teleop.lock_file=<path>` enables it (default `None` = off, upstream behaviour);
-  `--teleop.unlock_blend_s=0.8` tunes the release, `--teleop.home_blend_s=2.0` the move to the
-  Home position (see below).
+  `--teleop.unlock_blend_s=0.8` tunes the release, `--teleop.home_blend_s=2.0` the move to and
+  from the Home position (see below).
 - State file: a JSON object `{"left": bool, "right": bool, "head": bool}`, replaced atomically
   (tmp + rename) by whoever drives the UI. The controller-app writes
   `~/.cache/bmh-101/teleop-locks.json` and passes that path on both `lerobot-teleoperate` and
@@ -152,7 +152,8 @@ Locking a group again mid-blend holds the blended pose.
   `home_blend_s` (smoothstep) instead of freezing in place, then holds it; a head jitter is added
   on top of it (Home + offset). When the pose appears, changes or disappears the hold is re-based
   without a jump - a group whose pose entries vanish stays where it is (freeze). Release blends
-  from the pose to the leader over `unlock_blend_s` as usual. Values must be finite numbers; a
+  from the pose to the leader over `home_blend_s` too: Home is usually far from where the leader
+  is held, and `unlock_blend_s` would make that a fast move. Values must be finite numbers; a
   malformed `lock_pose` rejects that file version (logged once). An older fork ignores the key, so
   "Home" then degrades to a plain freeze.
 - **Recording:** the lock runs inside `get_action()`, so `lerobot-record` stores the held / blended
@@ -190,6 +191,7 @@ and the head) as normalized action values (`left_shoulder_pan.pos` ... `left_hea
   motors if they were relaxed, ramps from the pose it last commanded (or the present one) to
   `home` over `--home_ramp_s` (default 2.5 s, smoothstep), then holds it. It reports the seq like
   any idle target (`BMH_TARGET {..., "home": true, "home_reached": false}`) and logs a second line
-  with `"home_reached": true` on arrival. Keys the robot has no action for are dropped with a
+  with `"home_reached": true` on arrival - always after the first one, even when the arms arrive
+  before the inference worker got to the seq (it may still be busy with an older one). Keys the robot has no action for are dropped with a
   warning; `home` together with `"relaxed": true` is rejected; any newer document stops the ramp
   where the robot is. Contract details: `bmh/groot_client/control.py`.

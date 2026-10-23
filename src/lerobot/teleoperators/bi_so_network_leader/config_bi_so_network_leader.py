@@ -27,5 +27,6 @@ class BiSONetworkLeaderConfig(TeleoperatorConfig):
     # Seconds to ease a group from its held pose back to the live leader pose after unlock
     # (also the time a frozen head takes to ease to a new head_jitter offset).
     unlock_blend_s: float = 0.8
-    # Seconds a held group takes to ease from where it is to the lock pose (Home position).
+    # Seconds a held group takes to ease from where it is to the lock pose (Home position),
+    # and to ease from there back to the live leader pose on release.
     home_blend_s: float = 2.0

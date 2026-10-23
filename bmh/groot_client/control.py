@@ -45,7 +45,8 @@ An idle document may instead carry ``"home": {action_key: value}`` — the robot
 Home position (the Physical Agent's "Home position" button and a script's ``goHome()``).
 The client stiffens the motors if they were relaxed, ramps every listed joint from where
 it is to that pose, and then holds it like a plain idle. It answers the ``seq`` with a
-second ``BMH_TARGET`` line once the pose is reached (``"home_reached": true``). ``home``
+second ``BMH_TARGET`` line once the pose is reached (``"home_reached": true``), never
+before the first one: a status line of an older ``seq`` cannot land between them. ``home``
 and ``relaxed: true`` exclude each other; a non-idle document ignores ``home``.
 
 .. code-block:: json

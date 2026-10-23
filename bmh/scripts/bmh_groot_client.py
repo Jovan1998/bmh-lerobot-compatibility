@@ -748,6 +748,14 @@ def _run_control_loop(
     # Set while an idle target with a Home pose ramps the robot there; cleared on arrival
     # (the hold branch then keeps sending the pose) or by any newer target.
     home_ramp: _HomeRamp | None = None
+    # The arrival line (`home_reached`) goes out only after the target's accepted line:
+    # `accepted_seq` is the seq whose accepted line is out (logged at startup, or by the
+    # worker before it answers an idle target with `Idle`), `reached_seq` the seq that
+    # arrived but is not reported yet. A worker still busy with an older seq would
+    # otherwise log that seq's status between the two, and the app reads the arrival as
+    # superseded.
+    accepted_seq = -1
+    reached_seq: int | None = None
     # Chunk ownership, for the policy's feedback flags. `fire_seq` is the target the
     # in-flight request was fired under, `chunk_seq` the one `current_chunk` was
     # requested under (-1: no chunk yet; real seqs are >= 0). At most one request is
@@ -784,6 +792,7 @@ def _run_control_loop(
             except PolicyConnectError as e:
                 raise SystemExit(str(e)) from e
         logger.info(format_target_status(target, True, None))
+        accepted_seq = target.seq
 
         if not target.idle:
             logger.info('Running inference with instruction: "%s"', target.lang_instruction)
@@ -816,6 +825,7 @@ def _run_control_loop(
                     target = new_target
                     fire_now = True
                     home_ramp = None
+                    reached_seq = None
                     if target.idle:
                         # Stop at once instead of playing out the rest of the chunk;
                         # the worker is told below so it can drop its client.
@@ -895,6 +905,8 @@ def _run_control_loop(
                             new_chunk.seq,
                             new_chunk.error,
                         )
+                    elif isinstance(new_chunk, Idle):
+                        accepted_seq = new_chunk.seq
                     current_chunk = []
                     idx = 0
                     inflight = False
@@ -987,7 +999,7 @@ def _run_control_loop(
                 last_action = action
                 if alpha >= 1.0:
                     logger.info("target #%d: Home position reached", target.seq)
-                    logger.info(format_target_status(target, True, None, home_reached=True))
+                    reached_seq = target.seq
                     home_ramp = None
             elif holding:
                 # Idle or on hold: keep the last pose, quietly (logged once above) —
@@ -1005,6 +1017,9 @@ def _run_control_loop(
                 if late_logged_at is None or tick_start - late_logged_at >= 1.0:
                     logger.warning("late chunk: gap=%.1f ms (holding position)", gap_ms)
                     late_logged_at = tick_start
+            if reached_seq == target.seq and accepted_seq == target.seq:
+                logger.info(format_target_status(target, True, None, home_reached=True))
+                reached_seq = None
 
             # 3. Fire the next request once we've consumed `refetch_after`
             #    actions from the current chunk and nothing is already in flight.

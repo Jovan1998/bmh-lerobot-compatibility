@@ -82,6 +82,8 @@ class _GroupState:
     mode: str = "track"  # "track" | "hold" | "blend"
     held: dict[str, float] = field(default_factory=dict)
     blend_start: float = 0.0
+    # Duration of the running release blend: pose_blend_s after a hold at the lock pose, else blend_s.
+    release_s: float = 0.0
     # Offset added to `held` while in "hold": eases offset_from -> offset_to as
     # offset_progress goes 0 -> 1 over ease_s seconds of tick time.
     offset_from: dict[str, float] = field(default_factory=dict)
@@ -111,7 +113,8 @@ class ActionGroupLock:
     instead of its engage pose. Whenever a group's pose entries change (Home engaged,
     changed or dropped) the hold is re-based without a jump: ``held`` becomes the pose
     (keys the pose does not list stay where they are) and the difference to the current
-    output becomes an offset that eases out over ``pose_blend_s``.
+    output becomes an offset that eases out over ``pose_blend_s``. Releasing a group held
+    at the pose blends back to the leader over ``pose_blend_s`` too.
 
     ``now`` is injected (seconds, any monotonic clock) so the class is fully testable.
     """
@@ -195,9 +198,12 @@ class ActionGroupLock:
                 group.held = {key: self._last_output.get(key, held) for key, held in group.held.items()}
                 group.mode = "blend"
                 group.blend_start = now
+                # The Home position is usually far from the leader: release from it as slowly as
+                # the move there, not at the pace of a release from a freeze.
+                group.release_s = self._pose_blend_s if group.pose else self._blend_s
                 group.pose = None
             if group.mode == "blend":
-                t = 1.0 if self._blend_s <= 0.0 else (now - group.blend_start) / self._blend_s
+                t = 1.0 if group.release_s <= 0.0 else (now - group.blend_start) / group.release_s
                 if t >= 1.0:
                     group.mode = "track"
                     group.held = {}

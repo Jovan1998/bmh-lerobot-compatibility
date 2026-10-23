@@ -488,24 +488,31 @@ def test_jitter_roll_mid_ramp_does_not_shorten_the_ramp():
     assert rest[-1] == pytest.approx(65.0)
 
 
-def test_release_from_home_blends_to_the_leader():
+def test_release_from_home_blends_to_the_leader_over_pose_blend_s():
     lock = _locked("left", at=0.0, pose=_pose(left=30.0))
     _run(lock, 0.0, POSE_BLEND_S + 1.0)
 
     lock.set_locks({"left": False})
     out = lock.apply(_action(left=10.0), now=10.0)
     assert _all(out, LEFT, 30.0)
-    out = lock.apply(_action(left=10.0), now=10.0 + BLEND_S / 2)
-    assert _all(out, LEFT, 20.0)
+    # Still on the way after the release time of a freeze: Home is left as slowly as it was reached.
     out = lock.apply(_action(left=10.0), now=10.0 + BLEND_S)
+    assert out["left_elbow_flex.pos"] > 20.0
+    out = lock.apply(_action(left=10.0), now=10.0 + POSE_BLEND_S / 2)
+    assert _all(out, LEFT, 20.0)
+    out = lock.apply(_action(left=10.0), now=10.0 + POSE_BLEND_S)
     assert _all(out, LEFT, 10.0)
     assert lock.modes["left"] == "track"
 
-    # Re-engaging freezes in place again once Home is gone.
+    # Re-engaging freezes in place again once Home is gone, and releases at the freeze pace.
     lock.set_lock_pose({})
     lock.set_locks({"left": True})
-    out, _ = _run(lock, 10.0 + BLEND_S, 3.0)
+    out, now = _run(lock, 10.0 + POSE_BLEND_S, 3.0)
     assert _all(out, LEFT, 10.0)
+    lock.set_locks({"left": False})
+    lock.apply(_action(left=-10.0), now=now)
+    out = lock.apply(_action(left=-10.0), now=now + BLEND_S)
+    assert _all(out, LEFT, -10.0)
 
 
 def test_pose_ease_resumes_after_a_pause():
