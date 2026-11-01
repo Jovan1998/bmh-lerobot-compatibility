@@ -2,7 +2,9 @@
 
 Covers ``parse_target`` validation (incl. the idle, the relaxed and the Home idle document), ``InferenceTarget.endpoint``
 equality, ``ControlFileWatcher`` change detection (stat-based, like the teleop lock watcher)
-and the ``BMH_TARGET`` / ``BMH_FEEDBACK`` status lines. Pure stdlib module, so this runs anywhere.
+and the ``BMH_TARGET`` / ``BMH_FEEDBACK`` status lines. Also the loop-settings file:
+``parse_loop_settings`` / ``validate_loop_settings``, ``LoopFileWatcher`` (same base as the
+control-file watcher) and the ``BMH_LOOP`` line. Pure stdlib module, so this runs anywhere.
 Run with ``uv run --no-sync pytest tests/bmh/test_inference_control.py -q``.
 """
 
@@ -13,14 +15,20 @@ import pytest
 
 from bmh.groot_client.control import (
     FEEDBACK_STATUS_PREFIX,
+    LOOP_STATUS_PREFIX,
     STATUS_PREFIX,
     ControlFileWatcher,
     InferenceTarget,
+    LoopFileWatcher,
+    LoopSettings,
     format_feedback_status,
+    format_loop_status,
     format_target_status,
+    parse_loop_settings,
     parse_target,
     ramp_pose,
     smoothstep,
+    validate_loop_settings,
 )
 
 VALID = {
@@ -387,3 +395,128 @@ def test_feedback_line_is_not_a_target_line():
     assert not format_target_status(InferenceTarget.make_idle(1), True, None).startswith(
         FEEDBACK_STATUS_PREFIX
     )
+
+
+# --------------------------------------------------------------------------- loop settings
+
+LOOP = {"seq": 3, "action_horizon": 24, "refetch_after": 10, "speed_pct": 100}
+
+
+def test_parse_loop_settings_accepts_valid():
+    assert parse_loop_settings(LOOP) == LoopSettings(3, 24, 10, 100)
+    assert parse_loop_settings({**LOOP, "action_horizon": 60, "refetch_after": 59, "speed_pct": 150}) == (
+        LoopSettings(3, 60, 59, 150)
+    )
+    assert parse_loop_settings({**LOOP, "action_horizon": 2, "refetch_after": 1, "speed_pct": 50}) == (
+        LoopSettings(3, 2, 1, 50)
+    )
+
+
+@pytest.mark.parametrize(
+    "bad",
+    [
+        "not a dict",
+        [LOOP],
+        *({k: v for k, v in LOOP.items() if k != key} for key in LOOP),  # each key is required
+        {**LOOP, "seq": -1},
+        {**LOOP, "seq": True},
+        {**LOOP, "action_horizon": True},
+        {**LOOP, "speed_pct": 100.0},
+        {**LOOP, "speed_pct": "100"},
+        {**LOOP, "refetch_after": None},
+        {**LOOP, "action_horizon": 0},
+        {**LOOP, "action_horizon": 61},
+        {**LOOP, "refetch_after": 0},
+        {**LOOP, "refetch_after": 24},  # == horizon
+        {**LOOP, "refetch_after": 30},
+        {**LOOP, "speed_pct": 49},
+        {**LOOP, "speed_pct": 151},
+    ],
+)
+def test_parse_loop_settings_rejects(bad):
+    with pytest.raises(ValueError):
+        parse_loop_settings(bad)
+
+
+def test_validate_loop_settings():
+    assert validate_loop_settings(LoopSettings(1, 24, 10, 100), blend_frames=4) is None
+    assert validate_loop_settings(LoopSettings(1, 5, 1, 100), blend_frames=4) is None
+    assert "blend_frames=4" in validate_loop_settings(LoopSettings(1, 4, 2, 100), blend_frames=4)
+    assert "blend_frames" in validate_loop_settings(LoopSettings(1, 8, 2, 100), blend_frames=-1)
+    # The parse-time rules hold here too (CLI values never went through the parser).
+    assert "refetch_after" in validate_loop_settings(LoopSettings(1, 8, 8, 100), blend_frames=0)
+    assert "refetch_after" in validate_loop_settings(LoopSettings(1, 8, 0, 100), blend_frames=0)
+    assert "speed_pct" in validate_loop_settings(LoopSettings(1, 8, 3, 200), blend_frames=0)
+
+
+def test_loop_settings_period():
+    assert LoopSettings(0, 8, 3, 100).period_s(30) == pytest.approx(1 / 30)
+    assert LoopSettings(0, 8, 3, 150).period_s(30) == pytest.approx(1 / 45)
+    assert LoopSettings(0, 8, 3, 50).period_s(30) == pytest.approx(1 / 15)
+
+
+def test_format_loop_status_shape():
+    line = format_loop_status(LoopSettings(3, 24, 10, 80), True, None)
+    assert line.startswith(LOOP_STATUS_PREFIX) and "\n" not in line
+    payload = json.loads(line[len(LOOP_STATUS_PREFIX) :])
+    assert payload == {
+        "seq": 3,
+        "accepted": True,
+        "error": None,
+        "action_horizon": 24,
+        "refetch_after": 10,
+        "speed_pct": 80,
+    }
+    rejected = json.loads(
+        format_loop_status(LoopSettings(4, 24, 10, 80), False, "nope")[len(LOOP_STATUS_PREFIX) :]
+    )
+    assert (rejected["seq"], rejected["accepted"], rejected["error"]) == (4, False, "nope")
+
+
+def test_loop_line_is_neither_a_target_nor_a_feedback_line():
+    line = format_loop_status(LoopSettings(1, 8, 3, 100), True, None)
+    assert not line.startswith(STATUS_PREFIX) and not line.startswith(FEEDBACK_STATUS_PREFIX)
+
+
+def test_loop_watcher_read_initial_and_poll(tmp_path):
+    path = tmp_path / "loop.json"
+    _write(path, LOOP, 1_000)
+    watcher = LoopFileWatcher(path)
+    assert watcher.read_initial() == LoopSettings(3, 24, 10, 100)
+    assert watcher.poll() is None  # the startup read is not a change
+    _write(path, {**LOOP, "seq": 4, "speed_pct": 150}, 2_000)
+    assert watcher.poll() == LoopSettings(4, 24, 10, 150)
+    assert watcher.poll() is None
+
+
+def test_loop_watcher_missing_file(tmp_path):
+    path = tmp_path / "loop.json"
+    watcher = LoopFileWatcher(path)
+    assert watcher.read_initial() is None
+    assert watcher.poll() is None
+    _write(path, LOOP, 1_000)
+    assert watcher.poll() == LoopSettings(3, 24, 10, 100)
+
+
+def test_loop_watcher_read_initial_invalid_file_raises(tmp_path):
+    path = tmp_path / "loop.json"
+    path.write_text(json.dumps({**LOOP, "refetch_after": 24}))
+    with pytest.raises(ValueError, match="refetch_after"):
+        LoopFileWatcher(path).read_initial()
+
+
+def test_loop_watcher_malformed_then_fixed(tmp_path, caplog):
+    path = tmp_path / "loop.json"
+    watcher = LoopFileWatcher(path)
+    _write(path, LOOP, 1_000)
+    assert watcher.poll() is not None
+
+    _write(path, {**LOOP, "seq": 4, "speed_pct": 1.5}, 2_000)
+    with caplog.at_level("WARNING"):
+        assert watcher.poll() is None
+        assert watcher.poll() is None
+    assert caplog.text.lower().count("loop file") == 1  # once per file version, named as such
+    assert "control file" not in caplog.text.lower()
+
+    _write(path, {**LOOP, "seq": 5}, 3_000)
+    assert watcher.poll().seq == 5

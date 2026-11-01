@@ -61,6 +61,24 @@ travel back the same way, as a line kind of their own — ``BMH_FEEDBACK {json}`
 :func:`format_feedback_status`) — logged only when the flags change, so the
 ``BMH_TARGET`` payload stays what it is.
 
+Loop settings — how far ahead the client plays (``action_horizon``), when it asks for
+the next chunk (``refetch_after``) and how fast it plays (``speed_pct`` of the recorded
+fps) — come through a second file of their own (``~/.cache/bmh-101/inference-loop.json``),
+written the same way (tmp + rename) and watched the same way (:class:`LoopFileWatcher`).
+Its ``seq`` is independent of the target's: a settings change never re-requests a chunk
+and never counts as a new target. The app never deletes it — it is also where the
+settings persist between runs. All keys are required ints:
+
+.. code-block:: json
+
+    {"seq": 3, "action_horizon": 24, "refetch_after": 10, "speed_pct": 100}
+
+The client answers each decided ``seq`` (and the startup read) with one
+``BMH_LOOP {json}`` line (see :func:`format_loop_status`). A document that breaks a rule
+(:func:`parse_loop_settings`, :func:`validate_loop_settings`) is rejected as a whole:
+the line says ``"accepted": false`` with the reason and carries the values still in
+effect.
+
 stdlib only (no zmq / cv2 / hardware imports) so it is unit-testable anywhere.
 """
 
@@ -84,6 +102,18 @@ STATUS_PREFIX = "BMH_TARGET "
 # Prefix of the one-line JSON snapshot the client logs whenever the policy's feedback
 # flags change (same consumer). A line kind of its own, not part of `BMH_TARGET`.
 FEEDBACK_STATUS_PREFIX = "BMH_FEEDBACK "
+
+# Prefix of the one-line JSON status the client logs per decided loop-settings seq
+# (same consumer). A line kind of its own: loop settings have their own file and seq.
+LOOP_STATUS_PREFIX = "BMH_LOOP "
+
+# Loop-file ranges checked at parse time. `blend_frames < action_horizon` needs the
+# client's CLI value, so it is checked when the settings are applied
+# (`validate_loop_settings`).
+LOOP_HORIZON_MAX = 60
+LOOP_SPEED_PCT_MIN = 50
+LOOP_SPEED_PCT_MAX = 150
+_LOOP_KEYS = ("seq", "action_horizon", "refetch_after", "speed_pct")
 
 # Signature reported for a missing control file (never collides with a real stat).
 _MISSING_SIGNATURE = (-1, -1, -1)
@@ -234,6 +264,127 @@ def _parse_home(value: object) -> dict[str, float] | None:
     return home
 
 
+@dataclass(frozen=True)
+class LoopSettings:
+    """How the control loop plays the chunks: horizon, refetch point and speed.
+
+    Attributes:
+        seq: Monotonic request number assigned by the app (0 for CLI-only runs). Its own
+            counter, independent of the target's ``seq``.
+        action_horizon: Actions kept of each arriving chunk (the rest is cut off).
+        refetch_after: Actions played from a fresh chunk before the next request fires.
+        speed_pct: Playback speed in percent of the recorded fps (100 = as recorded).
+    """
+
+    seq: int
+    action_horizon: int
+    refetch_after: int
+    speed_pct: int = 100
+
+    def period_s(self, fps: int) -> float:
+        """Seconds per control tick: ``1 / (fps * speed_pct / 100)``."""
+        return 100.0 / (fps * self.speed_pct)
+
+
+def parse_loop_settings(data: object) -> LoopSettings:
+    """Validate a decoded loop-file document.
+
+    Args:
+        data: Result of ``json.loads`` on the loop file.
+
+    Returns:
+        The settings.
+
+    Raises:
+        ValueError: If a key is missing, is not an int (bools and floats are rejected),
+            or is out of range: ``seq >= 0``, ``1 <= action_horizon <= 60``,
+            ``1 <= refetch_after < action_horizon``, ``50 <= speed_pct <= 150``.
+    """
+    if not isinstance(data, dict):
+        raise ValueError(f"expected a JSON object, got {type(data).__name__}")
+    for key in _LOOP_KEYS:
+        if key not in data:
+            raise ValueError(f"missing {key!r}")
+        if type(data[key]) is not int:
+            raise ValueError(f"{key!r} must be an integer, got {data[key]!r}")
+    settings = LoopSettings(
+        seq=data["seq"],
+        action_horizon=data["action_horizon"],
+        refetch_after=data["refetch_after"],
+        speed_pct=data["speed_pct"],
+    )
+    if settings.seq < 0:
+        raise ValueError(f"'seq' must be a non-negative integer, got {settings.seq}")
+    if not 1 <= settings.action_horizon <= LOOP_HORIZON_MAX:
+        raise ValueError(
+            f"'action_horizon' must be in [1, {LOOP_HORIZON_MAX}], got {settings.action_horizon}"
+        )
+    error = _check_refetch_and_speed(settings)
+    if error is not None:
+        raise ValueError(error)
+    return settings
+
+
+def _check_refetch_and_speed(settings: LoopSettings) -> str | None:
+    """The rules :func:`parse_loop_settings` and :func:`validate_loop_settings` share."""
+    if not 1 <= settings.refetch_after < settings.action_horizon:
+        return (
+            f"refetch_after must be in [1, action_horizon={settings.action_horizon}), "
+            f"got {settings.refetch_after}"
+        )
+    if not LOOP_SPEED_PCT_MIN <= settings.speed_pct <= LOOP_SPEED_PCT_MAX:
+        return f"speed_pct must be in [{LOOP_SPEED_PCT_MIN}, {LOOP_SPEED_PCT_MAX}], got {settings.speed_pct}"
+    return None
+
+
+def validate_loop_settings(settings: LoopSettings, blend_frames: int) -> str | None:
+    """Check settings against the running client before they are used.
+
+    One rule set for the startup settings (loop file or CLI flags) and for every live
+    change: ``1 <= refetch_after < action_horizon``, ``0 <= blend_frames <
+    action_horizon`` and ``50 <= speed_pct <= 150``. The blend rule needs the client's
+    ``--blend_frames``, which the file parser cannot know.
+
+    Args:
+        settings: The settings to check.
+        blend_frames: The client's ``--blend_frames``.
+
+    Returns:
+        ``None`` when the settings can be applied, else the reason they cannot.
+    """
+    error = _check_refetch_and_speed(settings)
+    if error is not None:
+        return error
+    if blend_frames < 0:
+        return f"blend_frames must be >= 0, got {blend_frames}"
+    if blend_frames >= settings.action_horizon:
+        return (
+            f"action_horizon must be greater than blend_frames={blend_frames}, got {settings.action_horizon}"
+        )
+    return None
+
+
+def format_loop_status(settings: LoopSettings, accepted: bool, error: str | None) -> str:
+    """One-line ``BMH_LOOP {json}`` status for the app to parse.
+
+    Args:
+        settings: The settings now in effect, carrying the ``seq`` that was decided — on
+            a rejection the *rejected* seq with the values that stay in effect.
+        accepted: Whether the document of that ``seq`` was applied.
+        error: Reason for a rejection, ``None`` when accepted.
+    """
+    return LOOP_STATUS_PREFIX + json.dumps(
+        {
+            "seq": settings.seq,
+            "accepted": accepted,
+            "error": error,
+            "action_horizon": settings.action_horizon,
+            "refetch_after": settings.refetch_after,
+            "speed_pct": settings.speed_pct,
+        }
+    )
+
+
 def smoothstep(t: float) -> float:
     """Cubic ease-in/ease-out on [0, 1]; clamps outside that range."""
     if t <= 0.0:
@@ -253,14 +404,17 @@ def ramp_pose(start: Mapping[str, float], target: Mapping[str, float], alpha: fl
     }
 
 
-class ControlFileWatcher:
-    """Change detector for the controller-app's inference control file.
+class _JsonFileWatcher[T]:
+    """Change detector for one of the controller-app's JSON files.
 
     Costs one ``os.stat`` per :meth:`poll`; the file is only opened and parsed when its
     inode / mtime / size changed (i.e. once per apply). Unlike the lock-file watcher a
     *missing* file carries no meaning ("there is no unset target"): it reports ``None``
-    and the caller keeps its current target; a re-created file is picked up again.
+    and the caller keeps what it has; a re-created file is picked up again. Subclasses
+    name the document (``_what``, for log lines) and parse it (``_parse``).
     """
+
+    _what = "file"
 
     def __init__(self, path: Path | str):
         self._path = Path(path)
@@ -270,14 +424,14 @@ class ControlFileWatcher:
     def path(self) -> Path:
         return self._path
 
-    def read_initial(self) -> InferenceTarget | None:
+    def read_initial(self) -> T | None:
         """Startup read of the file the app wrote before spawning the client.
 
         Primes the change detector, so a following :meth:`poll` reports ``None`` unless
         the file changed after this call — the startup read is not a "change".
 
         Returns:
-            The target, or ``None`` if the file does not exist.
+            The parsed document, or ``None`` if the file does not exist.
 
         Raises:
             ValueError: If the file exists but is unreadable or invalid — the app is
@@ -290,13 +444,13 @@ class ControlFileWatcher:
         try:
             return self._read()
         except OSError as e:
-            raise ValueError(f"cannot read control file {self._path}: {e}") from e
+            raise ValueError(f"cannot read {self._what} {self._path}: {e}") from e
 
-    def poll(self) -> InferenceTarget | None:
-        """Return the new target if the file changed since the last call, else ``None``.
+    def poll(self) -> T | None:
+        """Return the new document if the file changed since the last call, else ``None``.
 
         A malformed or vanished file is logged once per file version and ignored
-        (``None``), leaving the caller's current target untouched.
+        (``None``), leaving the caller's current state untouched.
         """
         signature = self._stat()
         if signature == self._signature:
@@ -307,8 +461,11 @@ class ControlFileWatcher:
         try:
             return self._read()
         except (OSError, ValueError) as e:
-            logger.warning("Ignoring unreadable control file %s: %s", self._path, e)
+            logger.warning("Ignoring unreadable %s %s: %s", self._what, self._path, e)
             return None
+
+    def _parse(self, data: object) -> T:
+        raise NotImplementedError
 
     def _stat(self) -> tuple[int, int, int]:
         try:
@@ -318,9 +475,31 @@ class ControlFileWatcher:
         # st_ino changes on every tmp+rename, so even same-size same-mtime rewrites register.
         return (st.st_ino, st.st_mtime_ns, st.st_size)
 
-    def _read(self) -> InferenceTarget:
+    def _read(self) -> T:
         # json.JSONDecodeError is a ValueError, so callers see one failure type.
-        return parse_target(json.loads(self._path.read_text()))
+        return self._parse(json.loads(self._path.read_text()))
+
+
+class ControlFileWatcher(_JsonFileWatcher[InferenceTarget]):
+    """Change detector for the inference control file: yields :class:`InferenceTarget`."""
+
+    _what = "control file"
+
+    def _parse(self, data: object) -> InferenceTarget:
+        return parse_target(data)
+
+
+class LoopFileWatcher(_JsonFileWatcher[LoopSettings]):
+    """Change detector for the loop-settings file: yields :class:`LoopSettings`.
+
+    Only parse-time ranges are checked here; the client applies a document only after
+    :func:`validate_loop_settings` against its ``--blend_frames``.
+    """
+
+    _what = "loop file"
+
+    def _parse(self, data: object) -> LoopSettings:
+        return parse_loop_settings(data)
 
 
 def format_target_status(

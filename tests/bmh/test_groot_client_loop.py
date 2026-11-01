@@ -9,7 +9,9 @@ the torque off on both arms' buses and sends nothing until a Hold or a new task,
 stiffen the arms where they were left. A Home idle target ramps the arms from where they
 are to the saved pose, holds it and reports the arrival; a newer target stops the ramp. The policy's feedback
 values (``feedback_*``) never reach the robot, and come back as ``BMH_FEEDBACK`` lines
-under the seq of the target whose chunk set them.
+under the seq of the target whose chunk set them. Live loop settings (from a scripted loop
+watcher) change the tick period, the refetch point and the horizon cut from the next tick /
+chunk, are answered with ``BMH_LOOP`` lines, and a bad document is rejected whole.
 
 The scripted watcher is the test clock: the loop polls it exactly once per tick, so it
 delivers targets at fixed ticks and ends the run with ``KeyboardInterrupt`` - which the
@@ -20,6 +22,7 @@ skipped otherwise. Run with ``uv run --no-sync --with msgpack-numpy pytest tests
 import json
 import re
 import threading
+import time
 from collections.abc import Callable
 from types import SimpleNamespace
 
@@ -31,7 +34,12 @@ pytest.importorskip("draccus")
 pytest.importorskip("zmq")
 
 import bmh.scripts.bmh_groot_client as script  # noqa: E402
-from bmh.groot_client.control import FEEDBACK_STATUS_PREFIX, InferenceTarget  # noqa: E402
+from bmh.groot_client.control import (  # noqa: E402
+    FEEDBACK_STATUS_PREFIX,
+    LOOP_STATUS_PREFIX,
+    InferenceTarget,
+    LoopSettings,
+)
 from bmh.scripts.bmh_groot_client import (  # noqa: E402
     BmhInferenceConfig,
     PolicyConnectError,
@@ -687,6 +695,271 @@ def test_feedback_config_defaults():
     )
 
 
+# --------------------------------------------------------------------------- loop settings
+
+
+class _ScriptedLoopWatcher:
+    """Loop-file stand-in: `poll()` runs once per tick, after the target watcher, and fires
+    that tick's step. Never ends the run - the target watcher is the clock."""
+
+    def __init__(self, steps: dict[int, Callable[[], LoopSettings | None]] | None = None):
+        self.steps = steps or {}
+        self.tick = 0
+
+    def poll(self) -> LoopSettings | None:
+        self.tick += 1
+        step = self.steps.get(self.tick)
+        return step() if step else None
+
+
+class _VirtualClock:
+    """Stands in for the script's `time` module: `perf_counter` only advances in `sleep`.
+
+    A tick then takes no time, so every sleep is exactly the tick's period.
+    """
+
+    def __init__(self):
+        self.now = 1000.0
+        self.sleeps: list[float] = []
+
+    def perf_counter(self) -> float:
+        return self.now
+
+    def sleep(self, seconds: float) -> None:
+        self.sleeps.append(seconds)
+        self.now += seconds
+
+
+def _settings(seq: int, horizon: int = HORIZON, refetch: int = 3, speed: int = 100) -> LoopSettings:
+    return LoopSettings(seq, horizon, refetch, speed)
+
+
+def _loop_lines(caplog) -> list[dict]:
+    """Decoded `BMH_LOOP` payloads, in log order."""
+    messages = [r.getMessage() for r in caplog.records]
+    return [json.loads(m[len(LOOP_STATUS_PREFIX) :]) for m in messages if m.startswith(LOOP_STATUS_PREFIX)]
+
+
+def _loop_line(seq: int, accepted: bool, horizon: int, refetch: int, speed: int, error=None) -> dict:
+    return {
+        "seq": seq,
+        "accepted": accepted,
+        "error": error,
+        "action_horizon": horizon,
+        "refetch_after": refetch,
+        "speed_pct": speed,
+    }
+
+
+def _fires(caplog) -> list[tuple[int, int]]:
+    """`(frame, consumed_since_swap)` of every fired request."""
+    found = re.findall(r"inference fired at frame=(\d+) \(consumed_since_swap=(\d+)\)", caplog.text)
+    return [(int(frame), int(consumed)) for frame, consumed in found]
+
+
+def _arrivals(caplog) -> list[int]:
+    """Actions per swapped-in chunk, after the horizon cut."""
+    return [int(n) for n in re.findall(r"chunk swap: (\d+) actions arrived", caplog.text)]
+
+
+@pytest.mark.parametrize(("speed", "period"), [(150, 1 / 300), (50, 1 / 100)])
+def test_speed_change_scales_the_tick_period_from_the_next_tick(monkeypatch, caplog, speed, period):
+    clock = _VirtualClock()
+    monkeypatch.setattr(script, "time", clock)
+    robot = _FakeRobot()
+    loop = _ScriptedLoopWatcher({21: lambda: _settings(1, speed=speed)})
+    with caplog.at_level("INFO"):
+        _run_control_loop(
+            robot, _FakeAdapter(), _ScriptedWatcher(), _target(1), _cfg(), _Connect(), loop_watcher=loop
+        )
+    assert clock.sleeps[:20] == pytest.approx([1 / 200] * 20)  # 100 % of fps=200
+    assert clock.sleeps[20:] == pytest.approx([period] * (TICKS - 20))
+    assert len(robot.sent) == TICKS  # still one action per tick, whatever the speed
+    assert _loop_lines(caplog) == [
+        _loop_line(0, True, HORIZON, 3, 100),
+        _loop_line(1, True, HORIZON, 3, speed),
+    ]
+    assert f"loop settings #1 applied: horizon={HORIZON} refetch_after=3 speed={speed}%" in caplog.text
+
+
+def test_refetch_change_moves_the_next_fire(caplog):
+    robot = _FakeRobot()
+    loop = _ScriptedLoopWatcher({20: lambda: _settings(1, refetch=6)})
+    with caplog.at_level("INFO"):
+        _run_control_loop(
+            robot, _FakeAdapter(), _ScriptedWatcher(), _target(1), _cfg(), _Connect(), loop_watcher=loop
+        )
+    fires = _fires(caplog)
+    assert {consumed for frame, consumed in fires if frame < 20} == {3}
+    after = [consumed for frame, consumed in fires if frame > 20]
+    assert after and set(after) == {6}
+    assert "late chunk" not in caplog.text
+
+
+def test_horizon_is_cut_on_arrival_including_the_request_in_flight(caplog):
+    # The policy answers 24 steps; the loop keeps 8. Request 3 is fired under horizon 8 and
+    # hangs until tick 20; the horizon drops to 4 at tick 15, while it is in flight.
+    gate = threading.Event()
+    robot, adapter = _FakeRobot(), _FakeAdapter(gates={3: gate}, horizon=24)
+    loop = _ScriptedLoopWatcher({15: lambda: _settings(1, horizon=4)})
+    with caplog.at_level("INFO"):
+        _run_control_loop(
+            robot,
+            adapter,
+            _ScriptedWatcher({20: gate.set}),
+            _target(1),
+            _cfg(),
+            _Connect(),
+            loop_watcher=loop,
+        )
+    arrivals = _arrivals(caplog)
+    assert arrivals[0] == 8  # chunk 2, under horizon 8
+    assert len(arrivals) > 2 and set(arrivals[1:]) == {4}  # chunk 3 (in flight at the change) on
+    # Chunk 2 played out to its 8th step and the robot waited; chunk 3 only had 4 steps.
+    played = [a["j"] for a in robot.sent]
+    assert max(j for j in played if 200 <= j < 300) == 207
+    assert max(j for j in played if 300 <= j < 400) == 303
+    assert "shorter than action_horizon" not in caplog.text
+
+
+def test_stall_guard_fires_at_chunk_end_when_refetch_is_raised_above_what_is_left(caplog):
+    # Request 2 fires at tick 3 and is held until tick 6, so the swap drops 3 stale actions and
+    # keeps 5. Then refetch_after goes to 7: the counter can never reach it on this chunk.
+    gate = threading.Event()
+    robot, adapter = _FakeRobot(), _FakeAdapter(gates={2: gate})
+
+    def release() -> None:
+        gate.set()
+        time.sleep(0.05)  # the chunk is in the queue before this tick's swap
+
+    loop = _ScriptedLoopWatcher({7: lambda: _settings(1, refetch=HORIZON - 1)})
+    with caplog.at_level("INFO"):
+        _run_control_loop(
+            robot, adapter, _ScriptedWatcher({6: release}), _target(1), _cfg(), _Connect(), loop_watcher=loop
+        )
+    assert "5 kept" in caplog.text
+    assert (10, 5) in _fires(caplog)  # fired at the chunk's end instead of holding forever
+    assert len(adapter.calls) >= 3 and any(a["j"] >= 300 for a in robot.sent)
+    assert len(robot.sent) > HORIZON
+
+
+def test_stall_guard_keeps_refetching_a_policy_with_short_chunks(caplog):
+    robot, adapter = _FakeRobot(), _FakeAdapter(horizon=4)
+    with caplog.at_level("INFO"):
+        _run_control_loop(robot, adapter, _ScriptedWatcher(), _target(1), _cfg(refetch_after=6), _Connect())
+    assert len(adapter.calls) > 5
+    assert any(a["j"] >= 500 for a in robot.sent)
+    assert caplog.text.count("shorter than action_horizon") == 1
+    assert (
+        "policy returns 4-step chunks, shorter than action_horizon=8 — the loop refetches at chunk end"
+        in (caplog.text)
+    )
+
+
+def test_bad_loop_settings_are_rejected_whole_and_change_nothing(monkeypatch, caplog):
+    clock = _VirtualClock()
+    monkeypatch.setattr(script, "time", clock)
+    robot = _FakeRobot()
+    loop = _ScriptedLoopWatcher(
+        {
+            10: lambda: _settings(1, horizon=2, refetch=1, speed=150),  # horizon <= blend_frames
+            20: lambda: _settings(2, horizon=HORIZON, refetch=HORIZON, speed=150),  # refetch >= horizon
+            30: lambda: _settings(3, speed=150),  # a good one still applies afterwards
+        }
+    )
+    with caplog.at_level("INFO"):
+        _run_control_loop(
+            robot,
+            _FakeAdapter(),
+            _ScriptedWatcher(),
+            _target(1),
+            _cfg(blend_frames=2),
+            _Connect(),
+            loop_watcher=loop,
+        )
+    lines = _loop_lines(caplog)
+    assert [(line["seq"], line["accepted"]) for line in lines] == [
+        (0, True),
+        (1, False),
+        (2, False),
+        (3, True),
+    ]
+    # A rejection reports the rejected seq with the values still in effect.
+    assert lines[1] == _loop_line(
+        1, False, HORIZON, 3, 100, error="action_horizon must be greater than blend_frames=2, got 2"
+    )
+    assert lines[2]["error"].startswith("refetch_after must be in [1, action_horizon=8)")
+    assert (lines[2]["action_horizon"], lines[2]["refetch_after"], lines[2]["speed_pct"]) == (HORIZON, 3, 100)
+    assert clock.sleeps[:29] == pytest.approx([1 / 200] * 29)  # the 150 % of #1 / #2 never applied
+    assert clock.sleeps[29:] == pytest.approx([1 / 300] * (TICKS - 29))
+    assert {consumed for _frame, consumed in _fires(caplog)} == {3}
+    assert len(robot.sent) == TICKS
+
+
+def test_startup_reports_the_cli_loop_settings_without_a_loop_file(caplog):
+    with caplog.at_level("INFO"):
+        _run_control_loop(
+            _FakeRobot(), _FakeAdapter(), _ScriptedWatcher(), InferenceTarget.make_idle(0), _cfg(), _Connect()
+        )
+    assert _loop_lines(caplog) == [_loop_line(0, True, HORIZON, 3, 100)]
+    # ...right after the startup target line.
+    messages = [r.getMessage() for r in caplog.records]
+    first_target = next(i for i, m in enumerate(messages) if m.startswith("BMH_TARGET"))
+    assert messages[first_target + 1].startswith(LOOP_STATUS_PREFIX)
+
+
+def test_startup_reports_the_given_loop_settings_once(caplog):
+    robot, adapter = _FakeRobot(), _FakeAdapter(horizon=24)
+    with caplog.at_level("INFO"):
+        _run_control_loop(
+            robot,
+            adapter,
+            _ScriptedWatcher(),
+            _target(1),
+            _cfg(),
+            _Connect(),
+            loop_watcher=_ScriptedLoopWatcher(),
+            settings=LoopSettings(5, 6, 2, 80),
+        )
+    assert _loop_lines(caplog) == [_loop_line(5, True, 6, 2, 80)]
+    assert set(_arrivals(caplog)) == {6}  # 24-step chunks cut to the given horizon
+    assert {consumed for _frame, consumed in _fires(caplog)} == {2}
+
+
+def test_a_real_loop_file_rewritten_mid_run_applies_on_that_tick(tmp_path, monkeypatch, caplog):
+    # The app's write: tmp + rename. The target watcher (the clock) does it at tick 10; the loop
+    # watcher polls after it in the same tick.
+    clock = _VirtualClock()
+    monkeypatch.setattr(script, "time", clock)
+    path = tmp_path / "inference-loop.json"
+
+    def write(document: dict) -> None:
+        tmp = tmp_path / "inference-loop.json.tmp"
+        tmp.write_text(json.dumps(document))
+        tmp.replace(path)
+
+    write({"seq": 1, "action_horizon": HORIZON, "refetch_after": 3, "speed_pct": 100})
+    loop = script.LoopFileWatcher(path)
+    settings = loop.read_initial()
+    watcher = _ScriptedWatcher(
+        {10: lambda: write({"seq": 2, "action_horizon": HORIZON, "refetch_after": 3, "speed_pct": 50})}
+    )
+    with caplog.at_level("INFO"):
+        _run_control_loop(
+            _FakeRobot(),
+            _FakeAdapter(),
+            watcher,
+            _target(1),
+            _cfg(),
+            _Connect(),
+            loop_watcher=loop,
+            settings=settings,
+        )
+    assert _loop_lines(caplog) == [_loop_line(1, True, HORIZON, 3, 100), _loop_line(2, True, HORIZON, 3, 50)]
+    assert clock.sleeps[:9] == pytest.approx([1 / 200] * 9)
+    assert clock.sleeps[9:] == pytest.approx([1 / 100] * (TICKS - 9))
+
+
 # --------------------------------------------------------------------------- main
 
 
@@ -753,3 +1026,73 @@ def test_main_starts_idle_from_an_empty_control_file_path(fake_main, tmp_path, m
     main(_cfg(control_file=str(tmp_path / "control.json")))
     assert robot.sent == [] and adapter.calls == [] and state["connect"].calls == []
     assert (robot.connected, robot.disconnected) == (1, 1)
+
+
+@pytest.mark.parametrize(
+    "overrides",
+    [
+        {"speed_pct": 49},
+        {"speed_pct": 151},
+        {"refetch_after": HORIZON},
+        {"refetch_after": 0},
+        {"blend_frames": HORIZON},
+        {"blend_frames": -1},
+    ],
+)
+def test_main_rejects_bad_loop_flags_before_touching_the_robot(fake_main, overrides):
+    robot, _adapter, _state = fake_main
+    with pytest.raises(SystemExit, match=r"Invalid loop settings \(CLI flags\)"):
+        main(_cfg(lang_instruction="task A", **overrides))
+    assert robot.connected == 0
+
+
+@pytest.mark.parametrize(
+    ("document", "match"),
+    [
+        ("{not json", "--loop_file"),
+        ({"seq": 1, "action_horizon": 8, "refetch_after": 8, "speed_pct": 100}, "--loop_file.*refetch_after"),
+        ({"seq": 1, "action_horizon": 8, "refetch_after": 3, "speed_pct": 100.0}, "--loop_file.*speed_pct"),
+        # Valid for the parser, but not above this client's --blend_frames=3.
+        (
+            {"seq": 1, "action_horizon": 3, "refetch_after": 2, "speed_pct": 100},
+            r"Invalid loop settings \(--loop_file .*blend_frames=3",
+        ),
+    ],
+)
+def test_main_rejects_an_invalid_loop_file_before_touching_the_robot(fake_main, tmp_path, document, match):
+    robot, _adapter, _state = fake_main
+    path = tmp_path / "loop.json"
+    path.write_text(document if isinstance(document, str) else json.dumps(document))
+    with pytest.raises(SystemExit, match=match):
+        main(_cfg(lang_instruction="task A", blend_frames=3, loop_file=str(path)))
+    assert robot.connected == 0
+
+
+def test_main_starts_with_the_loop_file_over_the_cli_flags(fake_main, tmp_path, monkeypatch, caplog):
+    robot, _adapter, _state = fake_main
+    monkeypatch.setattr(script, "ControlFileWatcher", lambda _path: _ScriptedWatcher(ticks=10))
+    monkeypatch.setattr(_ScriptedWatcher, "read_initial", lambda _self: None, raising=False)
+    monkeypatch.setattr(_ScriptedWatcher, "path", tmp_path / "control.json", raising=False)
+    path = tmp_path / "loop.json"
+    path.write_text(json.dumps({"seq": 7, "action_horizon": 12, "refetch_after": 4, "speed_pct": 120}))
+    with caplog.at_level("INFO"):
+        main(_cfg(control_file=str(tmp_path / "control.json"), loop_file=str(path), speed_pct=60))
+    assert _loop_lines(caplog) == [_loop_line(7, True, 12, 4, 120)]
+    assert (robot.connected, robot.disconnected) == (1, 1)
+
+
+def test_main_without_a_loop_file_starts_from_the_cli_flags(fake_main, tmp_path, monkeypatch, caplog):
+    _robot, _adapter, _state = fake_main
+    monkeypatch.setattr(script, "ControlFileWatcher", lambda _path: _ScriptedWatcher(ticks=10))
+    monkeypatch.setattr(_ScriptedWatcher, "read_initial", lambda _self: None, raising=False)
+    monkeypatch.setattr(_ScriptedWatcher, "path", tmp_path / "control.json", raising=False)
+    with caplog.at_level("INFO"):
+        main(
+            _cfg(
+                control_file=str(tmp_path / "control.json"),
+                loop_file=str(tmp_path / "missing.json"),
+                speed_pct=60,
+            )
+        )
+    assert _loop_lines(caplog) == [_loop_line(0, True, HORIZON, 3, 60)]
+    assert "missing.json does not exist yet" in caplog.text
