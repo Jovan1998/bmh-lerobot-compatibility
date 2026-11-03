@@ -1,11 +1,12 @@
-"""Joint-group layout for the BMH-101 GR00T client.
+"""Joint-group layout for the BMH-101 policy client.
 
-Derives the GR00T state/action modality groups from a robot's action-feature names
+Derives the state/action modality groups (GR00T's modality vocabulary, which every
+BMH policy server speaks — the SmolVLA runner too) from a robot's action-feature names
 with the *same rule* the platform backend applies when it builds a training manifest
 (``bmh-app/backend/src/common/utils/groot-modality.ts::buildGrootModality``). The two
 implementations must stay in sync: a checkpoint trained by the platform advertises
 the group keys produced there, and ``validate_modality()`` in
-``bmh/scripts/bmh_groot_client.py`` compares them against the keys produced here.
+``bmh/scripts/bmh_policy_client.py`` compares them against the keys produced here.
 
 Rule, applied to each joint name in column order:
 

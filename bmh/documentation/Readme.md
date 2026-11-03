@@ -93,7 +93,7 @@ Two changes cut the follower's startup from ~38 s to ~10 s on a Pi 5 (measured 2
   `warmup_s: 5` used to cost 16.5 s in sequence; with `warmup_s: 2` and parallel connect it is
   ~2.5 s. On failure the devices that did connect are released again and the first error is
   re-raised. Any script using these robots (`lerobot-record`, `lerobot-teleoperate`,
-  `bmh-groot-client`) benefits.
+  `bmh-policy-client`) benefits.
 - **`bmh-record --config <file.json>`** (`bmh/scripts/bmh_record.py`). `lerobot-record`'s
   draccus CLI parse builds an argparse tree over every registered robot / teleoperator /
   policy config and costs ~5.5 s per start on the Pi. `bmh-record` reads the same configuration
@@ -185,7 +185,7 @@ and the head) as normalized action values (`left_shoulder_pan.pos` ... `left_hea
   ```
 
 - **Teleop / recording - `lock_pose`** in the lock state file (see "Teleop group locks" above).
-- **Inference - `home`** on an idle document of the `bmh-groot-client` control file
+- **Inference - `home`** on an idle document of the `bmh-policy-client` control file
   (`~/.cache/bmh-101/inference-control.json`):
   `{"seq": 6, "idle": true, "home": {"left_shoulder_pan.pos": 0.5, ...}}`. The client stiffens the
   motors if they were relaxed, ramps from the pose it last commanded (or the present one) to
@@ -194,4 +194,4 @@ and the head) as normalized action values (`left_shoulder_pan.pos` ... `left_hea
   with `"home_reached": true` on arrival - always after the first one, even when the arms arrive
   before the inference worker got to the seq (it may still be busy with an older one). Keys the robot has no action for are dropped with a
   warning; `home` together with `"relaxed": true` is rejected; any newer document stops the ramp
-  where the robot is. Contract details: `bmh/groot_client/control.py`.
+  where the robot is. Contract details: `bmh/policy_client/control.py`.

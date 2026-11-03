@@ -1,0 +1,1284 @@
+#!/usr/bin/env python
+"""
+BMH-101 policy client: drives the robot from a BMH policy server (GR00T or
+SmolVLA runner, or anything speaking the BMH policy protocol).
+
+Runs the closed-loop control on the follower Pi:
+
+    bi_so_follower.get_observation()
+        ↓
+    BiSoBimanualAdapter.obs_to_policy_inputs(...)   # cameras + grouped joint state + language
+        ↓
+    PolicyClient.get_action(...)  →  action chunk  (ZMQ to the remote policy server)
+        ↓
+    BiSoBimanualAdapter.decode_action_chunk(...)
+        ↓
+    bi_so_follower.send_action(...)
+
+Mirrors the spirit of Isaac-GR00T `gr00t/eval/real_robot/SO100/eval_so100.py` but
+adapted for the BMH-101 bimanual robot (bi_so_follower in the BMH LeRobot fork).
+
+The joint layout is not hardcoded: the state/action groups are derived from the
+robot's `action_features` with the same rule the platform uses at training time
+(see bmh/policy_client/layout.py). For the 7-DoF + head BMH-101 that is
+`left_single_arm` / `left_gripper` / `left_head` / `right_single_arm` /
+`right_gripper` (16 dims); the head servos ride the left arm's bus and are driven
+like any other `.pos` key.
+
+The *target* — policy host / port / API token plus the language instruction — comes
+from the CLI flags or, when `--control_file` points at the controller-app's JSON
+file, from that file. The file is polled every tick so the app can switch prompt
+or policy server live, without restarting the client (see
+bmh/policy_client/control.py). A switch is validated (ping + modality check) before
+it is used; a rejected switch makes the robot hold position until a valid one
+arrives. The same happens when a request fails mid-run (e.g. the server was stopped
+in the BMH App): the client stays alive, holds position and reports the failure, so
+the app can apply another target.
+
+With `--control_file` the client may also run *idle* — no server, no prompt, robot
+holding position. It starts that way when neither the file nor `--lang_instruction`
+names a target (the controller-app's Physical Agent tab does this), and returns to
+it whenever the app writes an idle document. A *relaxed* idle document also turns
+the torque off on every motor, so the operator can move the arms by hand; the next
+document that is not relaxed turns it back on, holding wherever the arms were left.
+An idle document with a *home* pose (the robot's saved Home position) ramps the arms
+and head there over `--home_ramp_s` seconds and then holds it, reporting the arrival
+with a second `BMH_TARGET` line (`"home_reached": true`).
+
+A skill trained with *feedbacks* returns extra `feedback_<key>` action keys (e.g.
+`feedback_done`). They ride along with each chunk step, never reach the robot, and are
+turned into debounced booleans that the controller-app reads from `BMH_FEEDBACK {json}`
+log lines — one per change, tagged with the `seq` of the target whose chunk set them
+(see bmh/policy_client/feedback.py). Display only: the client does not act on them.
+
+The *loop settings* — action horizon, refetch point and playback speed (`speed_pct` of
+the recorded fps) — come from the CLI flags or, when `--loop_file` points at the
+controller-app's loop-settings file, from that file, which is polled every tick like the
+control file but carries its own `seq`: a settings change applies from the next tick
+without re-requesting a chunk. Each decided seq is answered with a `BMH_LOOP {json}`
+line; a document that breaks a rule is rejected as a whole and the old values stay.
+"""
+
+import logging
+import queue
+import threading
+import time
+from collections.abc import Callable
+from dataclasses import asdict, dataclass, replace
+from pathlib import Path
+from pprint import pformat
+from typing import Any, cast
+
+import cv2
+import draccus
+import numpy as np
+
+from bmh.policy_client import PolicyClient
+from bmh.policy_client.control import (
+    ControlFileWatcher,
+    Hold,
+    Idle,
+    InferenceTarget,
+    LoopFileWatcher,
+    LoopSettings,
+    format_feedback_status,
+    format_loop_status,
+    format_target_status,
+    ramp_pose,
+    smoothstep,
+    validate_loop_settings,
+)
+from bmh.policy_client.feedback import FeedbackTracker
+from bmh.policy_client.layout import (
+    FEEDBACK_PREFIX,
+    JointGroup,
+    group_joint_names,
+    pack_state,
+    split_feedback,
+    unpack_action,
+    unpack_feedback,
+)
+
+# Importing the robot configs ensures draccus CLI registration is populated.
+from lerobot.cameras.opencv.configuration_opencv import OpenCVCameraConfig  # noqa: F401
+from lerobot.robots import (  # noqa: F401
+    Robot,
+    RobotConfig,
+    bi_so_follower,
+    make_robot_from_config,
+    so_follower,
+)
+from lerobot.utils.utils import init_logging
+
+logger = logging.getLogger(__name__)
+
+
+# Maps the policy server's video modality key (as trained — bare `front` / `left_wrist` /
+# `right_wrist`) to the corresponding key in `bi_so_follower.get_observation()`,
+# which prefixes each per-arm camera with `left_` / `right_`. That's why the
+# `left_left_wrist` / `right_right_wrist` source names look doubled — that's
+# the literal observation key, not a typo.
+BIMANUAL_CAMERA_KEYS = {
+    "front": "left_front",
+    "left_wrist": "left_left_wrist",
+    "right_wrist": "right_right_wrist",
+}
+
+
+def _blend_actions(old: dict[str, float], new: dict[str, float], alpha: float) -> dict[str, float]:
+    """Convex blend of two joint-command dicts: ``(1 - alpha) * old + alpha * new``.
+
+    Used to crossfade the seam between a retiring action chunk and a freshly
+    arrived one. ``alpha`` near 0 keeps the old command, near 1 takes the new.
+    Iterates over `new`'s keys; both dicts carry the same SO-joint key set.
+
+    ``feedback_*`` values are taken from `new` as they are: a crossfade would smear
+    the old skill's 1.0 into the new skill's 0. They are also the only keys the two
+    steps may not share (another skill, other feedbacks), so `old` is never asked
+    for one.
+    """
+    return {
+        k: v if k.startswith(FEEDBACK_PREFIX) else (1.0 - alpha) * old[k] + alpha * v for k, v in new.items()
+    }
+
+
+def recursive_add_extra_dim(obs: dict) -> dict:
+    """Recursively prepend a size-1 leading dim. Called twice to inject (B=1, T=1)."""
+    for key, val in obs.items():
+        if isinstance(val, np.ndarray):
+            obs[key] = val[np.newaxis, ...]
+        elif isinstance(val, dict):
+            obs[key] = recursive_add_extra_dim(val)
+        else:
+            obs[key] = [val]
+    return obs
+
+
+class BiSoBimanualAdapter:
+    """
+    Bimanual sibling of eval_so100.py's `So100Adapter`. Packs raw `bi_so_follower`
+    observations into the BMH policy protocol's input format and decodes returned action chunks
+    back into a `{left_*, right_*}` `.pos` dict that `bi_so_follower.send_action()`
+    accepts (one key per joint in `joint_names`, head servos included).
+
+    The state/action modality groups are derived from `joint_names` (the robot's
+    `action_features` keys, in order) by `bmh.policy_client.layout.group_joint_names`
+    — the same rule the platform backend uses to build the training modality, so a
+    checkpoint trained on a dataset recorded with this robot advertises exactly
+    `self.state_keys`. For the 7-DoF + head BMH-101: `left_single_arm` (6,) /
+    `left_gripper` (1,) / `left_head` (2,) / `right_single_arm` (6,) /
+    `right_gripper` (1,). `validate_modality()` confirms the server's layout at
+    startup against `PolicyClient.get_modality_config()` and raises a clear error
+    if the trained model uses a different one.
+
+    `policy` may be attached after construction (and swapped later by the
+    inference worker when the app switches policy servers).
+    """
+
+    def __init__(self, policy_client: PolicyClient | None, jpeg_quality: int, joint_names: list[str]):
+        self.policy = policy_client
+        self.jpeg_quality = jpeg_quality
+        self.groups: list[JointGroup] = group_joint_names(joint_names)
+        self.state_keys: tuple[str, ...] = tuple(g.key for g in self.groups)
+        logger.info(
+            "Joint layout: %d joints in %d groups: %s",
+            len(joint_names),
+            len(self.groups),
+            {g.key: len(g.names) for g in self.groups},
+        )
+
+    def obs_to_policy_inputs(self, obs: dict[str, Any]) -> dict:
+        model_obs: dict[str, Any] = {}
+
+        model_obs["video"] = {
+            server_key: obs[obs_key] for server_key, obs_key in BIMANUAL_CAMERA_KEYS.items()
+        }
+
+        model_obs["state"] = pack_state(obs, self.groups)
+
+        model_obs["language"] = {"annotation.human.task_description": obs["lang"]}
+
+        model_obs = recursive_add_extra_dim(model_obs)
+        model_obs = recursive_add_extra_dim(model_obs)
+
+        # JPEG-encode each camera frame in place. The runner-side proxy decodes
+        # bytes back to (1, 1, H, W, 3) uint8 RGB; if it ever receives a raw
+        # array instead it passes it through, so this is a safe one-sided rollout.
+        for cam_key, arr in model_obs["video"].items():
+            frame = arr[0, 0]  # (H, W, 3) RGB uint8
+            bgr = cv2.cvtColor(frame, cv2.COLOR_RGB2BGR)
+            ok, buf = cv2.imencode(".jpg", bgr, [cv2.IMWRITE_JPEG_QUALITY, self.jpeg_quality])
+            if not ok:
+                raise RuntimeError(f"JPEG encode failed for camera {cam_key!r}")
+            model_obs["video"][cam_key] = buf.tobytes()
+        total = sum(len(v) for v in model_obs["video"].values())
+        logger.info(
+            "video sent: %d cams, %.1f KiB total (Q=%d)",
+            len(model_obs["video"]),
+            total / 1024,
+            self.jpeg_quality,
+        )
+        return model_obs
+
+    def decode_action_chunk(self, chunk: dict, t: int) -> dict[str, float]:
+        # One `<side>_<motor>.pos` key per joint, head included. bi_so_follower
+        # routes them by prefix and so_follower writes every `.pos` key to its
+        # bus, so the head is driven without further plumbing.
+        return unpack_action(chunk, self.groups, t)
+
+    def get_action(self, obs: dict) -> list[dict[str, float]]:
+        model_input = self.obs_to_policy_inputs(obs)
+        tic = time.perf_counter()
+        action_chunk, _info = self.policy.get_action(model_input)
+        rtt_ms = (time.perf_counter() - tic) * 1000.0
+        logger.info("policy round-trip: %.1f ms", rtt_ms)
+
+        # Horizon of a joint group — the chunk may carry other keys (`feedback_*`).
+        horizon = action_chunk[self.groups[0].key].shape[1]
+        # Each step = joint commands ∪ prefixed feedback values, so the feedback stays
+        # index-aligned with its action through truncation, the time-align drop and
+        # the swap. `split_feedback` takes them apart again before anything is sent.
+        return [
+            {**self.decode_action_chunk(action_chunk, t), **unpack_feedback(action_chunk, t)}
+            for t in range(horizon)
+        ]
+
+    def validate_modality(self, modality_cfg: dict) -> None:
+        """Compare the server's advertised modality keys against this robot's layout.
+
+        State keys are compared order-sensitively against `self.state_keys` (derived
+        from the robot's joint names); video keys are compared as a set against
+        `BIMANUAL_CAMERA_KEYS`. Raises with a clear diff if the trained model uses a
+        different layout — this catches the common "model trained on a different
+        robot layout" mismatch before we ship garbage action commands to the motors.
+        """
+        if not modality_cfg:
+            logger.warning("Server returned an empty modality config; skipping modality validation.")
+            return
+
+        state_cfg = modality_cfg.get("state")
+        if state_cfg is None:
+            logger.warning(
+                "Server modality config has no 'state' entry; skipping modality validation. Server keys: %s",
+                list(modality_cfg.keys()),
+            )
+            return
+
+        server_state_keys = tuple(_modality_keys(state_cfg))
+        if server_state_keys != self.state_keys:
+            raise SystemExit(
+                "Policy server state modality keys do not match this robot's joint layout.\n"
+                f"  This robot expects: {self.state_keys}\n"
+                f"  Server reports:     {server_state_keys}\n"
+                "Retrain the model on data recorded with this robot layout (e.g. the "
+                "7-DoF + head BMH-101 needs a `left_head` group), or run the client on "
+                "the robot the model was trained for."
+            )
+
+        video_cfg = modality_cfg.get("video")
+        if video_cfg is not None:
+            server_video_keys = set(_modality_keys(video_cfg))
+            expected_video_keys = set(BIMANUAL_CAMERA_KEYS)
+            if server_video_keys != expected_video_keys:
+                raise SystemExit(
+                    "Policy server video modality keys do not match this client's cameras.\n"
+                    f"  This client expects: {sorted(expected_video_keys)}\n"
+                    f"  Server reports:      {sorted(server_video_keys)}\n"
+                    "Retrain the model with these camera keys, or extend "
+                    "`BIMANUAL_CAMERA_KEYS` to map them."
+                )
+        logger.info(
+            "Modality check passed (state keys: %s, video keys: %s).",
+            self.state_keys,
+            tuple(BIMANUAL_CAMERA_KEYS),
+        )
+
+
+def _modality_keys(section: Any) -> list[str]:
+    """`modality_keys` of one server modality section (ModalityConfig object or dict)."""
+    if isinstance(section, dict):
+        keys = section.get("modality_keys")
+    else:
+        keys = getattr(section, "modality_keys", None)
+    return [str(k) for k in (keys or [])]
+
+
+class PolicyConnectError(Exception):
+    """A target's policy server cannot be reached, rejects the token, or fails the modality check."""
+
+
+def _connect_policy(
+    target: InferenceTarget,
+    adapter: BiSoBimanualAdapter,
+    probe_timeout_ms: int,
+    timeout_ms: int,
+) -> PolicyClient:
+    """Open a validated `PolicyClient` for `target`, or raise `PolicyConnectError`.
+
+    Ping and modality fetch run with the short `probe_timeout_ms` so an unreachable
+    host is reported within seconds; the returned client is then switched to the
+    regular request `timeout_ms`. A failed probe closes its client before raising,
+    so nothing leaks. Used both at startup and by the worker for live switches.
+    """
+    client = PolicyClient(
+        host=target.policy_host,
+        port=target.policy_port,
+        timeout_ms=probe_timeout_ms,
+        api_token=target.api_token or None,
+    )
+    where = f"{target.policy_host}:{target.policy_port}"
+    try:
+        # A wrong token makes the proxy answer {"error": ...}, which `ping()` re-raises
+        # as RuntimeError instead of returning False — treat both as unreachable.
+        try:
+            reachable = client.ping()
+        except Exception as e:
+            raise PolicyConnectError(f"Cannot reach policy server at {where}: {e}") from e
+        if not reachable:
+            raise PolicyConnectError(f"Cannot reach policy server at {where}")
+        logger.info("Connected to policy server at %s", where)
+
+        try:
+            modality_cfg = client.get_modality_config()
+        except Exception as e:
+            # get_modality_config is best-effort — log and continue. If keys are wrong,
+            # the first send_action call will fail loudly anyway.
+            logger.warning("Could not fetch modality config from server: %s", e)
+        else:
+            try:
+                adapter.validate_modality(modality_cfg)
+            except SystemExit as e:
+                # validate_modality raises SystemExit for a clean CLI error. Inside the
+                # worker thread that would end the thread silently, so convert it.
+                raise PolicyConnectError(str(e)) from None
+    except PolicyConnectError:
+        client.close()
+        raise
+    client.set_timeout_ms(timeout_ms)
+    return client
+
+
+def _inference_worker(
+    adapter: BiSoBimanualAdapter,
+    obs_queue: "queue.Queue[tuple[InferenceTarget, dict[str, Any]] | None]",
+    chunk_queue: "queue.Queue[list[dict[str, float]] | Hold | Idle | None]",
+    stop_event: threading.Event,
+    active: InferenceTarget,
+    connect: Callable[[InferenceTarget], PolicyClient],
+) -> None:
+    """Owns the PolicyClient (ZMQ REQ is single-thread) and applies target switches.
+
+    Pulls one `(target, observation)` pair at a time from `obs_queue`. `target` is
+    the newest target the main loop knows; `active` is the one the current client
+    was validated for — or an idle target, in which case `adapter.policy` is `None`.
+    A new `target.seq` is decided exactly once — a rejected seq is never re-probed
+    on later requests carrying the same seq:
+
+    - idle target → the client is closed and detached, the reply is an `Idle`;
+    - same endpoint (prompt-only change) → adopted as is;
+    - other endpoint, no client (coming from idle) or a client whose last request
+      failed → `connect()` it (ping + modality check). On success the old client is
+      closed and replaced; on `PolicyConnectError` the old client stays but is
+      *not* used — the reply is a `Hold` and the robot holds position until a new
+      seq arrives.
+
+    The instruction sent with each request is always `active.lang_instruction`, so
+    a rejected target's prompt never reaches any server. Every decision is logged
+    as a `BMH_TARGET {json}` line for the controller-app.
+
+    A failing request (server stopped, network gone) does not end the client: the
+    active seq is re-reported as `accepted: false`, the reply is a `Hold`, and the
+    next seq re-probes its server even when the endpoint did not change.
+
+    Chunks are replied whole: the main loop cuts them to the live `action_horizon` when
+    they arrive, so the loop settings are only ever touched by one thread.
+
+    A `None` item is the shutdown sentinel. A `None` *reply* means the worker itself
+    crashed; the main thread aborts on it.
+    """
+    try:
+        _serve_requests(adapter, obs_queue, chunk_queue, stop_event, active, connect)
+    except Exception:
+        logger.exception("inference worker crashed")
+        chunk_queue.put(None)
+
+
+def _serve_requests(
+    adapter: BiSoBimanualAdapter,
+    obs_queue: "queue.Queue[tuple[InferenceTarget, dict[str, Any]] | None]",
+    chunk_queue: "queue.Queue[list[dict[str, float]] | Hold | Idle | None]",
+    stop_event: threading.Event,
+    active: InferenceTarget,
+    connect: Callable[[InferenceTarget], PolicyClient],
+) -> None:
+    """Request loop of `_inference_worker` (see there for the decision rules)."""
+    decided_seq = active.seq
+    rejected: str | None = None
+    # Set after a failed request: the client may be talking to a dead server, so the
+    # next target is probed even if it names the same endpoint.
+    needs_probe = False
+    while not stop_event.is_set():
+        try:
+            item = obs_queue.get(timeout=0.1)
+        except queue.Empty:
+            continue
+        if item is None:
+            break
+        target, obs = item
+
+        if target.seq != decided_seq:
+            decided_seq = target.seq
+            rejected = None
+            if target.idle:
+                old_client = adapter.policy
+                adapter.policy = None
+                if old_client is not None:
+                    old_client.close()
+                active = target
+                needs_probe = False
+            elif adapter.policy is None or needs_probe or target.endpoint != active.endpoint:
+                try:
+                    new_client = connect(target)
+                except PolicyConnectError as e:
+                    rejected = str(e)
+                    logger.error(
+                        "target #%d rejected (%s:%d): %s",
+                        target.seq,
+                        target.policy_host,
+                        target.policy_port,
+                        e,
+                    )
+                except Exception as e:
+                    # Unexpected — still hold rather than let the thread die silently.
+                    rejected = f"{type(e).__name__}: {e}"
+                    logger.exception("target #%d: unexpected error while connecting", target.seq)
+                else:
+                    old_client = adapter.policy
+                    adapter.policy = new_client
+                    if old_client is not None:
+                        old_client.close()
+                    active = target
+                    needs_probe = False
+            else:
+                active = target
+            if rejected is None and target.idle:
+                logger.info("target #%d applied: idle%s", target.seq, _idle_suffix(target))
+            elif rejected is None:
+                logger.info(
+                    'target #%d applied: %s:%d "%s"',
+                    target.seq,
+                    target.policy_host,
+                    target.policy_port,
+                    target.lang_instruction,
+                )
+            logger.info(format_target_status(target, rejected is None, rejected))
+
+        if rejected is not None:
+            chunk_queue.put(Hold(seq=target.seq, error=rejected))
+            continue
+        if active.idle:
+            chunk_queue.put(Idle(seq=active.seq))
+            continue
+
+        obs["lang"] = active.lang_instruction
+        try:
+            chunk = adapter.get_action(obs)
+        except Exception as e:
+            # Typically the server was stopped or became unreachable. Hold instead of
+            # exiting, and tell the app under the *same* seq so that re-applying the
+            # target is a new request.
+            logger.exception("inference worker: get_action failed")
+            rejected = f"policy request failed: {type(e).__name__}: {e}"
+            needs_probe = True
+            logger.info(format_target_status(active, False, rejected))
+            chunk_queue.put(Hold(seq=active.seq, error=rejected))
+        else:
+            chunk_queue.put(chunk)
+
+
+@dataclass
+class BmhInferenceConfig:
+    """CLI configuration for `bmh-policy-client` (also installed as `bmh-groot-client`)."""
+
+    robot: RobotConfig
+    policy_host: str = "localhost"
+    policy_port: int = 5555
+    lang_instruction: str = ""
+    # Actions kept of each arriving chunk; the rest is cut off. `--loop_file` overrides it.
+    action_horizon: int = 8
+    # Recorded control rate. Actions are played at `fps * speed_pct / 100` ticks per second.
+    fps: int = 30
+    timeout_ms: int = 15000
+    jpeg_quality: int = 95
+    api_token: str = ""
+    # Path of the controller-app's JSON control file (see bmh/policy_client/control.py).
+    # When set, the file is read at startup — overriding --policy_host / --policy_port /
+    # --lang_instruction / --api_token — and polled every tick so the app can switch
+    # prompt or policy server live, without restarting the client.
+    control_file: str | None = None
+    # Socket timeout for the ping + modality fetch that validate a (new) policy
+    # server, so an unreachable host is reported within seconds instead of
+    # `timeout_ms`. Regular requests use `timeout_ms`.
+    probe_timeout_ms: int = 5000
+    # Fire the next inference request once this many actions have been consumed
+    # from the freshly swapped-in chunk. Kept small so we re-sync to the latest
+    # observation often. The in-flight guard means the effective request cadence
+    # is max(refetch_after, server-latency-in-frames). Must be in
+    # [1, action_horizon). A chunk with fewer actions left than this fires at its end.
+    # `--loop_file` overrides it.
+    refetch_after: int = 3
+    # Playback speed in percent of `fps` (100 = recorded speed), in [50, 150]. One
+    # action is still played per tick; only the tick period changes. `--loop_file`
+    # overrides it.
+    speed_pct: int = 100
+    # Path of the controller-app's loop-settings file (see bmh/policy_client/control.py).
+    # When set, the file is read at startup — overriding --action_horizon /
+    # --refetch_after / --speed_pct — and polled every tick so the app can change them
+    # live. A missing file means "use the CLI flags".
+    loop_file: str | None = None
+    # Number of leading actions of a freshly arrived chunk to *crossfade* with the
+    # tail of the old chunk instead of switching to them outright. At a chunk swap
+    # the new chunk's first kept action and the old chunk's next action describe the
+    # same instant in time, but they come from two different policy passes, so they
+    # rarely agree exactly — sending the new one cold produces a one-frame jump (the
+    # seam jitter). Blending the two over the first `blend_frames` actions with a
+    # linear ramp (mostly-old → mostly-new) turns that step into a short wash-in.
+    # If the old chunk has fewer than `blend_frames` actions left (or the new chunk
+    # is shorter), the blend is clamped to whatever overlap exists. Set to 0 to
+    # disable blending and switch hard. Must be in [0, action_horizon).
+    blend_frames: int = 3
+    # Policy feedbacks (`feedback_<key>` action channels, 0..1 — see
+    # bmh/policy_client/feedback.py). A flag switches on once its value stayed at or
+    # above `feedback_on_threshold` for `feedback_debounce_ticks` consecutive control
+    # ticks, and off again once it stayed at or below `feedback_off_threshold` for as
+    # many. The gap between the thresholds keeps a value hovering around one of them
+    # from flapping the flag. Need off <= on and at least 1 tick. Counted in ticks, so
+    # its wall-clock length follows `speed_pct` (5 ticks: 333 ms at 50 %, 111 ms at 150 %).
+    feedback_on_threshold: float = 0.6
+    feedback_off_threshold: float = 0.4
+    feedback_debounce_ticks: int = 5
+    # Seconds the robot takes to ramp from where it is to the Home position of an idle
+    # document's `home` pose (smoothstep, like `bmh-center-arm`). Must be > 0.
+    home_ramp_s: float = 2.5
+
+
+def _initial_target(
+    watcher: ControlFileWatcher | None,
+    policy_host: str,
+    policy_port: int,
+    lang_instruction: str,
+    api_token: str,
+) -> InferenceTarget:
+    """Pick the target the client starts with.
+
+    The controller-app's control file wins when it exists (the app writes it before
+    spawning us); else the CLI flags, if they carry an instruction; else the client
+    starts idle — but only with a control file, because nothing could ever move an
+    idle client without one.
+
+    Raises:
+        SystemExit: On an invalid control file, or when there is neither an
+            instruction nor a control file.
+    """
+    if watcher is not None:
+        try:
+            target = watcher.read_initial()
+        except ValueError as e:
+            raise SystemExit(f"--control_file {watcher.path}: {e}") from e
+        if target is not None:
+            logger.info("Initial target #%d read from %s", target.seq, watcher.path)
+            return target
+        logger.warning("Control file %s does not exist yet; starting from CLI flags.", watcher.path)
+    if lang_instruction.strip():
+        return InferenceTarget(
+            seq=0,
+            policy_host=policy_host,
+            policy_port=policy_port,
+            lang_instruction=lang_instruction.strip(),
+            api_token=api_token,
+        )
+    if watcher is not None:
+        return InferenceTarget.make_idle(0)
+    raise SystemExit("--lang_instruction must not be empty (starting idle needs --control_file).")
+
+
+def _cli_loop_settings(cfg: BmhInferenceConfig) -> LoopSettings:
+    """The loop settings the CLI flags describe, as seq 0 (not validated)."""
+    return LoopSettings(
+        seq=0, action_horizon=cfg.action_horizon, refetch_after=cfg.refetch_after, speed_pct=cfg.speed_pct
+    )
+
+
+def _initial_loop_settings(watcher: LoopFileWatcher | None, cfg: BmhInferenceConfig) -> LoopSettings:
+    """Pick the loop settings the client starts with, and check them.
+
+    The controller-app's loop file wins when it exists (the app writes it before
+    spawning us); else the CLI flags, as seq 0. Either way the settings pass
+    `validate_loop_settings` against `--blend_frames` — the same rules as a live change.
+
+    Raises:
+        SystemExit: On an invalid loop file (the app is its only writer, so that is a
+            contract bug), or on invalid CLI values.
+    """
+    settings: LoopSettings | None = None
+    source = "CLI flags"
+    if watcher is not None:
+        try:
+            settings = watcher.read_initial()
+        except ValueError as e:
+            raise SystemExit(f"--loop_file {watcher.path}: {e}") from e
+        if settings is None:
+            logger.warning("Loop file %s does not exist yet; starting from CLI flags.", watcher.path)
+        else:
+            source = f"--loop_file {watcher.path}"
+            logger.info(
+                "Initial loop settings #%d read from %s: horizon=%d refetch_after=%d speed=%d%%",
+                settings.seq,
+                watcher.path,
+                settings.action_horizon,
+                settings.refetch_after,
+                settings.speed_pct,
+            )
+    if settings is None:
+        settings = _cli_loop_settings(cfg)
+    reason = validate_loop_settings(settings, cfg.blend_frames)
+    if reason is not None:
+        raise SystemExit(f"Invalid loop settings ({source}): {reason}")
+    return settings
+
+
+def _clear_feedback(tracker: FeedbackTracker, seq: int) -> None:
+    """Forget the policy's feedback flags; tell the app only if it had been shown any.
+
+    Args:
+        tracker: The control loop's tracker.
+        seq: Target the flags were reported under (the loop's `chunk_seq`), so the empty
+            snapshot replaces exactly the lines it clears.
+    """
+    if tracker.reset():
+        logger.info(format_feedback_status(seq, {}, {}))
+
+
+# Retries per torque / position transfer when relaxing or stiffening the arms —
+# as many as `bus.disconnect` allows its torque-off.
+_TORQUE_RETRIES = 5
+
+
+def _arm_buses(robot: Robot) -> list[tuple[str, Any]]:
+    """`(action-key prefix, motor bus)` per arm of a `bi_so_follower` (the head rides the left bus)."""
+    bi = cast(bi_so_follower.BiSOFollower, robot)
+    return [("left_", bi.left_arm.bus), ("right_", bi.right_arm.bus)]
+
+
+def _as_action(prefix: str, positions: dict[str, Any]) -> dict[str, float]:
+    """One bus's `{motor: position}` as action keys (`<prefix><motor>.pos`)."""
+    return {f"{prefix}{motor}.pos": float(value) for motor, value in positions.items()}
+
+
+def _relax_motors(robot: Robot) -> None:
+    """Torque off on every motor of both arms (the head rides the left bus): movable by hand."""
+    for _, bus in _arm_buses(robot):
+        bus.disable_torque(num_retry=_TORQUE_RETRIES)
+
+
+def _present_pose(robot: Robot) -> dict[str, float]:
+    """Where the arms are now, as an action (`left_` / `right_` + `<motor>.pos`)."""
+    pose: dict[str, float] = {}
+    for prefix, bus in _arm_buses(robot):
+        pose.update(_as_action(prefix, bus.sync_read("Present_Position", num_retry=_TORQUE_RETRIES)))
+    return pose
+
+
+def _stiffen_motors(robot: Robot) -> dict[str, float]:
+    """Torque back on, holding wherever the arms are now.
+
+    Each bus's goal is pinned to its present position first: the servos keep the
+    last goal they were sent, so enabling torque straight away would snap the arms
+    back to where they were before they were relaxed.
+
+    Returns:
+        That pose as an action (`left_` / `right_` + `<motor>.pos`, like
+        `BiSOFollower.send_action` takes it), for the loop to hold.
+    """
+    pose: dict[str, float] = {}
+    for prefix, bus in _arm_buses(robot):
+        present = bus.sync_read("Present_Position", num_retry=_TORQUE_RETRIES)
+        bus.sync_write("Goal_Position", present, num_retry=_TORQUE_RETRIES)
+        bus.enable_torque(num_retry=_TORQUE_RETRIES)
+        pose.update(_as_action(prefix, present))
+    return pose
+
+
+def _idle_suffix(target: InferenceTarget) -> str:
+    """Log suffix naming what an idle target does beyond holding position."""
+    if target.relaxed:
+        return " (motors relaxed)"
+    if target.home:
+        return " (Home position)"
+    return ""
+
+
+def _warn_short_chunk(length: int, settings: LoopSettings) -> None:
+    """Log that the policy's chunks are shorter than the horizon (once per settings seq)."""
+    logger.warning(
+        "policy returns %d-step chunks, shorter than action_horizon=%d%s",
+        length,
+        settings.action_horizon,
+        " — the loop refetches at chunk end" if length <= settings.refetch_after else "",
+    )
+
+
+@dataclass
+class _HomeRamp:
+    """A running move to the Home position: `start` → `target` over `duration` s from `t0`.
+
+    `t0` is the first ramp tick (`None` until then), so that tick sends exactly `start`.
+    """
+
+    start: dict[str, float]
+    target: dict[str, float]
+    duration: float
+    t0: float | None = None
+
+
+def _begin_home(
+    robot: Robot,
+    target: InferenceTarget,
+    last_action: dict[str, float] | None,
+    duration: float,
+) -> _HomeRamp | None:
+    """Start ramping to a Home target's pose from the last commanded pose (or the present one).
+
+    Pose keys the robot has no action for are logged and dropped; `None` when none is left.
+    """
+    pose = target.home_pose
+    unknown = sorted(key for key in pose if key not in robot.action_features)
+    if unknown:
+        logger.warning(
+            "target #%d: ignoring Home position keys the robot does not have: %s",
+            target.seq,
+            ", ".join(unknown),
+        )
+    goal = {key: value for key, value in pose.items() if key in robot.action_features}
+    if not goal:
+        logger.warning("target #%d: the Home position names no joint of this robot — holding", target.seq)
+        return None
+    start = dict(last_action) if last_action is not None else _present_pose(robot)
+    return _HomeRamp(start=start, target=goal, duration=duration)
+
+
+def _run_control_loop(
+    robot: Robot,
+    adapter: BiSoBimanualAdapter,
+    watcher: ControlFileWatcher | None,
+    target: InferenceTarget,
+    cfg: BmhInferenceConfig,
+    connect: Callable[[InferenceTarget], PolicyClient],
+    *,
+    loop_watcher: LoopFileWatcher | None = None,
+    settings: LoopSettings | None = None,
+) -> None:
+    """Closed control loop, from the initial connect to the worker / client teardown.
+
+    The caller owns `robot` and must disconnect it in a `finally`; everything here —
+    the startup connect, the bootstrap inference, the loop — may raise.
+
+    Args:
+        robot: Connected robot — a `bi_so_follower`: relaxing reaches into its arms' buses.
+        adapter: Adapter without a policy client; one is attached here.
+        watcher: Control-file watcher, `None` for a CLI-only run.
+        target: Startup target (see `_initial_target`). Idle skips the connect and
+            the bootstrap inference: the robot holds position (or goes limp, when
+            relaxed), and nothing is requested until the control file names a real
+            target.
+        cfg: CLI configuration.
+        connect: Opens a validated client for a target, or raises `PolicyConnectError`.
+        loop_watcher: Loop-settings file watcher, `None` for fixed settings. Polled
+            once per tick, after the control file.
+        settings: Startup loop settings, already validated (see
+            `_initial_loop_settings`); `None` = built from `cfg` as seq 0.
+
+    Raises:
+        SystemExit: If the startup target's server is rejected.
+        RuntimeError: If the inference worker crashed.
+    """
+    if settings is None:
+        settings = _cli_loop_settings(cfg)
+    # Settings seq the "chunks shorter than action_horizon" warning was logged for.
+    short_chunk_warned_seq: int | None = None
+    # When the tick-overrun warning was last logged (rate-limited like `late chunk`).
+    overrun_logged_at: float | None = None
+    current_chunk: list[dict[str, float]] = []
+    idx = 0
+    inflight = False
+    last_action: dict[str, float] | None = None
+    chunk_exhausted_at: float | None = None
+    # When the `late chunk` warning was last logged for the current gap (it repeats
+    # every tick otherwise).
+    late_logged_at: float | None = None
+    # Monotonic per-tick frame counter (one tick == one action == one control period).
+    # Used to measure how many frames a request spent in flight so we can drop
+    # the chunk's stale leading actions on arrival.
+    frame_counter = 0
+    fire_frame = 0
+    # Actions left in the old chunk when the in-flight request fired. The robot
+    # can advance through at most this many actions before it runs dry and holds
+    # position, so it bounds how many leading actions we may skip on arrival.
+    remaining_at_fire = 0
+    # Actions consumed from the current chunk since it was swapped in; drives the
+    # `refetch_after` re-fire trigger below.
+    consumed_since_swap = 0
+    # Set when the control file delivered a new target: fire the next request as
+    # soon as nothing is in flight instead of waiting for `refetch_after`, so a
+    # prompt / server switch takes effect after a single round-trip.
+    fire_now = False
+    # True while idle, and after the worker rejected a target or lost its server:
+    # the robot holds its last pose and nothing is fired until a new seq arrives.
+    holding = target.idle
+    # True while the motors' torque is off (a relaxed idle target): nothing is sent
+    # to the robot, not even the held pose, until a target that is not relaxed.
+    relaxed = False
+    # Set while an idle target with a Home pose ramps the robot there; cleared on arrival
+    # (the hold branch then keeps sending the pose) or by any newer target.
+    home_ramp: _HomeRamp | None = None
+    # The arrival line (`home_reached`) goes out only after the target's accepted line:
+    # `accepted_seq` is the seq whose accepted line is out (logged at startup, or by the
+    # worker before it answers an idle target with `Idle`), `reached_seq` the seq that
+    # arrived but is not reported yet. A worker still busy with an older seq would
+    # otherwise log that seq's status between the two, and the app reads the arrival as
+    # superseded.
+    accepted_seq = -1
+    reached_seq: int | None = None
+    # Chunk ownership, for the policy's feedback flags. `fire_seq` is the target the
+    # in-flight request was fired under, `chunk_seq` the one `current_chunk` was
+    # requested under (-1: no chunk yet; real seqs are >= 0). At most one request is
+    # in flight and the worker answers a request with actions only when it accepted
+    # that very target, so this is exact: the tracker is fed only while
+    # `chunk_seq == target.seq` and reset whenever `chunk_seq` changes — a chunk
+    # requested under the old target never sets flags under the new seq.
+    fire_seq = -1
+    chunk_seq = -1
+    tracker = FeedbackTracker(
+        cfg.feedback_on_threshold, cfg.feedback_off_threshold, cfg.feedback_debounce_ticks
+    )
+
+    obs_queue: queue.Queue[tuple[InferenceTarget, dict[str, Any]] | None] = queue.Queue(maxsize=1)
+    chunk_queue: queue.Queue[list[dict[str, float]] | Hold | Idle | None] = queue.Queue(maxsize=1)
+    stop_event = threading.Event()
+    worker: threading.Thread | None = None
+
+    try:
+        if target.relaxed:
+            # Relax was pressed while the client was still connecting.
+            _relax_motors(robot)
+            relaxed = True
+            logger.info("No target yet — idle, motors relaxed (torque off).")
+        elif target.home:
+            # Home was pressed while the client was still connecting.
+            home_ramp = _begin_home(robot, target, None, cfg.home_ramp_s)
+            logger.info("No target yet — idle, moving to the Home position.")
+        elif target.idle:
+            logger.info("No target yet — idle, holding position until the controller-app applies one.")
+        else:
+            try:
+                adapter.policy = connect(target)
+            except PolicyConnectError as e:
+                raise SystemExit(str(e)) from e
+        logger.info(format_target_status(target, True, None))
+        accepted_seq = target.seq
+        # The effective loop settings, also when there is no loop file (seq 0, CLI values).
+        logger.info(format_loop_status(settings, True, None))
+
+        if not target.idle:
+            logger.info('Running inference with instruction: "%s"', target.lang_instruction)
+            # Bootstrap: one synchronous inference on the main thread to seed the
+            # first chunk. After this, the worker thread is the sole owner of the
+            # PolicyClient.
+            bootstrap_obs = robot.get_observation()
+            bootstrap_obs["lang"] = target.lang_instruction
+            current_chunk = adapter.get_action(bootstrap_obs)
+            if len(current_chunk) < settings.action_horizon:
+                _warn_short_chunk(len(current_chunk), settings)
+                short_chunk_warned_seq = settings.seq
+            current_chunk = current_chunk[: settings.action_horizon]
+            chunk_seq = target.seq
+
+        worker = threading.Thread(
+            target=_inference_worker,
+            args=(adapter, obs_queue, chunk_queue, stop_event, target, connect),
+            name="bmh-inference-worker",
+            daemon=True,
+        )
+        worker.start()
+
+        while True:
+            tick_start = time.perf_counter()
+            frame_counter += 1
+
+            # 0. Pick up a new target from the controller-app (one os.stat per
+            #    tick; the file is only parsed when it changed). It travels with
+            #    the next request; the worker validates and applies it.
+            if watcher is not None:
+                new_target = watcher.poll()
+                if new_target is not None and new_target.seq != target.seq:
+                    target = new_target
+                    fire_now = True
+                    home_ramp = None
+                    reached_seq = None
+                    if target.idle:
+                        # Stop at once instead of playing out the rest of the chunk;
+                        # the worker is told below so it can drop its client.
+                        current_chunk = []
+                        idx = 0
+                        consumed_since_swap = 0
+                        chunk_exhausted_at = None
+                        holding = True
+                        _clear_feedback(tracker, chunk_seq)
+                        if target.relaxed:
+                            logger.info(
+                                "target #%d requested: idle — motors relaxed (torque off)", target.seq
+                            )
+                        elif target.home:
+                            logger.info(
+                                "target #%d requested: idle — moving to the Home position", target.seq
+                            )
+                        else:
+                            logger.info("target #%d requested: idle — holding position", target.seq)
+                    else:
+                        logger.info(
+                            'target #%d requested: %s:%d "%s"',
+                            target.seq,
+                            target.policy_host,
+                            target.policy_port,
+                            target.lang_instruction,
+                        )
+                    # Torque follows the target at once — before step 3 fires, so a new
+                    # target's first observation already sees the re-stiffened arms.
+                    if target.relaxed and not relaxed:
+                        _relax_motors(robot)
+                        relaxed = True
+                    elif relaxed and not target.relaxed:
+                        # Hold (plain idle) or a new task: stiffen where the operator
+                        # left the arms, and hold that pose until a chunk arrives.
+                        last_action = _stiffen_motors(robot)
+                        relaxed = False
+                        logger.info("target #%d: motors stiffened, holding the current pose", target.seq)
+                    # Home: ramp from the pose just commanded (or stiffened at) to the saved one.
+                    if target.home:
+                        home_ramp = _begin_home(robot, target, last_action, cfg.home_ramp_s)
+
+            # 0b. Pick up new loop settings (after the target: that order is defined).
+            #     They apply from this tick on: the period at step 4, the refetch point
+            #     at step 3, the horizon when the next chunk arrives at step 1. Nothing is
+            #     re-requested. A document breaking a rule is rejected whole; the line
+            #     carries its seq with the values that stay in effect.
+            if loop_watcher is not None:
+                new_settings = loop_watcher.poll()
+                if new_settings is not None and new_settings.seq != settings.seq:
+                    reason = validate_loop_settings(new_settings, cfg.blend_frames)
+                    if reason is not None:
+                        logger.error("loop settings #%d rejected: %s", new_settings.seq, reason)
+                        logger.info(
+                            format_loop_status(replace(settings, seq=new_settings.seq), False, reason)
+                        )
+                    else:
+                        settings = new_settings
+                        logger.info(
+                            "loop settings #%d applied: horizon=%d refetch_after=%d speed=%d%%",
+                            settings.seq,
+                            settings.action_horizon,
+                            settings.refetch_after,
+                            settings.speed_pct,
+                        )
+                        logger.info(format_loop_status(settings, True, None))
+
+            # 1. Try to swap in a freshly arrived chunk, time-aligned to the
+            #    robot's current position. The chunk's action[0] is the policy's
+            #    response to the observation captured when the request fired,
+            #    `elapsed` frames ago — but the robot has kept moving along the
+            #    old chunk since then. Dropping the first `elapsed` actions
+            #    makes the new chunk pick up from where the robot actually is,
+            #    instead of snapping it back to the fire-time pose (the cause of
+            #    the back-and-forth jitter).
+            #
+            #    The skip is bounded by `remaining_at_fire`: if the old chunk ran
+            #    out before this one arrived (a full gap), the robot was *holding
+            #    position*, not advancing, for those extra frames — so they must
+            #    not be skipped. Without this bound a gap would drop almost the
+            #    whole new chunk, leaving fewer than `refetch_after` actions, so
+            #    the re-fire trigger below could never arm again and the robot
+            #    would hold forever.
+            try:
+                new_chunk = chunk_queue.get_nowait()
+            except queue.Empty:
+                pass
+            else:
+                if new_chunk is None:
+                    raise RuntimeError("inference worker reported failure; aborting")
+                if isinstance(new_chunk, (Hold, Idle)) or target.idle:
+                    # Rejected target, lost server, or idle: drop what is left of the
+                    # previous target's chunk and hold the last commanded pose.
+                    # `consumed_since_swap` stays 0, so the `refetch_after` trigger
+                    # never re-fires; only a new seq from the control file
+                    # (`fire_now`) does. A chunk that was still in flight when the
+                    # target went idle lands here too and is discarded. The dropped
+                    # chunk's feedback flags go with it.
+                    if isinstance(new_chunk, Hold):
+                        logger.error(
+                            "target #%d on hold: %s — holding position until a valid target is applied",
+                            new_chunk.seq,
+                            new_chunk.error,
+                        )
+                    elif isinstance(new_chunk, Idle):
+                        accepted_seq = new_chunk.seq
+                    current_chunk = []
+                    idx = 0
+                    inflight = False
+                    consumed_since_swap = 0
+                    chunk_exhausted_at = None
+                    holding = True
+                    _clear_feedback(tracker, chunk_seq)
+                else:
+                    holding = False
+                    # Cut to the horizon on arrival, here on the main thread, so a live
+                    # change also applies to a request that was already in flight.
+                    if len(new_chunk) < settings.action_horizon and short_chunk_warned_seq != settings.seq:
+                        _warn_short_chunk(len(new_chunk), settings)
+                        short_chunk_warned_seq = settings.seq
+                    new_chunk = new_chunk[: settings.action_horizon]
+                    elapsed = frame_counter - fire_frame
+                    # Drop the `elapsed` frames the robot already advanced along the
+                    # old chunk (capped at what it could actually consume), so the new
+                    # chunk picks up from where the robot *is*, not from the fire-time
+                    # pose (the cause of the back-and-forth jitter).
+                    #
+                    # Cap: keep at least `refetch_after` actions in the chunk. The
+                    # re-fire trigger needs `consumed_since_swap >= refetch_after`, and
+                    # that counter only advances while there are actions left to send.
+                    # If a high-latency swap trimmed the chunk below `refetch_after`,
+                    # the trigger could never arm again and the robot would hold
+                    # position forever (the bug seen when ping exceeds the action
+                    # horizon). Capping here guarantees the loop always re-fires.
+                    drop = min(elapsed, remaining_at_fire)
+                    drop = min(drop, max(len(new_chunk) - settings.refetch_after, 0))
+
+                    # Crossfade the seam. `current_chunk[idx:]` are the old chunk's
+                    # next actions and `new_chunk[drop:]` are the new chunk's first
+                    # kept actions; after the time-align above these describe the same
+                    # instants but come from different policy passes, so a cold switch
+                    # leaves a one-frame jump. Blend the first `blend_frames` of them
+                    # with a mostly-old → mostly-new ramp. The blend length is clamped
+                    # to the overlap: if the old chunk has fewer actions left than
+                    # `blend_frames` (or already ran dry — `leftover_old` empty, robot
+                    # holding position) we interpolate over only the frames available.
+                    leftover_old = current_chunk[idx:]
+                    new_kept = new_chunk[drop:]
+                    blend_len = min(cfg.blend_frames, len(leftover_old), len(new_kept))
+                    for k in range(blend_len):
+                        alpha = (k + 1) / (blend_len + 1)
+                        new_kept[k] = _blend_actions(leftover_old[k], new_kept[k], alpha)
+
+                    logger.info(
+                        "chunk swap: %d actions arrived after %d frames, dropping %d "
+                        "stale actions, %d kept, %d blended "
+                        "(remaining_at_fire=%d, leftover=%d)",
+                        len(new_chunk),
+                        elapsed,
+                        drop,
+                        len(new_kept),
+                        blend_len,
+                        remaining_at_fire,
+                        len(leftover_old),
+                    )
+                    current_chunk = new_kept
+                    idx = 0
+                    inflight = False
+                    consumed_since_swap = 0
+                    chunk_exhausted_at = None
+                    if chunk_seq != fire_seq:
+                        # The chunk of another target takes over: its flags start from
+                        # scratch (first fed step re-announces them under the new seq).
+                        chunk_seq = fire_seq
+                        tracker.reset()
+
+            # 2. Send an action (or hold position if we ran out / were told to).
+            #    A step also carries the policy's feedback values (see `get_action`);
+            #    only the joints go to the robot — and into `last_action`, which both
+            #    hold branches re-send. Hold / late-chunk ticks leave the tracker alone:
+            #    they are neither evidence for nor against a flag. A Home ramp (idle, so
+            #    no chunk) sends its next pose until it arrives, then the hold re-sends it.
+            if idx < len(current_chunk):
+                action, feedback = split_feedback(current_chunk[idx])
+                robot.send_action(action)
+                last_action = action
+                idx += 1
+                consumed_since_swap += 1
+                chunk_exhausted_at = None
+                # While a newer target is pending, the old target's chunk keeps playing
+                # but must not set flags under the new seq.
+                if chunk_seq == target.seq:
+                    flags = tracker.update(feedback)
+                    if flags is not None:
+                        logger.info(format_feedback_status(chunk_seq, flags, feedback))
+            elif home_ramp is not None and not relaxed:
+                if home_ramp.t0 is None:
+                    home_ramp.t0 = tick_start
+                alpha = smoothstep(min(1.0, (tick_start - home_ramp.t0) / home_ramp.duration))
+                action = ramp_pose(home_ramp.start, home_ramp.target, alpha)
+                robot.send_action(action)
+                last_action = action
+                if alpha >= 1.0:
+                    logger.info("target #%d: Home position reached", target.seq)
+                    reached_seq = target.seq
+                    home_ramp = None
+            elif holding:
+                # Idle or on hold: keep the last pose, quietly (logged once above) —
+                # unless relaxed: then the arms are the operator's.
+                if last_action is not None and not relaxed:
+                    robot.send_action(last_action)
+            else:
+                if chunk_exhausted_at is None:
+                    chunk_exhausted_at = tick_start
+                    late_logged_at = None
+                gap_ms = (tick_start - chunk_exhausted_at) * 1000.0
+                if last_action is not None:
+                    robot.send_action(last_action)
+                # First tick of a gap, then once per second — not once per tick.
+                if late_logged_at is None or tick_start - late_logged_at >= 1.0:
+                    logger.warning("late chunk: gap=%.1f ms (holding position)", gap_ms)
+                    late_logged_at = tick_start
+            if reached_seq == target.seq and accepted_seq == target.seq:
+                logger.info(format_target_status(target, True, None, home_reached=True))
+                reached_seq = None
+
+            # 3. Fire the next request once we've consumed `refetch_after`
+            #    actions from the current chunk and nothing is already in flight.
+            #    A new target (`fire_now`) fires as soon as the line is free.
+            #    Record the fire frame and how many actions are still queued so
+            #    the swap above can measure round-trip latency in frames and cap
+            #    the stale-lead trim at what the robot can actually consume. The
+            #    instruction is attached by the worker from the target it accepted.
+            #    An idle target is handed over once, without an observation (the
+            #    worker only drops its client); after that nothing fires while idle.
+            #
+            #    Stall guard: fire at `min(refetch_after, len(current_chunk))`, i.e. at
+            #    the chunk's end at the latest. Otherwise the counter could never reach
+            #    `refetch_after` (it only advances while actions are left) when (a) a live
+            #    change raised it above what an already-trimmed chunk holds, or (b) the
+            #    policy's chunks are shorter than it — and the robot would hold forever.
+            #    With unchanged settings and full chunks this is plain `refetch_after`:
+            #    the drop cap at step 1 keeps at least that many actions. An empty chunk
+            #    (idle / hold) never fires, as before; during a late-chunk gap a request
+            #    is in flight, so this is not evaluated.
+            refetch_at = min(settings.refetch_after, len(current_chunk))
+            if not inflight and (fire_now or (len(current_chunk) > 0 and consumed_since_swap >= refetch_at)):
+                t_start = time.perf_counter()
+                obs = {} if target.idle else robot.get_observation()
+                obs_queue.put((target, obs))
+                inflight = True
+                fire_now = False
+                fire_frame = frame_counter
+                fire_seq = target.seq
+                remaining_at_fire = max(len(current_chunk) - idx, 0)
+                if not target.idle:
+                    logger.info(
+                        "inference fired at frame=%d (consumed_since_swap=%d), "
+                        "remaining_at_fire=%d, fire_time=%.6f",
+                        frame_counter,
+                        consumed_since_swap,
+                        remaining_at_fire,
+                        time.perf_counter() - t_start,
+                    )
+
+            # 4. Sleep to next tick. The period follows the live `speed_pct`. A tick that
+            #    took longer than its period (typically the fire tick, which reads the
+            #    cameras on this thread) slows playback below the requested speed; say so
+            #    once per second at most.
+            period = settings.period_s(cfg.fps)
+            now = time.perf_counter()
+            sleep = period - (now - tick_start)
+            if sleep > 0:
+                time.sleep(sleep)
+            elif sleep < 0 and (overrun_logged_at is None or now - overrun_logged_at >= 1.0):
+                logger.warning(
+                    "tick overran the %.1f ms period by %.1f ms — effective speed is below %d%%",
+                    period * 1000.0,
+                    -sleep * 1000.0,
+                    settings.speed_pct,
+                )
+                overrun_logged_at = now
+    except KeyboardInterrupt:
+        logger.info("Shutting down inference loop…")
+    finally:
+        stop_event.set()
+        if worker is not None:
+            try:
+                obs_queue.put_nowait(None)
+            except queue.Full:
+                pass
+            worker.join(timeout=2.0)
+        if worker is not None and worker.is_alive():
+            logger.warning("inference worker did not exit within 2 s")
+        elif adapter.policy is not None:
+            # Only when the worker is gone — ZMQ sockets are not thread-safe.
+            adapter.policy.close()
+
+
+@draccus.wrap()
+def main(cfg: BmhInferenceConfig) -> None:
+    init_logging()
+    # Never echo the API token — the controller-app tails this output into its log.
+    logger.info(pformat({**asdict(cfg), "api_token": "***" if cfg.api_token else ""}))
+
+    if not 1 <= cfg.jpeg_quality <= 100:
+        raise SystemExit("--jpeg_quality must be in [1, 100].")
+    if cfg.feedback_off_threshold > cfg.feedback_on_threshold:
+        raise SystemExit(
+            f"--feedback_off_threshold ({cfg.feedback_off_threshold}) must not exceed "
+            f"--feedback_on_threshold ({cfg.feedback_on_threshold})."
+        )
+    if cfg.feedback_debounce_ticks < 1:
+        raise SystemExit(f"--feedback_debounce_ticks must be >= 1; got {cfg.feedback_debounce_ticks}.")
+    if not cfg.home_ramp_s > 0:
+        raise SystemExit(f"--home_ramp_s must be > 0; got {cfg.home_ramp_s}.")
+
+    # Initial target: the controller-app's control file when given, else the CLI
+    # flags, else idle. A real target is validated by `_connect_policy` (ping +
+    # modality) in `_run_control_loop`, before the robot moves.
+    watcher = ControlFileWatcher(Path(cfg.control_file).expanduser()) if cfg.control_file else None
+    target = _initial_target(watcher, cfg.policy_host, cfg.policy_port, cfg.lang_instruction, cfg.api_token)
+    # Loop settings: the app's loop file when given (and present), else the CLI flags —
+    # checked against --blend_frames with the same rules as a live change.
+    loop_watcher = LoopFileWatcher(Path(cfg.loop_file).expanduser()) if cfg.loop_file else None
+    settings = _initial_loop_settings(loop_watcher, cfg)
+
+    robot = make_robot_from_config(cfg.robot)
+    robot.connect()
+    logger.info("Robot connected: %s", robot.name)
+
+    try:
+        # bi_so_follower.action_features lists every `.pos` key in bus order with the
+        # left_/right_ prefix — for the BMH-101 with `--robot.left_arm_config.with_head=true`
+        # that is the same 16 names the training dataset's `features` carry. The policy
+        # client is attached in `_run_control_loop`, once the server passed the modality check.
+        adapter = BiSoBimanualAdapter(
+            None,
+            jpeg_quality=cfg.jpeg_quality,
+            joint_names=list(robot.action_features.keys()),
+        )
+
+        def connect(t: InferenceTarget) -> PolicyClient:
+            return _connect_policy(t, adapter, cfg.probe_timeout_ms, cfg.timeout_ms)
+
+        _run_control_loop(
+            robot, adapter, watcher, target, cfg, connect, loop_watcher=loop_watcher, settings=settings
+        )
+    finally:
+        try:
+            robot.disconnect()
+        except Exception as e:
+            logger.error("Error disconnecting robot: %s", e)
+
+
+if __name__ == "__main__":
+    main()

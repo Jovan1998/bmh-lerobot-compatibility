@@ -45,7 +45,7 @@ the matching `with_head` value.
   config instead of CLI flags, skipping draccus' ~5.5 s argparse build on the Pi. Used by the
   controller-app for every recording session. Config layout and example:
   [`../documentation/Readme.md`](../documentation/Readme.md#fast-startup-bmh-extras).
-- `bmh_groot_client.py` — `bmh-groot-client`: GR00T N inference client (see its module docstring).
+- `bmh_policy_client.py` — `bmh-policy-client`: policy client for any BMH policy server, GR00T or SmolVLA (see its module docstring). `bmh_groot_client.py` / `bmh-groot-client` remain as aliases for one release.
 - `bmh_center_arm.py` — `bmh-center-arm`: moves an arm to its calibrated center pose.
 - `bmh_read_pose.py` — `bmh-read-pose`: prints both follower arms' present pose (head included) as
   one `POSE {json}` line without moving anything; the controller-app saves it as the Home position.

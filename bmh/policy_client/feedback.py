@@ -1,7 +1,7 @@
-"""Policy feedback flags for the BMH-101 GR00T client.
+"""Policy feedback flags for the BMH-101 policy client.
 
 A skill trained with *feedbacks* (preset: ``done``) returns one 0..1 value per feedback
-with every action step (see ``bmh/groot_client/layout.py::unpack_feedback``).
+with every action step (see ``bmh/policy_client/layout.py::unpack_feedback``).
 :class:`FeedbackTracker` turns that noisy per-tick stream into booleans for the
 controller-app:
 
@@ -13,7 +13,7 @@ controller-app:
 Flags are level state: :meth:`FeedbackTracker.update` answers with the **full snapshot**
 (every key, not a delta) whenever it changed and ``None`` otherwise, so the caller logs
 one ``BMH_FEEDBACK`` line per change (see
-``bmh/groot_client/control.py::format_feedback_status``) and nothing per tick. The
+``bmh/policy_client/control.py::format_feedback_status``) and nothing per tick. The
 caller decides *which* ticks count — the control loop only feeds steps of a chunk that
 belongs to the current target and calls :meth:`FeedbackTracker.reset` when that changes.
 

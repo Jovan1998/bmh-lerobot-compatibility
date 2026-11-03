@@ -13,6 +13,8 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 #
+# The transport for every BMH policy server (GR00T or SmolVLA runner): the wire format
+# is GR00T's, which the BMH runners all speak.
 # Vendored from Isaac-GR00T `gr00t/policy/server_client.py`. PolicyServer is omitted
 # (the BMH-101 only acts as a client). Imports are rewritten to the sibling vendored
 # modules so this file pulls in no further GR00T dependencies.

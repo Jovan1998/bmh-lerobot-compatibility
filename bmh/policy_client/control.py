@@ -1,6 +1,6 @@
-"""Live inference target for the BMH-101 GR00T client.
+"""Live inference target for the BMH-101 policy client.
 
-The controller-app hands ``bmh-groot-client`` its *target* — policy server host /
+The controller-app hands ``bmh-policy-client`` its *target* — policy server host /
 port / API token plus the language instruction — through a small JSON file
 (``~/.cache/bmh-101/inference-control.json``) that it replaces atomically (tmp +
 rename) whenever the operator applies a change. The client ``os.stat``s the file
@@ -125,8 +125,8 @@ class InferenceTarget:
 
     Attributes:
         seq: Monotonic request number assigned by the writer (0 for CLI-only runs).
-        policy_host: GR00T policy server host.
-        policy_port: GR00T policy server port.
+        policy_host: BMH policy server (GR00T or SmolVLA runner) host.
+        policy_port: BMH policy server port.
         lang_instruction: Language instruction sent with every request.
         api_token: Per-request API token (empty = none). Hidden from ``repr``.
         idle: ``True`` for "no server, no prompt" — host / instruction / token are
@@ -542,7 +542,7 @@ def format_feedback_status(seq: int, flags: Mapping[str, bool], values: Mapping[
         seq: ``seq`` of the target the flags belong to; the app shows them only while
             that target is the applied one.
         flags: Full snapshot, ``{feedback key: on?}`` (see
-            ``bmh/groot_client/feedback.py::FeedbackTracker``). Empty = cleared.
+            ``bmh/policy_client/feedback.py::FeedbackTracker``). Empty = cleared.
         values: Raw 0..1 value behind each flag at the moment of the change, for the
             log reader. Rounded to 3 decimals; non-finite values are left out so the
             line is always valid JSON.

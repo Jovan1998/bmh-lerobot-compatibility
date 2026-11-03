@@ -1,4 +1,4 @@
-"""Worker-level tests for ``bmh-groot-client`` target switching - no robot, no server.
+"""Worker-level tests for ``bmh-policy-client`` target switching - no robot, no server.
 
 Drives ``_inference_worker`` with a fake adapter / fake policy clients and checks the
 decision rules: a prompt-only change is adopted, an endpoint change is probed once via
@@ -23,10 +23,10 @@ pytest.importorskip("cv2")
 pytest.importorskip("draccus")
 zmq = pytest.importorskip("zmq")
 
-import bmh.scripts.bmh_groot_client as script  # noqa: E402
-from bmh.groot_client.control import ControlFileWatcher, Hold, Idle, InferenceTarget  # noqa: E402
-from bmh.groot_client.server_client import PolicyClient  # noqa: E402
-from bmh.scripts.bmh_groot_client import (  # noqa: E402
+import bmh.scripts.bmh_policy_client as script  # noqa: E402
+from bmh.policy_client.control import ControlFileWatcher, Hold, Idle, InferenceTarget  # noqa: E402
+from bmh.policy_client.server_client import PolicyClient  # noqa: E402
+from bmh.scripts.bmh_policy_client import (  # noqa: E402
     PolicyConnectError,
     _connect_policy,
     _inference_worker,
@@ -416,7 +416,7 @@ def test_connect_policy_passes_no_token_as_none(probe_client):
 
 def test_connect_policy_maps_unreachable_and_closes(probe_client):
     probe_client.ping_result = False
-    with pytest.raises(PolicyConnectError, match="Cannot reach GR00T policy server at h1:5555"):
+    with pytest.raises(PolicyConnectError, match="Cannot reach policy server at h1:5555"):
         _connect_policy(_target(1), _ValidatingAdapter(), 300, 15000)
     assert probe_client.instances[0].closed == 1
 
