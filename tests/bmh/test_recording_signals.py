@@ -1,48 +1,45 @@
 """BMH: Unix signals stand in for the recording keys (headless Pi, controller-app UI).
 
 The controller-app ends an episode, re-records or stops a running `bmh-record` / `lerobot-record`
-by sending SIGUSR1 / SIGUSR2 / SIGTERM to its PID. `init_keyboard_listener()` must install those
-handlers whatever keyboard backend it picks (or none at all).
+by sending SIGUSR1 / SIGUSR2 / SIGTERM to its PID. `record()` installs those handlers right after
+`init_keyboard_listener()`, whatever keyboard backend that picked (or none at all), and puts the
+previous handlers back when it returns (see `test_record_guards.py`).
 """
 
-import importlib
 import os
 import signal
 import time
-from contextlib import ExitStack
 from unittest.mock import patch
 
 import pytest
 
+from lerobot.utils import keyboard_input
+
 _SIGNALS = (signal.SIGUSR1, signal.SIGUSR2, signal.SIGTERM)
 
 
-def _keyboard_module():
-    """The module that owns `init_keyboard_listener` (it moved upstream in 0.6)."""
-    try:
-        return importlib.import_module("lerobot.utils.keyboard_input")
-    except ImportError:
-        return importlib.import_module("lerobot.common.control_utils")
+@pytest.fixture
+def restore_signal_handlers():
+    previous = {sig: signal.getsignal(sig) for sig in _SIGNALS}
+    yield
+    for sig, handler in previous.items():
+        signal.signal(sig, handler)
+
+
+def _init_keyboard() -> dict:
+    # Never start a real keyboard listener from a test (pynput would hook the desktop).
+    with patch.object(keyboard_input, "create_key_listener", return_value=None):
+        listener, events = keyboard_input.init_keyboard_listener()
+    assert listener is None
+    return events
 
 
 @pytest.fixture
-def events():
-    """`events` from `init_keyboard_listener()` with no keyboard backend; signal handlers restored after."""
-    module = _keyboard_module()
-    previous = {sig: signal.getsignal(sig) for sig in _SIGNALS}
-    with ExitStack() as stack:
-        # Never start a real keyboard listener from a test (pynput would hook the desktop).
-        if hasattr(module, "create_key_listener"):
-            stack.enter_context(patch.object(module, "create_key_listener", return_value=None))
-        else:
-            stack.enter_context(patch.object(module, "is_headless", return_value=True))
-        listener, events = module.init_keyboard_listener()
-        assert listener is None
-        try:
-            yield events
-        finally:
-            for sig, handler in previous.items():
-                signal.signal(sig, handler)
+def events(restore_signal_handlers):
+    """`events` as `record()` sets them up: keyboard listener (none here), then the signals."""
+    events = _init_keyboard()
+    keyboard_input.install_recording_signal_handlers(events)
+    return events
 
 
 def _send(sig: int) -> None:
@@ -79,22 +76,33 @@ def test_handlers_installed_for_all_three_signals(events):
         assert handler not in (signal.SIG_DFL, signal.SIG_IGN)
 
 
-def test_headless_log_names_the_pid(caplog):
-    """With no keyboard, the log tells the operator how to drive recording via `kill`."""
-    module = _keyboard_module()
-    previous = {sig: signal.getsignal(sig) for sig in _SIGNALS}
-    with ExitStack() as stack:
-        if hasattr(module, "create_key_listener"):
-            stack.enter_context(patch.object(module, "create_key_listener", return_value=None))
-        else:
-            stack.enter_context(patch.object(module, "is_headless", return_value=True))
-        try:
-            with caplog.at_level("INFO"):
-                module.init_keyboard_listener()
-        finally:
-            for sig, handler in previous.items():
-                signal.signal(sig, handler)
+def test_log_tells_the_operator_how_to_signal(restore_signal_handlers, caplog):
+    with caplog.at_level("INFO"):
+        keyboard_input.install_recording_signal_handlers(_init_keyboard())
     pid = str(os.getpid())
     assert f"kill -USR1 {pid}" in caplog.text
     assert f"kill -USR2 {pid}" in caplog.text
     assert f"kill -TERM {pid}" in caplog.text
+
+
+def test_restore_puts_the_previous_handlers_back(restore_signal_handlers):
+    sentinel = lambda signum, frame: None  # noqa: E731
+    for sig in _SIGNALS:
+        signal.signal(sig, sentinel)
+
+    restore = keyboard_input.install_recording_signal_handlers(_init_keyboard())
+    assert all(signal.getsignal(sig) is not sentinel for sig in _SIGNALS)
+    restore()
+
+    assert all(signal.getsignal(sig) is sentinel for sig in _SIGNALS)
+
+
+def test_keyboard_listener_alone_leaves_signals_alone(restore_signal_handlers):
+    """Other callers of `init_keyboard_listener` (`lerobot-rollout`) own SIGTERM themselves."""
+    sentinel = lambda signum, frame: None  # noqa: E731
+    for sig in _SIGNALS:
+        signal.signal(sig, sentinel)
+
+    _init_keyboard()
+
+    assert all(signal.getsignal(sig) is sentinel for sig in _SIGNALS)

@@ -11,11 +11,13 @@ The controller-app ends episodes with SIGUSR1 (see `test_recording_signals.py`).
 
 import contextlib
 import logging
+import signal
 from unittest.mock import MagicMock, patch
 
 import pytest
 
 pytest.importorskip("datasets")
+pytestmark = pytest.mark.dataset
 
 from lerobot.configs.dataset import DatasetRecordConfig  # noqa: E402
 from lerobot.robots.so_follower import SO101FollowerConfig  # noqa: E402
@@ -107,6 +109,13 @@ def _run_record(tmp_path, num_episodes: int, episode_loop):
         enter(patch.object(lerobot_record, "make_teleoperator_from_config", return_value=None))
         enter(patch.object(lerobot_record.LeRobotDataset, "create", return_value=dataset))
         enter(patch.object(lerobot_record, "init_keyboard_listener", return_value=(None, events)))
+        install_signals = enter(
+            patch.object(
+                lerobot_record,
+                "install_recording_signal_handlers",
+                wraps=lerobot_record.install_recording_signal_handlers,
+            )
+        )
         enter(patch.object(lerobot_record, "record_loop", side_effect=fake_record_loop))
         enter(patch.object(lerobot_record, "VideoEncodingManager", lambda ds: contextlib.nullcontext()))
         enter(patch.object(lerobot_record, "log_say"))
@@ -115,8 +124,13 @@ def _run_record(tmp_path, num_episodes: int, episode_loop):
         for name in ("check_control_rate", "start_episode", "CycleTimer", "init_rerun", "init_visualization"):
             if hasattr(lerobot_record, name):
                 enter(patch.object(lerobot_record, name, MagicMock()))
+        sigterm_before = signal.getsignal(signal.SIGTERM)
         record(_cfg(tmp_path, num_episodes))
 
+    # The controller-app drives recording with SIGUSR1/SIGUSR2/SIGTERM (test_recording_signals.py):
+    # installed on the session's events, and the previous handlers are back once record() returns.
+    install_signals.assert_called_once_with(events)
+    assert signal.getsignal(signal.SIGTERM) is sigterm_before
     return dataset, events, seen_at_start
 
 

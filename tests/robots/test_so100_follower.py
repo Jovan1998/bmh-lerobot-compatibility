@@ -50,7 +50,7 @@ def _make_bus_mock() -> MagicMock:
 
 
 @contextmanager
-def _patched_follower(**cfg_kwargs):
+def _patched_follower(calibration_dir, **cfg_kwargs):
     bus_mock = _make_bus_mock()
 
     def _bus_side_effect(*_args, **kwargs):
@@ -67,12 +67,12 @@ def _patched_follower(**cfg_kwargs):
 
     with (
         patch(
-            "lerobot.robots.so_follower.so_follower.FeetechMotorsBus",
+            "lerobot.robots.so_follower.so_follower.SerialMotorsBus",
             side_effect=_bus_side_effect,
         ),
         patch.object(SO100Follower, "configure", lambda self: None),
     ):
-        cfg = SO100FollowerConfig(port="/dev/null", **cfg_kwargs)
+        cfg = SO100FollowerConfig(port="/dev/null", calibration_dir=calibration_dir, **cfg_kwargs)
         robot = SO100Follower(cfg)
         yield robot
         if robot.is_connected:
@@ -80,8 +80,8 @@ def _patched_follower(**cfg_kwargs):
 
 
 @pytest.fixture
-def follower():
-    with _patched_follower() as robot:
+def follower(tmp_path):
+    with _patched_follower(tmp_path) as robot:
         yield robot
 
 
@@ -100,8 +100,8 @@ def test_motor_layout(follower):
     assert "head_pan.pos" not in follower.action_features
 
 
-def test_motor_layout_with_head():
-    with _patched_follower(with_head=True) as robot:
+def test_motor_layout_with_head(tmp_path):
+    with _patched_follower(tmp_path, with_head=True) as robot:
         assert len(robot.bus.motors) == 9
         assert list(robot.bus.motors)[-2:] == ["head_pan", "head_tilt"]
         assert [robot.bus.motors[m].id for m in ("head_pan", "head_tilt")] == [8, 9]
@@ -125,7 +125,7 @@ def _uncalibrated_follower(tmp_path, with_file: bool):
         (tmp_path / "follower.json").write_text(json.dumps(_calibration_file(arm)))
     with (
         patch.object(SO100Follower, "calibrate") as calibrate_mock,
-        _patched_follower(id="follower", calibration_dir=tmp_path) as robot,
+        _patched_follower(tmp_path, id="follower") as robot,
     ):
         robot.bus.is_calibrated = False
         yield robot, calibrate_mock
@@ -172,6 +172,40 @@ def test_get_observation(follower):
         assert obs[f"{motor}.pos"] == idx
 
 
+def test_observation_keys_match_features_with_mock_camera(follower):
+    # `observation_features` and `get_observation()` must use the same depth predicate:
+    # a bare mock camera is not a `DepthCamera`, so neither side may advertise `<cam>_depth`.
+    cam = MagicMock(name="CameraMock")
+    cam.height, cam.width = 480, 640
+    follower.cameras = {"wrist": cam}
+    follower.connect()
+
+    obs = follower.get_observation()
+    assert set(obs) == set(follower.observation_features)
+    assert "wrist" in obs and "wrist_depth" not in obs
+
+
+def test_get_observation_uses_read_retries(follower):
+    # Feetech buses can intermittently fail a sync_read; the follower should forward the configured
+    # retry count so transient failures don't abort the control loop (see #3131).
+    follower.config.num_read_retries = 7
+    follower.connect()
+    follower.get_observation()
+
+    follower.bus.sync_read.assert_called_once_with("Present_Position", num_retry=7)
+
+
+def test_send_action_uses_read_retries(follower):
+    follower.config.max_relative_target = 10.0
+    follower.config.num_read_retries = 7
+    follower.connect()
+
+    action = {f"{motor}.pos": value * 10 for value, motor in enumerate(follower.bus.motors, 1)}
+    follower.send_action(action)
+
+    follower.bus.sync_read.assert_called_once_with("Present_Position", num_retry=7)
+
+
 def test_send_action(follower):
     follower.connect()
 
@@ -182,3 +216,22 @@ def test_send_action(follower):
 
     goal_pos = {m: (i + 1) * 10 for i, m in enumerate(follower.bus.motors)}
     follower.bus.sync_write.assert_called_once_with("Goal_Position", goal_pos)
+
+
+def test_configure_writes_position_pid_coefficients():
+    bus_mock = _make_bus_mock()
+    bus_mock.motors = ["shoulder_pan"]
+    robot = MagicMock()
+    robot.bus = bus_mock
+    robot.config = SO100FollowerConfig(
+        port="/dev/null",
+        position_p_coefficient=32,
+        position_i_coefficient=1,
+        position_d_coefficient=16,
+    )
+
+    SO100Follower.configure(robot)
+
+    bus_mock.write.assert_any_call("P_Coefficient", "shoulder_pan", 32)
+    bus_mock.write.assert_any_call("I_Coefficient", "shoulder_pan", 1)
+    bus_mock.write.assert_any_call("D_Coefficient", "shoulder_pan", 16)

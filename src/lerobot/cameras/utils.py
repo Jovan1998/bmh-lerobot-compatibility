@@ -111,7 +111,7 @@ def connect_cameras(cameras: Mapping[str, Camera]) -> None:
 
 
 def get_cv2_rotation(rotation: Cv2Rotation) -> int | None:
-    import cv2  # type: ignore  # TODO: add type stubs for OpenCV
+    import cv2
 
     if rotation == Cv2Rotation.ROTATE_90:
         return int(cv2.ROTATE_90_CLOCKWISE)
