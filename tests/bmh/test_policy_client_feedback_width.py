@@ -37,19 +37,34 @@ def test_split_feedback_keeps_any_width_away_from_the_robot() -> None:
     assert feedback == {"done": 0.5, "grasped": 1.0}
 
 
-def test_groot_client_alias_warns_and_shares_modules() -> None:
+def test_groot_client_alias_warns_and_shares_modules(monkeypatch: pytest.MonkeyPatch) -> None:
     for name in [m for m in sys.modules if m.startswith("bmh.groot_client")]:
-        del sys.modules[name]
+        monkeypatch.delitem(sys.modules, name)
+    # Captured before the alias is imported: an alias that re-executes the module
+    # file would leave these objects behind and replace the sys.modules entries.
+    import bmh.policy_client.control as control
+    import bmh.policy_client.feedback as feedback
+
+    control_spec = control.__spec__
+    meta_path = list(sys.meta_path)
+
     with warnings.catch_warnings(record=True) as caught:
         warnings.simplefilter("always")
         importlib.import_module("bmh.groot_client")
     assert any(issubclass(w.category, DeprecationWarning) for w in caught)
 
+    import bmh.groot_client.layout as old_layout
+    from bmh.groot_client import layout as old_layout_attr
+    from bmh.groot_client.control import Hold as OldHold
     from bmh.groot_client.feedback import FeedbackTracker as OldTracker
-
-    from bmh.groot_client import layout as old_layout
     from bmh.policy_client import layout
-    from bmh.policy_client.feedback import FeedbackTracker
 
+    assert OldHold is control.Hold
+    assert OldTracker is feedback.FeedbackTracker
+    assert sys.modules["bmh.policy_client.control"] is control
+    assert sys.modules["bmh.policy_client.feedback"] is feedback
     assert old_layout is layout
-    assert OldTracker is FeedbackTracker
+    assert old_layout_attr is layout
+    assert control.__spec__ is control_spec
+    assert control.__spec__.name == "bmh.policy_client.control"
+    assert sys.meta_path == meta_path
