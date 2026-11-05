@@ -14,6 +14,7 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+import json
 from contextlib import contextmanager
 from unittest.mock import MagicMock, patch
 
@@ -107,6 +108,47 @@ def test_motor_layout_with_head():
         assert "head_pan.pos" in robot.action_features
         assert "head_tilt.pos" in robot.action_features
         assert "head_pan.pos" in robot.observation_features
+
+
+def _calibration_file(motors) -> dict:
+    return {
+        m: {"id": i, "drive_mode": 0, "homing_offset": 10 * i, "range_min": 1000, "range_max": 3000}
+        for i, m in enumerate(motors, 1)
+    }
+
+
+@contextmanager
+def _uncalibrated_follower(tmp_path, with_file: bool):
+    """Follower whose motor registers do not match the calibration (bus.is_calibrated False)."""
+    arm = ["shoulder_pan", "shoulder_lift", "elbow_flex", "wrist_flex", "wrist_yaw", "wrist_roll", "gripper"]
+    if with_file:
+        (tmp_path / "follower.json").write_text(json.dumps(_calibration_file(arm)))
+    with (
+        patch.object(SO100Follower, "calibrate") as calibrate_mock,
+        _patched_follower(id="follower", calibration_dir=tmp_path) as robot,
+    ):
+        robot.bus.is_calibrated = False
+        yield robot, calibrate_mock
+
+
+def test_connect_applies_drifted_calibration_file_without_prompting(tmp_path):
+    # BMH: connect() must work headless — a drifted motor gets the file's values, no prompt.
+    with _uncalibrated_follower(tmp_path, with_file=True) as (robot, calibrate_mock):
+        assert len(robot.calibration) == 7
+        robot.connect()
+
+        robot.bus.write_calibration.assert_called_once_with(robot.calibration)
+        calibrate_mock.assert_not_called()
+        assert robot.is_connected
+
+
+def test_connect_without_calibration_file_runs_calibrate(tmp_path):
+    with _uncalibrated_follower(tmp_path, with_file=False) as (robot, calibrate_mock):
+        assert robot.calibration == {}
+        robot.connect()
+
+        calibrate_mock.assert_called_once_with()
+        robot.bus.write_calibration.assert_not_called()
 
 
 def test_connect_disconnect(follower):
