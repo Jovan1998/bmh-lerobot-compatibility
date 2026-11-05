@@ -8,7 +8,7 @@ Run with ``uv run --no-sync pytest tests/bmh/test_feedback_tracker.py -q``.
 
 import pytest
 
-from bmh.groot_client.feedback import FeedbackTracker
+from bmh.policy_client.feedback import FeedbackTracker
 
 
 def _tracker(debounce: int = 3) -> FeedbackTracker:

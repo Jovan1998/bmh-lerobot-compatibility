@@ -1,4 +1,4 @@
-"""Unit tests for the BMH-101 GR00T client joint-group layout.
+"""Unit tests for the BMH-101 policy client joint-group layout.
 
 Pure Python + numpy — no robot hardware or ZMQ. Run with
 ``uv run pytest tests/bmh -svv``.
@@ -7,7 +7,7 @@ Pure Python + numpy — no robot hardware or ZMQ. Run with
 import numpy as np
 import pytest
 
-from bmh.groot_client.layout import (
+from bmh.policy_client.layout import (
     FEEDBACK_PREFIX,
     JointGroup,
     group_joint_names,

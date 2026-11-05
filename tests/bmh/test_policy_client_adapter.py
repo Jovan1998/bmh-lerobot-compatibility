@@ -1,4 +1,4 @@
-"""Adapter-level tests for ``bmh-groot-client`` — no robot hardware, no ZMQ traffic.
+"""Adapter-level tests for ``bmh-policy-client`` — no robot hardware, no ZMQ traffic.
 
 Exercises ``BiSoBimanualAdapter`` end to end on fake observations / action chunks
 for the 16-dim 7-DoF + head BMH-101 layout. Needs the ``bmh_network`` extra
@@ -13,8 +13,8 @@ pytest.importorskip("msgpack_numpy")
 pytest.importorskip("cv2")
 pytest.importorskip("draccus")
 
-from bmh.scripts.bmh_groot_client import BIMANUAL_CAMERA_KEYS, BiSoBimanualAdapter  # noqa: E402
-from tests.bmh.test_groot_client_layout import BMH_101_16_NAMES, LEGACY_12_NAMES  # noqa: E402
+from bmh.scripts.bmh_policy_client import BIMANUAL_CAMERA_KEYS, BiSoBimanualAdapter  # noqa: E402
+from tests.bmh.test_policy_client_layout import BMH_101_16_NAMES, LEGACY_12_NAMES  # noqa: E402
 
 BMH_101_STATE_KEYS = ("left_single_arm", "left_gripper", "left_head", "right_single_arm", "right_gripper")
 LEGACY_STATE_KEYS = ("left_single_arm", "left_gripper", "right_single_arm", "right_gripper")

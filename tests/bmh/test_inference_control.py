@@ -13,7 +13,7 @@ import os
 
 import pytest
 
-from bmh.groot_client.control import (
+from bmh.policy_client.control import (
     FEEDBACK_STATUS_PREFIX,
     LOOP_STATUS_PREFIX,
     STATUS_PREFIX,

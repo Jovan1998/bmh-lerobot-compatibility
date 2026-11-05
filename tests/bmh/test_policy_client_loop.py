@@ -1,4 +1,4 @@
-"""Loop-level tests for ``bmh-groot-client`` - fake robot, fake adapter, no server.
+"""Loop-level tests for ``bmh-policy-client`` - fake robot, fake adapter, no server.
 
 Runs ``_run_control_loop`` (and ``main`` for the robot-disconnect guarantees) against
 fakes and checks what reaches the robot: an idle start is still and quiet, a target from
@@ -33,14 +33,14 @@ pytest.importorskip("cv2")
 pytest.importorskip("draccus")
 pytest.importorskip("zmq")
 
-import bmh.scripts.bmh_groot_client as script  # noqa: E402
-from bmh.groot_client.control import (  # noqa: E402
+import bmh.scripts.bmh_policy_client as script  # noqa: E402
+from bmh.policy_client.control import (  # noqa: E402
     FEEDBACK_STATUS_PREFIX,
     LOOP_STATUS_PREFIX,
     InferenceTarget,
     LoopSettings,
 )
-from bmh.scripts.bmh_groot_client import (  # noqa: E402
+from bmh.scripts.bmh_policy_client import (  # noqa: E402
     BmhInferenceConfig,
     PolicyConnectError,
     _blend_actions,
@@ -541,7 +541,7 @@ def test_late_chunk_warning_is_rate_limited(caplog):
 
 def test_startup_connect_failure_exits_without_a_worker():
     robot, adapter = _FakeRobot(), _FakeAdapter()
-    connect = _Connect(PolicyConnectError("Cannot reach GR00T policy server at h1:5555"))
+    connect = _Connect(PolicyConnectError("Cannot reach policy server at h1:5555"))
     with pytest.raises(SystemExit, match="Cannot reach"):
         _run_control_loop(robot, adapter, _ScriptedWatcher(), _target(1), _cfg(), connect)
     assert robot.sent == [] and adapter.policy is None
@@ -977,7 +977,7 @@ def fake_main(monkeypatch):
 
 def test_main_startup_connect_failure_disconnects_robot(fake_main):
     robot, _adapter, state = fake_main
-    state["connect"] = _Connect(PolicyConnectError("Cannot reach GR00T policy server at h1:5555"))
+    state["connect"] = _Connect(PolicyConnectError("Cannot reach policy server at h1:5555"))
     with pytest.raises(SystemExit, match="Cannot reach"):
         main(_cfg(lang_instruction="task A"))
     assert (robot.connected, robot.disconnected) == (1, 1)

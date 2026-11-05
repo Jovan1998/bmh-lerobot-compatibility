@@ -153,7 +153,7 @@ gamepad = ["lerobot[pygame-dep]", "hidapi>=0.14.0,<0.15.0"]
 hopejr = ["lerobot[feetech]", "lerobot[pygame-dep]"]
 lekiwi = ["lerobot[feetech]", "lerobot[pyzmq-dep]"]
 # BMH-101 network teleoperation (so_network_leader, bi_so_network_leader)
-# + GR00T N inference client (bmh-groot-client)
+# + the policy client for BMH policy servers, GR00T or SmolVLA (bmh-policy-client)
 bmh_network = [
     "lerobot[core_scripts]",
     "lerobot[feetech]",
@@ -298,7 +298,9 @@ lerobot-imgtransform-viz="lerobot.scripts.lerobot_imgtransform_viz:main"
 lerobot-edit-dataset="lerobot.scripts.lerobot_edit_dataset:main"
 lerobot-setup-can="lerobot.scripts.lerobot_setup_can:main"
 lerobot-rollout="lerobot.scripts.lerobot_rollout:main"
-bmh-groot-client="bmh.scripts.bmh_groot_client:main"
+bmh-policy-client="bmh.scripts.bmh_policy_client:main"
+# Deprecated alias of bmh-policy-client, kept for one release.
+bmh-groot-client="bmh.scripts.bmh_policy_client:main"
 bmh-center-arm="bmh.scripts.bmh_center_arm:main"
 bmh-record="bmh.scripts.bmh_record:main"
 bmh-read-pose="bmh.scripts.bmh_read_pose:main"
@@ -309,8 +311,8 @@ lerobot = ["envs/*.json"]
 
 [tool.setuptools.packages.find]
 # `bmh/` lives at the repo root (alongside `src/`) and ships the BMH-specific
-# scripts and GR00T inference client; including it here makes
-# `from bmh.groot_client...` importable and lets `bmh-groot-client` resolve
+# scripts and the BMH policy client; including it here makes
+# `from bmh.policy_client...` importable and lets `bmh-policy-client` resolve
 # as a setuptools entry point.
 where = ["src", "."]
 include = ["lerobot*", "bmh*"]
