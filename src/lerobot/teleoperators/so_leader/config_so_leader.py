@@ -32,6 +32,12 @@ class SOLeaderConfig:
     # BMH-101: head_pan/head_tilt (IDs 8/9) ride the LEFT arm's serial bus
     with_head: bool = False
 
+    # Number of extra attempts when a `sync_read` of the motors fails. Feetech buses can occasionally
+    # return a corrupted status packet ("Incorrect status packet!"), especially when several joints move
+    # at once, which otherwise aborts the teleoperation loop. Retries are immediate (no sleep) and only
+    # happen on failure, so the steady-state read cost is unchanged.
+    num_read_retries: int = 2
+
 
 @TeleoperatorConfig.register_subclass("so101_leader")
 @TeleoperatorConfig.register_subclass("so100_leader")

@@ -7,12 +7,14 @@ import pytest
 
 # `lerobot.scripts.lerobot_record` needs the `datasets` extra (not in the Mac dev venv; the Pi has it).
 pytest.importorskip("datasets")
+pytestmark = pytest.mark.dataset
 
 from bmh.scripts.bmh_record import load_record_config, main  # noqa: E402
-from lerobot.cameras.opencv import OpenCVCameraConfig
-from lerobot.robots.bi_so_follower import BiSOFollowerConfig
-from lerobot.scripts.lerobot_record import RecordConfig
-from lerobot.teleoperators.bi_so_network_leader import BiSONetworkLeaderConfig
+from lerobot.cameras.opencv import OpenCVCameraConfig  # noqa: E402
+from lerobot.configs import RGBEncoderConfig  # noqa: E402
+from lerobot.robots.bi_so_follower import BiSOFollowerConfig  # noqa: E402
+from lerobot.scripts.lerobot_record import RecordConfig  # noqa: E402
+from lerobot.teleoperators.bi_so_network_leader import BiSONetworkLeaderConfig  # noqa: E402
 
 CONFIG = {
     "robot": {
@@ -62,8 +64,8 @@ CONFIG = {
         "episode_time_s": 600,
         "encoder_threads": 4,
         "video_encoding_batch_size": 50,
-        "crf": 25,
-        "g": 6,
+        # Upstream `DatasetRecordConfig.rgb_encoder` (lerobot 0.6); only the keys the controller-app sets.
+        "rgb_encoder": {"crf": 25, "g": 6},
         "push_to_hub": False,
     },
     "resume": False,
@@ -101,10 +103,26 @@ def test_load_record_config_decodes_registry_types(config_path):
     assert cfg.dataset.repo_id == "local/my-set"
     assert cfg.dataset.single_task == "Place the toast"
     assert cfg.dataset.video_encoding_batch_size == 50
-    assert cfg.dataset.crf == 25 and cfg.dataset.g == 6
+    assert isinstance(cfg.dataset.rgb_encoder, RGBEncoderConfig)
+    assert cfg.dataset.rgb_encoder.crf == 25 and cfg.dataset.rgb_encoder.g == 6
+    assert cfg.dataset.encoder_threads == 4
     # omitted keys keep lerobot's defaults
-    assert cfg.dataset.vcodec == "libsvtav1" and cfg.dataset.preset is None
+    assert cfg.dataset.rgb_encoder.vcodec == "libsvtav1"
+    assert cfg.dataset.rgb_encoder.preset == 12  # libsvtav1 default preset
+    assert cfg.dataset.rgb_encoder.pix_fmt == "yuv420p"
     assert cfg.resume is False and cfg.play_sounds is False
+
+
+def test_flat_encoder_keys_are_rejected(tmp_path):
+    """The pre-0.6 BMH fields (`dataset.crf` / `g` / `preset` / `vcodec`) are gone: an old
+    controller-app config fails loudly instead of silently recording with default quality."""
+    data = json.loads(json.dumps(CONFIG))
+    data["dataset"].pop("rgb_encoder")
+    data["dataset"]["crf"] = 25
+    p = tmp_path / "old-shape.json"
+    p.write_text(json.dumps(data))
+    with pytest.raises(Exception, match="crf"):
+        load_record_config(p)
 
 
 def test_load_record_config_rejects_non_object(tmp_path):

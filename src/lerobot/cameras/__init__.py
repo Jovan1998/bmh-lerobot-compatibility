@@ -12,7 +12,7 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-from .camera import Camera
+from .camera import Camera, DepthCamera
 from .configs import CameraConfig, ColorMode, Cv2Backends, Cv2Rotation
 from .utils import connect_cameras, make_cameras_from_configs
 
@@ -26,6 +26,7 @@ __all__ = [
     "ColorMode",
     "Cv2Backends",
     "Cv2Rotation",
+    "DepthCamera",
     "connect_cameras",
     "make_cameras_from_configs",
 ]

@@ -10,6 +10,7 @@ import numpy as np
 import pytest
 from PIL import Image
 
+from lerobot.configs import RGBEncoderConfig
 from lerobot.datasets.image_writer import VIDEO_FRAME_JPEG_QUALITY, write_image
 from lerobot.datasets.utils import DEFAULT_IMAGE_PATH, DEFAULT_VIDEO_FRAME_PATH
 from lerobot.datasets.video_utils import encode_video_frames
@@ -59,7 +60,7 @@ def test_encode_video_frames_accepts_jpg_frames(tmp_path):
     for i in range(n):
         write_image(_frame(seed=i), imgs_dir / f"frame-{i:06d}.jpg")
     out = tmp_path / "out.mp4"
-    encode_video_frames(imgs_dir, out, fps=30, vcodec="h264", g=2, crf=23)
+    encode_video_frames(imgs_dir, out, fps=30, video_encoder=RGBEncoderConfig(vcodec="h264", g=2, crf=23))
     assert out.exists() and out.stat().st_size > 0
 
 
@@ -101,7 +102,7 @@ def test_encode_video_frames_orders_mixed_png_and_jpg_by_index(tmp_path, monkeyp
         def __exit__(self, *_):
             return False
 
-    def fake_av_open(path, mode):
+    def fake_av_open(path, mode, **_kwargs):
         Path(path).write_bytes(b"x")
         return _Out()
 

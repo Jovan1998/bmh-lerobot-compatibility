@@ -25,8 +25,8 @@ import os
 import time
 from typing import Any
 
-import cv2  # type: ignore  # TODO: add type stubs for OpenCV
-from numpy.typing import NDArray  # type: ignore  # TODO: add type stubs for numpy.typing
+import cv2
+from numpy.typing import NDArray
 
 logger = logging.getLogger(__name__)
 

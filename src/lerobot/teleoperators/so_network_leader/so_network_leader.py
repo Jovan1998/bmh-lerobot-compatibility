@@ -1,6 +1,7 @@
 import json
 import logging
 from functools import cached_property
+from typing import Any
 
 from lerobot.teleoperators.teleoperator import Teleoperator
 from lerobot.utils.decorators import check_if_already_connected, check_if_not_connected
@@ -42,10 +43,12 @@ class SONetworkLeader(Teleoperator):
         super().__init__(config)
         self.config = config
 
-        self.zmq_context = None
-        self.zmq_socket = None
+        # zmq is imported lazily in connect(), so these stay untyped here.
+        self.zmq_context: Any = None
+        self.zmq_socket: Any = None
         self._is_connected = False
-        self._last_action: dict[str, float] | None = None
+        # Set from the first message in connect(); get_action() is only reachable after that.
+        self._last_action: dict[str, float] = {}
 
     @cached_property
     def action_features(self) -> dict[str, type]:

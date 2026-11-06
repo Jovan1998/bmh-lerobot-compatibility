@@ -19,6 +19,7 @@ from pathlib import Path
 from unittest.mock import patch
 
 import numpy as np
+import pandas as pd
 import pyarrow.parquet as pq
 import pytest
 import torch
@@ -26,10 +27,13 @@ from PIL import Image
 
 pytest.importorskip("datasets", reason="datasets is required (install lerobot[dataset])")
 
+from lerobot.configs import VideoEncoderConfig
 from lerobot.datasets.dataset_writer import _encode_video_worker
 from lerobot.datasets.lerobot_dataset import LeRobotDataset
 from lerobot.datasets.utils import DEFAULT_IMAGE_PATH
 from tests.fixtures.constants import DEFAULT_FPS, DUMMY_REPO_ID
+
+pytestmark = pytest.mark.dataset
 
 SIMPLE_FEATURES = {
     "state": {"dtype": "float32", "shape": (6,), "names": None},
@@ -53,8 +57,8 @@ def _make_frame(features: dict, task: str = "Dummy task") -> dict:
 # ── Existing encode_video_worker tests ───────────────────────────────
 
 
-def test_encode_video_worker_forwards_vcodec(tmp_path):
-    """_encode_video_worker correctly forwards the vcodec parameter."""
+def test_encode_video_worker_forwards_video_encoder(tmp_path):
+    """_encode_video_worker forwards video_encoder to encode_video_frames."""
     video_key = "observation.images.laptop"
     fpath = DEFAULT_IMAGE_PATH.format(image_key=video_key, episode_index=0, frame_index=0)
     img_dir = tmp_path / Path(fpath).parent
@@ -69,13 +73,21 @@ def test_encode_video_worker_forwards_vcodec(tmp_path):
         Path(video_path).touch()
 
     with patch("lerobot.datasets.dataset_writer.encode_video_frames", side_effect=mock_encode):
-        _encode_video_worker(video_key, 0, tmp_path, fps=30, vcodec="h264")
+        _encode_video_worker(
+            video_key,
+            0,
+            tmp_path,
+            fps=30,
+            video_encoder=VideoEncoderConfig(vcodec="h264", preset=None),
+            encoder_threads=4,
+        )
 
-    assert captured_kwargs["vcodec"] == "h264"
+    assert captured_kwargs["video_encoder"].vcodec == "h264"
+    assert captured_kwargs["encoder_threads"] == 4
 
 
-def test_encode_video_worker_default_vcodec(tmp_path):
-    """_encode_video_worker uses libsvtav1 as the default codec."""
+def test_encode_video_worker_default_video_encoder(tmp_path):
+    """_encode_video_worker passes None video_encoder which encode_video_frames defaults."""
     video_key = "observation.images.laptop"
     fpath = DEFAULT_IMAGE_PATH.format(image_key=video_key, episode_index=0, frame_index=0)
     img_dir = tmp_path / Path(fpath).parent
@@ -92,7 +104,8 @@ def test_encode_video_worker_default_vcodec(tmp_path):
     with patch("lerobot.datasets.dataset_writer.encode_video_frames", side_effect=mock_encode):
         _encode_video_worker(video_key, 0, tmp_path, fps=30)
 
-    assert captured_kwargs["vcodec"] == "libsvtav1"
+    assert captured_kwargs["video_encoder"] is None
+    assert captured_kwargs["encoder_threads"] is None
 
 
 # ── add_frame contracts ──────────────────────────────────────────────
@@ -193,6 +206,74 @@ def test_clear_resets_buffer(tmp_path):
 
     dataset.clear_episode_buffer()
     assert dataset.writer.episode_buffer["size"] == 0
+
+
+def test_clear_removes_video_frame_staging_dir(tmp_path):
+    """clear_episode_buffer() removes PNG staging dirs for video features."""
+    video_key = "observation.images.cam"
+    features = {
+        video_key: {
+            "dtype": "video",
+            "shape": (64, 96, 3),
+            "names": ["height", "width", "channels"],
+        },
+        "action": {"dtype": "float32", "shape": (2,), "names": None},
+    }
+    dataset = LeRobotDataset.create(
+        repo_id=DUMMY_REPO_ID,
+        fps=DEFAULT_FPS,
+        features=features,
+        root=tmp_path / "ds",
+        use_videos=True,
+    )
+
+    dataset.add_frame(_make_frame(features))
+    video_staging_dir = (
+        dataset.root
+        / Path(DEFAULT_IMAGE_PATH.format(image_key=video_key, episode_index=0, frame_index=0)).parent
+    )
+    assert video_staging_dir.is_dir()
+
+    dataset.clear_episode_buffer()
+
+    assert dataset.writer.episode_buffer["size"] == 0
+    assert not video_staging_dir.exists()
+
+
+def test_batched_encoding_staging_survives_save(tmp_path):
+    """The post-save clear must NOT delete video staging frames.
+
+    With ``batch_encoding_size > 1`` the frames of already-saved episodes stay
+    on disk until the batch encode runs; the encoder deletes them afterwards.
+    A blanket switch of the post-save cleanup to ``camera_keys`` (as done in the
+    discard path) would silently break batched encoding.
+    """
+    video_key = "observation.images.cam"
+    features = {
+        video_key: {
+            "dtype": "video",
+            "shape": (64, 96, 3),
+            "names": ["height", "width", "channels"],
+        },
+        "action": {"dtype": "float32", "shape": (2,), "names": None},
+    }
+    dataset = LeRobotDataset.create(
+        repo_id=DUMMY_REPO_ID,
+        fps=DEFAULT_FPS,
+        features=features,
+        root=tmp_path / "ds",
+        use_videos=True,
+        batch_encoding_size=2,
+    )
+    for _ in range(3):
+        dataset.add_frame(_make_frame(features))
+
+    staging_dir = dataset.writer._get_image_file_dir(0, video_key)
+    assert staging_dir.is_dir()
+
+    dataset.save_episode()  # first of a batch of 2: no encoding yet
+
+    assert staging_dir.is_dir() and any(staging_dir.iterdir())
 
 
 def test_finalize_is_idempotent(tmp_path):
@@ -340,3 +421,61 @@ def test_batch_encode_checkpoints_parquet_before_encoding(tmp_path):
     assert len(_data_parquet_files(root)) == 2
     assert dataset.meta.total_episodes == 3
     assert dataset.meta.total_frames == 9
+
+
+def _episodes_on_disk(root: Path) -> pd.DataFrame:
+    """Every row of every episodes-metadata parquet, in file order."""
+    files = sorted((root / "meta" / "episodes").rglob("*.parquet"))
+    return pd.concat([pd.read_parquet(f) for f in files], ignore_index=True)
+
+
+def test_batch_encode_episode_metadata_has_one_row_per_episode(tmp_path):
+    """Batched encoding over batches that don't start at episode 0 must not create phantom rows.
+
+    BMH fixes in `_batch_save_episode_video`: flush + reload the episodes metadata before
+    looking up the batch, address the episodes parquet by `meta/episodes/*` (not `data/*`),
+    align on `episode_index` before `combine_first`, and write without the pandas index.
+    """
+    root = tmp_path / "ds"
+    video_key = "observation.images.cam"
+    dataset = LeRobotDataset.create(
+        repo_id=DUMMY_REPO_ID,
+        fps=DEFAULT_FPS,
+        features=VIDEO_FEATURES,
+        root=root,
+        batch_encoding_size=2,
+    )
+    encoded: list[int] = []
+
+    def fake_save_episode_video(video_key: str, episode_index: int, temp_path=None) -> dict:
+        encoded.append(episode_index)
+        return {
+            "episode_index": episode_index,
+            f"videos/{video_key}/chunk_index": 0,
+            f"videos/{video_key}/file_index": 0,
+            f"videos/{video_key}/from_timestamp": float(episode_index),
+            f"videos/{video_key}/to_timestamp": float(episode_index) + 0.1,
+        }
+
+    with patch.object(dataset.writer, "_save_episode_video", side_effect=fake_save_episode_video):
+        for _ in range(5):
+            for _ in range(3):
+                dataset.add_frame(_make_frame(VIDEO_FEATURES))
+            dataset.save_episode()
+        dataset.finalize()
+
+    # Batches [0, 1], [2, 3], then the leftover [4] at finalize().
+    assert encoded == [0, 1, 2, 3, 4]
+    assert dataset.meta.total_episodes == 5
+    assert dataset.meta.total_frames == 15
+
+    episodes = _episodes_on_disk(root)
+    assert sorted(episodes["episode_index"].tolist()) == [0, 1, 2, 3, 4]
+    assert "__index_level_0__" not in episodes.columns
+    for col in ("chunk_index", "file_index", "from_timestamp", "to_timestamp"):
+        assert episodes[f"videos/{video_key}/{col}"].notna().all(), col
+    # Each episode carries its own video metadata, not a neighbour's.
+    by_ep = episodes.set_index("episode_index")
+    for ep in range(5):
+        assert by_ep.loc[ep, f"videos/{video_key}/from_timestamp"] == float(ep)
+        assert by_ep.loc[ep, "length"] == 3
