@@ -7,11 +7,15 @@ The controller-app ends episodes with SIGUSR1 (see `test_recording_signals.py`).
   start of every episode;
 * a stop/next signal on the very first tick leaves an empty episode buffer — `record()` must
   skip `save_episode()` (which raises on an empty buffer) instead of crashing the session.
+
+And Stop: the controller-app sends SIGTERM, which must save the last episode (see the bottom).
 """
 
 import contextlib
 import logging
+import os
 import signal
+import time
 from unittest.mock import MagicMock, patch
 
 import pytest
@@ -88,8 +92,9 @@ def _cfg(tmp_path, num_episodes: int) -> RecordConfig:
     )
 
 
-def _run_record(tmp_path, num_episodes: int, episode_loop):
-    """Run `record()` with fakes; `episode_loop(events, dataset)` plays one recording loop.
+def _run_record(tmp_path, num_episodes: int, episode_loop, reset_loop=None):
+    """Run `record()` with fakes; `episode_loop(events, dataset)` plays one recording loop and
+    `reset_loop(events)` (optional) one reset phase.
 
     Returns `(dataset, events, exit_early_at_episode_start)`.
     """
@@ -99,6 +104,8 @@ def _run_record(tmp_path, num_episodes: int, episode_loop):
 
     def fake_record_loop(*, events, dataset=None, **_kwargs):
         if dataset is None:  # reset phase: no frames recorded
+            if reset_loop is not None:
+                reset_loop(events)
             return
         seen_at_start.append(events["exit_early"])
         episode_loop(events, dataset)
@@ -179,3 +186,70 @@ def test_stop_on_first_tick_ends_session_without_saving(tmp_path):
 
     assert seen_at_start == [False]
     assert dataset.saved == []
+
+
+# --- Stop from the controller-app ---------------------------------------------------------
+#
+# `record()` saves an episode only when the reset phase after it ends. The controller-app's
+# Stop sends SIGTERM once recording runs: the fork's graceful stop, which must keep the
+# episode just finished (Stop in the reset phase) or in progress (Stop mid-episode).
+
+
+def _send(sig: int) -> None:
+    os.kill(os.getpid(), sig)
+    time.sleep(0.01)  # the handler runs on the main thread at the next signal check
+
+
+def _record_three_frames_then_next(events, dataset):
+    for _ in range(3):
+        dataset.add_frame()
+    _send(signal.SIGUSR1)  # "Next episode" in the UI
+
+
+def test_sigterm_in_reset_phase_saves_the_finished_episode(tmp_path):
+    resets = []
+
+    def reset_loop(events):
+        resets.append(dict(events))
+        _send(signal.SIGTERM)  # Stop while the operator resets the scene
+
+    dataset, events, _ = _run_record(
+        tmp_path, num_episodes=5, episode_loop=_record_three_frames_then_next, reset_loop=reset_loop
+    )
+
+    assert len(resets) == 1
+    assert dataset.saved == [3]
+    assert events["stop_recording"] is True
+
+
+def test_sigterm_mid_episode_saves_it_and_skips_the_reset(tmp_path):
+    resets = []
+
+    def episode_loop(events, dataset):
+        for _ in range(2):
+            dataset.add_frame()
+        _send(signal.SIGTERM)
+
+    dataset, _, _ = _run_record(
+        tmp_path, num_episodes=5, episode_loop=episode_loop, reset_loop=lambda events: resets.append(1)
+    )
+
+    assert dataset.saved == [2]
+    assert resets == []
+
+
+def test_sigint_in_reset_phase_drops_the_finished_episode(tmp_path):
+    """Why Stop no longer sends SIGINT once recording runs: the episode is still unsaved."""
+    datasets = []
+
+    def episode_loop(events, dataset):
+        datasets.append(dataset)
+        _record_three_frames_then_next(events, dataset)
+
+    def reset_loop(events):
+        raise KeyboardInterrupt  # what SIGINT does inside the reset loop
+
+    with pytest.raises(KeyboardInterrupt):
+        _run_record(tmp_path, num_episodes=5, episode_loop=episode_loop, reset_loop=reset_loop)
+
+    assert datasets[0].saved == []
