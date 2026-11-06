@@ -25,6 +25,9 @@ from .config_so_leader import SOLeaderTeleopConfig
 
 logger = logging.getLogger(__name__)
 
+# BMH: attempts after a missed reply when `configure()` turns the torque off.
+_TORQUE_RETRIES = 5
+
 _HOMING_POSITION_DIAGRAM = r"""
        ╭─────┬────────────────────┬──────╮ ◉╲═════╗   ← moveable claw
        │     │      forearm       │  ▤▤  │╤══╲════╝
@@ -128,7 +131,9 @@ class SOLeader(Teleoperator):
         print("Calibration saved to", self.calibration_fpath)
 
     def configure(self) -> None:
-        self.bus.disable_torque()
+        # BMH: retry a missed reply instead of aborting the leader host's startup
+        # (same count as SOFollower.configure).
+        self.bus.disable_torque(num_retry=_TORQUE_RETRIES)
         self.bus.configure_motors()
         self.bus.set_operating_mode("position")
 

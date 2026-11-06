@@ -29,6 +29,12 @@ from .config_so_follower import SOFollowerRobotConfig
 
 logger = logging.getLogger(__name__)
 
+# BMH: attempts after a missed reply when the torque goes off and back on in `configure()`
+# (as many as `SerialMotorsBus.disconnect` gives its torque-off). On the BMH-101 a servo
+# sometimes misses the torque-on reply as every motor starts drawing current at once, and
+# one miss used to abort teleop / recording / inference at startup.
+_TORQUE_RETRIES = 5
+
 _HOMING_POSITION_DIAGRAM = r"""
        ╭─────┬────────────────────┬──────╮ ◉╲═════╗   ← moveable claw
        │     │      forearm       │  ▤▤  │╤══╲════╝   ← fixed claw
@@ -162,7 +168,7 @@ class SOFollower(Robot):
         print("Calibration saved to", self.calibration_fpath)
 
     def configure(self) -> None:
-        with self.bus.torque_disabled():
+        with self.bus.torque_disabled(num_retry=_TORQUE_RETRIES):
             self.bus.configure_motors()
             for motor in self.bus.motors:
                 self.bus.set_operating_mode("position", motor)

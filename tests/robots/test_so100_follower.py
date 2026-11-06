@@ -41,7 +41,7 @@ def _make_bus_mock() -> MagicMock:
     bus.disconnect.side_effect = _disconnect
 
     @contextmanager
-    def _dummy_cm():
+    def _dummy_cm(*_args, **_kwargs):
         yield
 
     bus.torque_disabled.side_effect = _dummy_cm
@@ -149,6 +149,17 @@ def test_connect_without_calibration_file_runs_calibrate(tmp_path):
 
         calibrate_mock.assert_called_once_with()
         robot.bus.write_calibration.assert_not_called()
+
+
+_REAL_CONFIGURE = SO100Follower.configure  # the fixtures replace it with a no-op
+
+
+def test_configure_retries_the_torque_changes(follower):
+    # BMH: a servo sometimes misses the torque-on reply when every motor starts drawing
+    # current at once; one miss used to abort teleop / recording / inference at startup.
+    _REAL_CONFIGURE(follower)
+
+    follower.bus.torque_disabled.assert_called_once_with(num_retry=5)
 
 
 def test_connect_disconnect(follower):

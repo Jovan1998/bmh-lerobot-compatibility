@@ -552,6 +552,34 @@ def test_setup_motors_asks_for_one_motor_at_a_time(motors, order, bus, monkeypat
     assert f"'{order[0]}' motor id set to {bus.motors[order[0]].id}" in capsys.readouterr().out
 
 
+# --- BMH: torque retries -------------------------------------------------------------------
+
+
+def test_torque_disabled_retries_both_torque_changes(arm):
+    """`num_retry` reaches rustypot's set_torque for the torque-off and the torque-on."""
+    with arm.torque_disabled(num_retry=5):
+        assert [(enabled, retries) for _, enabled, retries in arm._bus.torques] == [(False, 5)]
+
+    assert [(ids, enabled, retries) for ids, enabled, retries in arm._bus.torques] == [
+        ([1, 2, 3], False, 5),
+        ([1, 2, 3], True, 5),
+    ]
+
+
+def test_torque_disabled_does_not_retry_by_default(arm):
+    with arm.torque_disabled():
+        pass
+
+    assert [retries for *_, retries in arm._bus.torques] == [0, 0]
+
+
+def test_torque_disabled_still_turns_the_torque_on_when_the_block_raises(arm):
+    with pytest.raises(RuntimeError, match="boom"), arm.torque_disabled(num_retry=2):
+        raise RuntimeError("boom")
+
+    assert [(enabled, retries) for _, enabled, retries in arm._bus.torques] == [(False, 2), (True, 2)]
+
+
 # --- BMH: centered homings -----------------------------------------------------------------
 
 

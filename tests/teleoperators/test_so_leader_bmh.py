@@ -97,6 +97,16 @@ def _calibration_file(motors: list[str]) -> dict:
 # --- motor layout ------------------------------------------------------------------------
 
 
+_REAL_CONFIGURE = SO101Leader.configure  # `_patched_leader` replaces it with a no-op
+
+
+def test_configure_retries_the_torque_off(tmp_path):
+    with _patched_leader(tmp_path) as leader:
+        _REAL_CONFIGURE(leader)
+
+        leader.bus.disable_torque.assert_called_once_with(num_retry=5)
+
+
 def test_motor_layout(tmp_path):
     # BMH-101 arm: 7 motors, IDs 7 (shoulder_pan) down to 1 (gripper), no head by default
     with _patched_leader(tmp_path) as leader:
