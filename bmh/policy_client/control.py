@@ -64,7 +64,7 @@ travel back the same way, as a line kind of their own — ``BMH_FEEDBACK {json}`
 Loop settings — how far ahead the client plays (``action_horizon``), when it asks for
 the next chunk (``refetch_after``), how fast it plays (``speed_pct`` of the recorded
 fps) and how the action stream is shaped on its way to the servos (``blend_frames``,
-``smoothing_pct``, ``weight_pct``) — come through a second file of their own
+``smoothing_pct``) — come through a second file of their own
 (``~/.cache/bmh-101/inference-loop.json``), written the same way (tmp + rename) and
 watched the same way (:class:`LoopFileWatcher`). Its ``seq`` is independent of the
 target's: a settings change never re-requests a chunk and never counts as a new target.
@@ -74,12 +74,12 @@ are required ints:
 .. code-block:: json
 
     {"seq": 3, "action_horizon": 24, "refetch_after": 10, "speed_pct": 100,
-     "blend_frames": 4, "smoothing_pct": 0, "weight_pct": 0}
+     "blend_frames": 4, "smoothing_pct": 0}
 
 ``blend_frames`` (0..10) is how many actions of each new chunk are crossfaded with the
-old chunk at the seam, read at the next chunk swap. ``smoothing_pct`` and ``weight_pct``
-(0..100, 0 = off) drive ``bmh/policy_client/motion.py::MotionShaper`` — a speed-gated
-low-pass and an acceleration limit — from the next tick on.
+old chunk at the seam, read at the next chunk swap. ``smoothing_pct`` (0..100, 0 = off)
+drives ``bmh/policy_client/motion.py::MotionShaper`` — a speed-gated low-pass — from the
+next tick on.
 
 The client answers each decided ``seq`` (and the startup read) with one
 ``BMH_LOOP {json}`` line (see :func:`format_loop_status`). A document that breaks a rule
@@ -99,8 +99,6 @@ import os
 from collections.abc import Mapping
 from dataclasses import dataclass, field
 from pathlib import Path
-
-from .motion import MotionParams
 
 logger = logging.getLogger(__name__)
 
@@ -124,7 +122,7 @@ LOOP_SPEED_PCT_MIN = 50
 LOOP_SPEED_PCT_MAX = 150
 # The app's slider stops at 6; the client accepts a little more.
 LOOP_BLEND_MAX = 10
-# `smoothing_pct` and `weight_pct` are in [0, LOOP_PCT_MAX].
+# `smoothing_pct` is in [0, LOOP_PCT_MAX].
 LOOP_PCT_MAX = 100
 _LOOP_KEYS = (
     "seq",
@@ -133,7 +131,6 @@ _LOOP_KEYS = (
     "speed_pct",
     "blend_frames",
     "smoothing_pct",
-    "weight_pct",
 )
 
 # Signature reported for a missing control file (never collides with a real stat).
@@ -298,7 +295,6 @@ class LoopSettings:
         blend_frames: Leading actions of a new chunk crossfaded with the old chunk's
             tail at the swap (0 = switch hard). Clamped to the overlap at the swap.
         smoothing_pct: Speed-gated low-pass strength (0 = off), see :mod:`.motion`.
-        weight_pct: Acceleration limit (0 = off, higher = heavier), see :mod:`.motion`.
     """
 
     seq: int
@@ -307,15 +303,10 @@ class LoopSettings:
     speed_pct: int = 100
     blend_frames: int = 3
     smoothing_pct: int = 0
-    weight_pct: int = 0
 
     def period_s(self, fps: int) -> float:
         """Seconds per control tick: ``1 / (fps * speed_pct / 100)``."""
         return 100.0 / (fps * self.speed_pct)
-
-    def motion(self) -> MotionParams:
-        """The two motion sliders, for ``MotionShaper``."""
-        return MotionParams(smoothing_pct=self.smoothing_pct, weight_pct=self.weight_pct)
 
 
 def parse_loop_settings(data: object) -> LoopSettings:
@@ -331,8 +322,7 @@ def parse_loop_settings(data: object) -> LoopSettings:
         ValueError: If a key is missing, is not an int (bools and floats are rejected),
             or is out of range: ``seq >= 0``, ``1 <= action_horizon <= 60``,
             ``1 <= refetch_after < action_horizon``, ``50 <= speed_pct <= 150``,
-            ``0 <= blend_frames <= 10``, ``0 <= smoothing_pct <= 100``,
-            ``0 <= weight_pct <= 100``.
+            ``0 <= blend_frames <= 10``, ``0 <= smoothing_pct <= 100``.
     """
     if not isinstance(data, dict):
         raise ValueError(f"expected a JSON object, got {type(data).__name__}")
@@ -348,7 +338,6 @@ def parse_loop_settings(data: object) -> LoopSettings:
         speed_pct=data["speed_pct"],
         blend_frames=data["blend_frames"],
         smoothing_pct=data["smoothing_pct"],
-        weight_pct=data["weight_pct"],
     )
     if settings.seq < 0:
         raise ValueError(f"'seq' must be a non-negative integer, got {settings.seq}")
@@ -375,8 +364,6 @@ def _check_loop_rules(settings: LoopSettings) -> str | None:
         return f"blend_frames must be in [0, {LOOP_BLEND_MAX}], got {settings.blend_frames}"
     if not 0 <= settings.smoothing_pct <= LOOP_PCT_MAX:
         return f"smoothing_pct must be in [0, {LOOP_PCT_MAX}], got {settings.smoothing_pct}"
-    if not 0 <= settings.weight_pct <= LOOP_PCT_MAX:
-        return f"weight_pct must be in [0, {LOOP_PCT_MAX}], got {settings.weight_pct}"
     return None
 
 
@@ -385,7 +372,7 @@ def validate_loop_settings(settings: LoopSettings) -> str | None:
 
     One rule set for the startup settings (loop file or CLI flags) and for every live
     change: ``1 <= refetch_after < action_horizon``, ``50 <= speed_pct <= 150``,
-    ``0 <= blend_frames <= 10`` and ``0 <= smoothing_pct, weight_pct <= 100``. CLI values
+    ``0 <= blend_frames <= 10`` and ``0 <= smoothing_pct <= 100``. CLI values
     never went through :func:`parse_loop_settings`, so they are checked here. A blend
     longer than the horizon is fine: the swap clamps it to the overlap.
 
@@ -417,7 +404,6 @@ def format_loop_status(settings: LoopSettings, accepted: bool, error: str | None
             "speed_pct": settings.speed_pct,
             "blend_frames": settings.blend_frames,
             "smoothing_pct": settings.smoothing_pct,
-            "weight_pct": settings.weight_pct,
         }
     )
 

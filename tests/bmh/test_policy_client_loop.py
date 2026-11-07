@@ -40,7 +40,7 @@ from bmh.policy_client.control import (  # noqa: E402
     InferenceTarget,
     LoopSettings,
 )
-from bmh.policy_client.motion import MotionParams  # noqa: E402
+from bmh.policy_client.motion import MotionShaper  # noqa: E402
 from bmh.scripts.bmh_policy_client import (  # noqa: E402
     BmhInferenceConfig,
     PolicyConnectError,
@@ -746,10 +746,9 @@ def _settings(
     speed: int = 100,
     blend: int = 0,
     smoothing: int = 0,
-    weight: int = 0,
 ) -> LoopSettings:
     # Blend 0 like `_cfg`, so a live change keeps every sent action traceable to its chunk.
-    return LoopSettings(seq, horizon, refetch, speed, blend, smoothing, weight)
+    return LoopSettings(seq, horizon, refetch, speed, blend, smoothing)
 
 
 def _loop_lines(caplog) -> list[dict]:
@@ -767,7 +766,6 @@ def _loop_line(
     error=None,
     blend: int = 0,
     smoothing: int = 0,
-    weight: int = 0,
 ) -> dict:
     return {
         "seq": seq,
@@ -778,7 +776,6 @@ def _loop_line(
         "speed_pct": speed,
         "blend_frames": blend,
         "smoothing_pct": smoothing,
-        "weight_pct": weight,
     }
 
 
@@ -791,7 +788,6 @@ def _loop_doc(seq: int, horizon: int = HORIZON, refetch: int = 3, speed: int = 1
         "speed_pct": speed,
         "blend_frames": motion.get("blend_frames", 0),
         "smoothing_pct": motion.get("smoothing_pct", 0),
-        "weight_pct": motion.get("weight_pct", 0),
     }
 
 
@@ -908,7 +904,7 @@ def test_bad_loop_settings_are_rejected_whole_and_change_nothing(monkeypatch, ca
         {
             10: lambda: _settings(1, speed=150, blend=11),  # blend_frames > 10
             20: lambda: _settings(2, horizon=HORIZON, refetch=HORIZON, speed=150),  # refetch >= horizon
-            25: lambda: _settings(3, speed=150, smoothing=101, weight=50),  # smoothing_pct > 100
+            25: lambda: _settings(3, speed=150, smoothing=101),  # smoothing_pct > 100
             30: lambda: _settings(4, speed=150),  # a good one still applies afterwards
         }
     )
@@ -1010,8 +1006,7 @@ def test_a_real_loop_file_rewritten_mid_run_applies_on_that_tick(tmp_path, monke
 
 # --------------------------------------------------------------------------- motion shaping
 
-# Weight 100 % at fps=200: the acceleration cap and the per-tick velocity change it allows.
-WEIGHT_100_ACCEL = MotionParams(0, 100).accel_limit()
+# The control tick at fps=200 (`_cfg`).
 DT_200 = 1 / 200
 
 
@@ -1028,9 +1023,11 @@ def _jump(n: int, _i: int) -> float:
     return 0.0 if n == 1 else 10.0
 
 
-def _velocity_changes(values: list[float], dt: float) -> list[float]:
-    v = [(b - a) / dt for a, b in zip(values, values[1:], strict=False)]
-    return [b - a for a, b in zip(v, v[1:], strict=False)]
+def _first_smoothed_step(start: dict[str, float], target: float) -> dict[str, float]:
+    """What smoothing 100 % sends on the first tick from rest at `start` towards `target`."""
+    shaper = MotionShaper(100)
+    shaper.reset(start)
+    return shaper.step(dict.fromkeys(start, target), DT_200)
 
 
 def test_blend_frames_change_live_at_the_next_swap(caplog):
@@ -1056,7 +1053,7 @@ def test_blend_frames_change_live_at_the_next_swap(caplog):
     assert before and set(before) == {0}
     assert during and set(during) == {2}
     assert after and set(after) == {0}
-    assert "blend=2 smoothing=0% weight=0%" in caplog.text
+    assert "blend=2 smoothing=0%" in caplog.text
 
 
 def test_a_blend_as_long_as_the_horizon_is_accepted(caplog):
@@ -1072,7 +1069,7 @@ def test_a_blend_as_long_as_the_horizon_is_accepted(caplog):
 
 
 def test_motion_settings_change_is_reported(caplog):
-    loop = _ScriptedLoopWatcher({10: lambda: _settings(1, blend=2, smoothing=40, weight=70)})
+    loop = _ScriptedLoopWatcher({10: lambda: _settings(1, blend=2, smoothing=40)})
     with caplog.at_level("INFO"):
         _run_control_loop(
             _FakeRobot(),
@@ -1085,11 +1082,11 @@ def test_motion_settings_change_is_reported(caplog):
         )
     assert _loop_lines(caplog) == [
         _loop_line(0, True, HORIZON, 3, 100),
-        _loop_line(1, True, HORIZON, 3, 100, blend=2, smoothing=40, weight=70),
+        _loop_line(1, True, HORIZON, 3, 100, blend=2, smoothing=40),
     ]
     assert (
         f"loop settings #1 applied: horizon={HORIZON} refetch_after=3 speed=100% "
-        "blend=2 smoothing=40% weight=70%" in caplog.text
+        "blend=2 smoothing=40%" in caplog.text
     )
 
 
@@ -1112,26 +1109,9 @@ def test_smoothing_turns_a_jump_into_a_monotonic_approach():
     assert _joints_only(robot)
 
 
-def test_weight_caps_the_acceleration_of_what_reaches_the_robot():
-    robot = _FakeRobot()
-    _run_control_loop(
-        robot,
-        _FakeAdapter(value=_jump),
-        _ScriptedWatcher(),
-        _target(1),
-        _cfg(),
-        _Connect(),
-        settings=_settings(0, weight=100),
-    )
-    values = [a["j"] for a in robot.sent]
-    assert max(abs(dv) for dv in _velocity_changes(values, DT_200)) <= WEIGHT_100_ACCEL * DT_200 + 1e-6
-    assert 0.0 < values[-1] < 10.0  # under way, accelerating gently
-    assert all(b >= a for a, b in zip(values, values[1:], strict=False))
-
-
-def test_weight_keeps_settling_onto_the_last_command_while_a_chunk_is_late(caplog):
+def test_smoothing_keeps_settling_onto_the_last_command_while_a_chunk_is_late(caplog):
     # Request 2 hangs until the last tick: the bootstrap chunk ends at tick 8 and the
-    # heavy arm, far behind its command, keeps approaching it instead of stopping dead.
+    # smoothed arm, far behind its command, keeps approaching it instead of stopping dead.
     gate = threading.Event()
     robot = _FakeRobot()
     adapter = _FakeAdapter(gates={2: gate}, value=lambda _n, i: 0.0 if i == 0 else 10.0)
@@ -1143,17 +1123,17 @@ def test_weight_keeps_settling_onto_the_last_command_while_a_chunk_is_late(caplo
             _target(1),
             _cfg(),
             _Connect(),
-            settings=_settings(0, weight=100),
+            settings=_settings(0, smoothing=100),
         )
     assert "late chunk" in caplog.text
     values = [a["j"] for a in robot.sent]
     assert len(values) == TICKS
     assert values[HORIZON] < values[-1] < 10.0  # still moving after the chunk ran out
-    assert max(abs(dv) for dv in _velocity_changes(values, DT_200)) <= WEIGHT_100_ACCEL * DT_200 + 1e-6
+    assert all(b >= a for a, b in zip(values, values[1:], strict=False))  # and never past it
 
 
 def test_shaping_never_touches_the_feedback(caplog):
-    # Same as the ramping-feedback test, with both filters on: the flag values and their
+    # Same as the ramping-feedback test, with smoothing on: the flag values and their
     # timing come from the chunk as is, and only joints reach the robot.
     gate = threading.Event()
     robot = _FakeRobot()
@@ -1166,15 +1146,16 @@ def test_shaping_never_touches_the_feedback(caplog):
             _target(1),
             _cfg(action_horizon=24),
             _Connect(),
-            settings=_settings(0, horizon=24, smoothing=100, weight=100),
+            settings=_settings(0, horizon=24, smoothing=100),
         )
     assert _feedback_lines(caplog) == [_line(1, False, 0.0), _line(1, True, 0.875)]
     assert _joints_only(robot)
 
 
-def test_home_ramp_bypasses_the_weight_and_the_next_chunk_starts_from_home(caplog):
-    # Weight 100 % would need over a second for these 40° moves; the 0.05 s ramp lands on
-    # time and exactly. The next task's chunk (both joints at 0) then starts from Home.
+def test_home_ramp_bypasses_the_smoothing_and_the_next_chunk_starts_from_home(caplog):
+    # Smoothing 100 % would trail these moves by a 0.5 s time constant; the 0.05 s ramp
+    # lands on time and exactly. The next task's chunk (both joints at 0) then starts
+    # from Home.
     robot = _HomeRobot()
     adapter = _FakeAdapter(value=lambda _n, _i: 0.0, joints=tuple(HOME))
     watcher = _ScriptedWatcher({3: lambda: InferenceTarget.make_idle(1, home=HOME), 30: lambda: _target(2)})
@@ -1186,7 +1167,7 @@ def test_home_ramp_bypasses_the_weight_and_the_next_chunk_starts_from_home(caplo
             InferenceTarget.make_idle(0),
             _cfg(home_ramp_s=0.05),
             _Connect(),
-            settings=_settings(0, weight=100),
+            settings=_settings(0, smoothing=100),
         )
     assert _home_statuses(caplog, 1) == [False, True]
     at_home = robot.sent.index(HOME)
@@ -1196,13 +1177,12 @@ def test_home_ramp_bypasses_the_weight_and_the_next_chunk_starts_from_home(caplo
         assert _monotonic([a[key] for a in ramp])
     moved = [a for a in robot.sent[at_home:] if a != HOME]
     assert moved, "the task never moved the arms"
-    step = WEIGHT_100_ACCEL * DT_200 * DT_200  # one tick of acceleration from rest
+    assert moved[0] == pytest.approx(_first_smoothed_step(HOME, 0.0))
     for key, home in HOME.items():
-        assert abs(moved[0][key] - home) == pytest.approx(step)
         assert abs(moved[-1][key]) < abs(home)  # on its way to 0
 
 
-def test_relax_then_hold_with_weight_holds_the_stiffened_pose():
+def test_relax_then_hold_with_smoothing_holds_the_stiffened_pose():
     robot, adapter, connect = _FakeBiRobot(), _FakeAdapter(), _Connect()
     watcher = _ScriptedWatcher(
         {3: lambda: InferenceTarget.make_idle(1, relaxed=True), 6: lambda: InferenceTarget.make_idle(2)}
@@ -1214,13 +1194,13 @@ def test_relax_then_hold_with_weight_holds_the_stiffened_pose():
         InferenceTarget.make_idle(0),
         _cfg(),
         connect,
-        settings=_settings(0, smoothing=100, weight=100),
+        settings=_settings(0, smoothing=100),
     )
     assert robot.bus_calls() == RELAX_CALLS + STIFFEN_CALLS
     assert robot.sent == [LEFT_AT_HAND] * (TICKS - 5)
 
 
-def test_a_task_after_relax_with_weight_starts_from_where_the_arms_were_left():
+def test_a_task_after_relax_with_smoothing_starts_from_where_the_arms_were_left():
     robot = _HomeRobot()
     adapter = _FakeAdapter(value=lambda _n, _i: 0.0, joints=tuple(LEFT_AT_HAND))
     watcher = _ScriptedWatcher({3: lambda: InferenceTarget.make_idle(1, relaxed=True), 6: lambda: _target(2)})
@@ -1231,14 +1211,12 @@ def test_a_task_after_relax_with_weight_starts_from_where_the_arms_were_left():
         InferenceTarget.make_idle(0),
         _cfg(),
         _Connect(),
-        settings=_settings(0, weight=100),
+        settings=_settings(0, smoothing=100),
     )
     assert robot.sent[0] == LEFT_AT_HAND  # held at the hand-placed pose until the chunk lands
     moved = [a for a in robot.sent if a != LEFT_AT_HAND]
     assert moved, "the task never moved the arms"
-    step = WEIGHT_100_ACCEL * DT_200 * DT_200
-    for key, start in LEFT_AT_HAND.items():
-        assert abs(moved[0][key] - start) == pytest.approx(step)
+    assert moved[0] == pytest.approx(_first_smoothed_step(LEFT_AT_HAND, 0.0))
 
 
 # --------------------------------------------------------------------------- main
@@ -1320,8 +1298,6 @@ def test_main_starts_idle_from_an_empty_control_file_path(fake_main, tmp_path, m
         {"blend_frames": -1},
         {"smoothing_pct": 101},
         {"smoothing_pct": -1},
-        {"weight_pct": 101},
-        {"weight_pct": -1},
     ],
 )
 def test_main_rejects_bad_loop_flags_before_touching_the_robot(fake_main, overrides):
@@ -1337,7 +1313,7 @@ def test_main_rejects_bad_loop_flags_before_touching_the_robot(fake_main, overri
         ("{not json", "--loop_file"),
         (_loop_doc(1, refetch=8), "--loop_file.*refetch_after"),
         ({**_loop_doc(1), "speed_pct": 100.0}, "--loop_file.*speed_pct"),
-        (_loop_doc(1, weight_pct=101), "--loop_file.*weight_pct"),
+        (_loop_doc(1, smoothing_pct=101), "--loop_file.*smoothing_pct"),
         # What an older controller-app wrote: no motion keys.
         (
             {"seq": 1, "action_horizon": 8, "refetch_after": 3, "speed_pct": 100},
@@ -1360,7 +1336,7 @@ def test_main_starts_with_the_loop_file_over_the_cli_flags(fake_main, tmp_path, 
     monkeypatch.setattr(_ScriptedWatcher, "read_initial", lambda _self: None, raising=False)
     monkeypatch.setattr(_ScriptedWatcher, "path", tmp_path / "control.json", raising=False)
     path = tmp_path / "loop.json"
-    path.write_text(json.dumps(_loop_doc(7, 12, 4, 120, blend_frames=5, smoothing_pct=20, weight_pct=30)))
+    path.write_text(json.dumps(_loop_doc(7, 12, 4, 120, blend_frames=5, smoothing_pct=20)))
     with caplog.at_level("INFO"):
         main(
             _cfg(
@@ -1368,11 +1344,10 @@ def test_main_starts_with_the_loop_file_over_the_cli_flags(fake_main, tmp_path, 
                 loop_file=str(path),
                 speed_pct=60,
                 smoothing_pct=90,
-                weight_pct=90,
             )
         )
-    assert _loop_lines(caplog) == [_loop_line(7, True, 12, 4, 120, blend=5, smoothing=20, weight=30)]
-    assert "blend=5 smoothing=20% weight=30%" in caplog.text
+    assert _loop_lines(caplog) == [_loop_line(7, True, 12, 4, 120, blend=5, smoothing=20)]
+    assert "blend=5 smoothing=20%" in caplog.text
     assert (robot.connected, robot.disconnected) == (1, 1)
 
 
@@ -1389,8 +1364,7 @@ def test_main_without_a_loop_file_starts_from_the_cli_flags(fake_main, tmp_path,
                 speed_pct=60,
                 blend_frames=6,
                 smoothing_pct=20,
-                weight_pct=40,
             )
         )
-    assert _loop_lines(caplog) == [_loop_line(0, True, HORIZON, 3, 60, blend=6, smoothing=20, weight=40)]
+    assert _loop_lines(caplog) == [_loop_line(0, True, HORIZON, 3, 60, blend=6, smoothing=20)]
     assert "missing.json does not exist yet" in caplog.text
