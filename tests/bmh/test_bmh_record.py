@@ -52,13 +52,20 @@ CONFIG = {
             "port_zmq": 5555,
             "with_head": True,
             "connect_timeout_s": 15,
+            "polling_timeout_ms": 5,
         },
-        "right_arm_config": {"remote_ip": "192.168.1.2", "port_zmq": 5557, "connect_timeout_s": 15},
+        "right_arm_config": {
+            "remote_ip": "192.168.1.2",
+            "port_zmq": 5557,
+            "connect_timeout_s": 15,
+            "polling_timeout_ms": 5,
+        },
         "lock_file": "/home/pi/.cache/bmh-101/teleop-locks.json",
     },
     "dataset": {
         "repo_id": "local/my-set",
         "root": "/tmp/staging",
+        "fps": 30,
         "single_task": "Place the toast",
         "num_episodes": 50,
         "episode_time_s": 600,
@@ -68,6 +75,8 @@ CONFIG = {
         "rgb_encoder": {"crf": 25, "g": 6},
         "push_to_hub": False,
     },
+    # Arms commanded at 60 Hz while the dataset stays at 30 fps.
+    "control_fps": 60,
     "resume": False,
     "play_sounds": False,
 }
@@ -99,6 +108,13 @@ def test_load_record_config_decodes_registry_types(config_path):
     assert cfg.teleop.left_arm_config.connect_timeout_s == 15
     assert cfg.teleop.right_arm_config.port_zmq == 5557
     assert cfg.teleop.lock_file == "/home/pi/.cache/bmh-101/teleop-locks.json"
+    # Recording caps the per-arm wait for a leader message (the default is 15 ms).
+    assert cfg.teleop.left_arm_config.polling_timeout_ms == 5
+    assert cfg.teleop.right_arm_config.polling_timeout_ms == 5
+
+    assert cfg.dataset.fps == 30
+    assert cfg.control_fps == 60
+    assert cfg.control_multiplier == 2
 
     assert cfg.dataset.repo_id == "local/my-set"
     assert cfg.dataset.single_task == "Place the toast"

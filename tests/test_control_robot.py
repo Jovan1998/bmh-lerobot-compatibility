@@ -14,6 +14,7 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+import math
 import re
 from unittest.mock import patch
 
@@ -29,6 +30,8 @@ from lerobot.scripts.lerobot_calibrate import CalibrateConfig, calibrate
 from lerobot.scripts.lerobot_record import RecordConfig, record, record_loop
 from lerobot.scripts.lerobot_replay import DatasetReplayConfig, ReplayConfig, replay
 from lerobot.scripts.lerobot_teleoperate import TeleoperateConfig, teleoperate
+from lerobot.teleoperators import make_teleoperator_from_config
+from lerobot.utils.cycle_timer import CycleTimer
 from tests.fixtures.constants import DUMMY_REPO_ID
 from tests.mocks.mock_robot import MockRobotConfig
 from tests.mocks.mock_teleop import MockTeleopConfig
@@ -255,3 +258,169 @@ def test_record_loop_without_a_teleoperator_paces_and_terminates():
 
     # 0.1 s at 30 Hz is 3 ticks; the upper bound is what proves the phase was paced.
     assert 1 <= calls <= 6
+
+
+# --- BMH: `control_fps` — command the robot faster than frames are recorded ---
+
+
+def _events() -> dict[str, bool]:
+    return {"exit_early": False, "stop_recording": False, "rerecord_episode": False}
+
+
+def _record_config(control_fps: int | None) -> RecordConfig:
+    return RecordConfig(
+        robot=MockRobotConfig(),
+        dataset=DatasetRecordConfig(
+            repo_id=DUMMY_REPO_ID, single_task="Dummy task", fps=30, push_to_hub=False
+        ),
+        teleop=MockTeleopConfig(),
+        control_fps=control_fps,
+        play_sounds=False,
+    )
+
+
+@pytest.mark.parametrize("control_fps", [45, 15, 0, -30])
+def test_record_config_rejects_a_control_fps_that_is_not_a_positive_multiple_of_dataset_fps(control_fps):
+    with pytest.raises(
+        ValueError, match=rf"control_fps \({control_fps}\) must be a positive multiple of dataset.fps \(30\)"
+    ):
+        _record_config(control_fps)
+
+
+@pytest.mark.parametrize(("control_fps", "multiplier"), [(None, 1), (30, 1), (60, 2), (90, 3)])
+def test_record_config_derives_the_control_multiplier(control_fps, multiplier):
+    assert _record_config(control_fps).control_multiplier == multiplier
+
+
+def test_record_with_control_fps_commands_every_tick_and_records_every_other(tmp_path, cadence_log):
+    dataset_cfg = DatasetRecordConfig(
+        repo_id=DUMMY_REPO_ID,
+        single_task="Dummy task",
+        root=tmp_path / "control_fps",
+        fps=30,
+        num_episodes=1,
+        episode_time_s=0.3,
+        push_to_hub=False,
+    )
+    cfg = RecordConfig(
+        robot=MockRobotConfig(),
+        dataset=dataset_cfg,
+        teleop=MockTeleopConfig(),
+        control_fps=60,
+        play_sounds=False,
+    )
+
+    dataset = record(cfg)
+
+    # One episode, so no reset phase: the run summary covers exactly the recorded ticks.
+    run = cadence_log[-1]
+    assert run.startswith("Cadence summary — whole run")
+    assert "Hz commands" in run
+    ticks = _ticks(run)
+    # Every tick commands the robot; every second one, starting with the first, records.
+    assert _step_calls(run, "send") == ticks
+    assert _step_calls(run, "record") == math.ceil(ticks / 2)
+    # The robot is observed only on the ticks that record.
+    assert _step_calls(run, "observe") == _step_calls(run, "record")
+    assert dataset.fps == 30
+    assert dataset.num_frames == _step_calls(run, "record")
+
+
+class _TickSpy(CycleTimer):
+    """Records the `new_cycle` flag of every tick, and ends the loop (`exit_early`) once
+    `stop_at` ticks have run in total, so each call runs an exact number of ticks."""
+
+    def __init__(self, events: dict[str, bool], multiplier: int):
+        super().__init__(30, multiplier, records_data=False)
+        self.events = events
+        self.new_cycles: list[bool] = []
+        self.stop_at = 0
+
+    def tick(self, new_cycle: bool = False) -> None:
+        self.new_cycles.append(new_cycle)
+        super().tick(new_cycle=new_cycle)
+
+    def wait(self) -> None:
+        super().wait()
+        if len(self.new_cycles) >= self.stop_at:
+            self.events["exit_early"] = True
+
+
+def test_record_loop_starts_a_new_cycle_on_every_record_tick():
+    robot = make_robot_from_config(MockRobotConfig())
+    teleop = make_teleoperator_from_config(MockTeleopConfig())
+    robot.connect()
+    teleop.connect()
+    teleop_action_processor, robot_action_processor, robot_observation_processor = make_default_processors()
+    observations = 0
+    real_get_observation = robot.get_observation
+
+    def counted_get_observation():
+        nonlocal observations
+        observations += 1
+        return real_get_observation()
+
+    robot.get_observation = counted_get_observation
+    events = _events()
+    spy = _TickSpy(events, multiplier=2)
+
+    def run(ticks: int) -> None:
+        spy.stop_at = len(spy.new_cycles) + ticks
+        record_loop(
+            robot=robot,
+            events=events,
+            fps=30,
+            teleop_action_processor=teleop_action_processor,
+            robot_action_processor=robot_action_processor,
+            robot_observation_processor=robot_observation_processor,
+            teleop=teleop,
+            control_time_s=1.0,  # safety cap; `stop_at` ends each call first
+            timer=spy,
+            control_multiplier=2,
+        )
+
+    try:
+        # Like `record()` across episodes: one timer, and the first call ends mid-group.
+        run(3)
+        run(4)
+    finally:
+        robot.disconnect()
+        teleop.disconnect()
+
+    # Each call starts on a record tick that re-anchors the pacing, so recorded frames
+    # stay 1/fps apart even after an episode that ended after an odd number of ticks.
+    assert spy.new_cycles == [True, False, True] + [True, False, True, False]
+    assert observations == 2 + 2
+
+
+def test_record_loop_rejects_a_timer_with_a_different_multiplier():
+    robot = make_robot_from_config(MockRobotConfig())
+    teleop_action_processor, robot_action_processor, robot_observation_processor = make_default_processors()
+    with pytest.raises(ValueError, match="control_multiplier is 2"):
+        record_loop(
+            robot=robot,
+            events=_events(),
+            fps=30,
+            teleop_action_processor=teleop_action_processor,
+            robot_action_processor=robot_action_processor,
+            robot_observation_processor=robot_observation_processor,
+            control_time_s=0.1,
+            timer=CycleTimer(30),
+            control_multiplier=2,
+        )
+
+
+def test_record_loop_rejects_a_control_multiplier_below_one():
+    robot = make_robot_from_config(MockRobotConfig())
+    teleop_action_processor, robot_action_processor, robot_observation_processor = make_default_processors()
+    with pytest.raises(ValueError, match="control_multiplier must be >= 1"):
+        record_loop(
+            robot=robot,
+            events=_events(),
+            fps=30,
+            teleop_action_processor=teleop_action_processor,
+            robot_action_processor=robot_action_processor,
+            robot_observation_processor=robot_observation_processor,
+            control_time_s=0.1,
+            control_multiplier=0,
+        )

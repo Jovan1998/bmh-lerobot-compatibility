@@ -112,13 +112,20 @@ cat > /tmp/record.json <<'JSON'
   "teleop": {"type": "bi_so_network_leader",
              "left_arm_config": {"remote_ip": "192.168.0.200", "port_zmq": 5555, "with_head": true},
              "right_arm_config": {"remote_ip": "192.168.0.200", "port_zmq": 5557}},
-  "dataset": {"repo_id": "my_local_sets/fun_set_2", "num_episodes": 5, "single_task": "Pick up the Controller",
+  "dataset": {"repo_id": "my_local_sets/fun_set_2", "fps": 30, "num_episodes": 5, "single_task": "Pick up the Controller",
               "encoder_threads": 2, "push_to_hub": false},
+  "control_fps": 60,
   "play_sounds": false
 }
 JSON
 bmh-record --config /tmp/record.json
 ```
+
+`control_fps` (BMH extra, CLI `--control_fps=60`) is the rate at which the arms are commanded.
+It defaults to `dataset.fps` (upstream behaviour) and must be a multiple of it: with 60 and a
+30 fps dataset the loop reads the leader and commands the arms every 16.7 ms, like
+`lerobot-teleoperate`, but observes the robot and records a frame only on every second tick, so
+the dataset and its videos stay at 30 fps.
 
 ## Teleop group locks (BMH extra)
 
