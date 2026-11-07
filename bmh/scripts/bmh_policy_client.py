@@ -51,12 +51,18 @@ turned into debounced booleans that the controller-app reads from `BMH_FEEDBACK 
 log lines — one per change, tagged with the `seq` of the target whose chunk set them
 (see bmh/policy_client/feedback.py). Display only: the client does not act on them.
 
-The *loop settings* — action horizon, refetch point and playback speed (`speed_pct` of
-the recorded fps) — come from the CLI flags or, when `--loop_file` points at the
-controller-app's loop-settings file, from that file, which is polled every tick like the
-control file but carries its own `seq`: a settings change applies from the next tick
-without re-requesting a chunk. Each decided seq is answered with a `BMH_LOOP {json}`
-line; a document that breaks a rule is rejected as a whole and the old values stay.
+The *loop settings* — action horizon, refetch point, playback speed (`speed_pct` of
+the recorded fps) and motion shaping (chunk blending, smoothing, weight) — come from the
+CLI flags or, when `--loop_file` points at the controller-app's loop-settings file, from
+that file, which is polled every tick like the control file but carries its own `seq`: a
+settings change applies from the next tick without re-requesting a chunk. Each decided
+seq is answered with a `BMH_LOOP {json}` line; a document that breaks a rule is rejected
+as a whole and the old values stay.
+
+Every chunk action passes through `MotionShaper` (bmh/policy_client/motion.py) on its
+way to the robot: a speed-gated low-pass (`smoothing_pct`) and an acceleration limit
+(`weight_pct`), both off by default, in which case the action goes out untouched. The
+Home ramp bypasses it; Hold, Relax and Stiffen tell it where the arms stopped.
 """
 
 import logging
@@ -98,6 +104,7 @@ from bmh.policy_client.layout import (
     unpack_action,
     unpack_feedback,
 )
+from bmh.policy_client.motion import MotionShaper
 
 # Importing the robot configs ensures draccus CLI registration is populated.
 from lerobot.cameras.opencv.configuration_opencv import OpenCVCameraConfig  # noqa: F401
@@ -545,8 +552,15 @@ class BmhInferenceConfig:
     # linear ramp (mostly-old → mostly-new) turns that step into a short wash-in.
     # If the old chunk has fewer than `blend_frames` actions left (or the new chunk
     # is shorter), the blend is clamped to whatever overlap exists. Set to 0 to
-    # disable blending and switch hard. Must be in [0, action_horizon).
+    # disable blending and switch hard. Must be in [0, 10]. `--loop_file` overrides it.
     blend_frames: int = 3
+    # Motion shaping between the chunk and the servos (bmh/policy_client/motion.py), in
+    # [0, 100], 0 = off. `smoothing_pct`: a low-pass on the commanded positions, strong
+    # while a joint moves fast and gentle while it adjusts slowly. `weight_pct`: an
+    # acceleration limit — about 1 s to full speed at 50 %, 2 s at 100 %, and as long to
+    # stop. `--loop_file` overrides both.
+    smoothing_pct: int = 0
+    weight_pct: int = 0
     # Policy feedbacks (`feedback_<key>` action channels, 0..1 — see
     # bmh/policy_client/feedback.py). A flag switches on once its value stayed at or
     # above `feedback_on_threshold` for `feedback_debounce_ticks` consecutive control
@@ -605,7 +619,22 @@ def _initial_target(
 def _cli_loop_settings(cfg: BmhInferenceConfig) -> LoopSettings:
     """The loop settings the CLI flags describe, as seq 0 (not validated)."""
     return LoopSettings(
-        seq=0, action_horizon=cfg.action_horizon, refetch_after=cfg.refetch_after, speed_pct=cfg.speed_pct
+        seq=0,
+        action_horizon=cfg.action_horizon,
+        refetch_after=cfg.refetch_after,
+        speed_pct=cfg.speed_pct,
+        blend_frames=cfg.blend_frames,
+        smoothing_pct=cfg.smoothing_pct,
+        weight_pct=cfg.weight_pct,
+    )
+
+
+def _describe_loop(settings: LoopSettings) -> str:
+    """The settings for a log line: `horizon=24 refetch_after=10 speed=100% blend=4 ...`."""
+    return (
+        f"horizon={settings.action_horizon} refetch_after={settings.refetch_after} "
+        f"speed={settings.speed_pct}% blend={settings.blend_frames} "
+        f"smoothing={settings.smoothing_pct}% weight={settings.weight_pct}%"
     )
 
 
@@ -614,7 +643,7 @@ def _initial_loop_settings(watcher: LoopFileWatcher | None, cfg: BmhInferenceCon
 
     The controller-app's loop file wins when it exists (the app writes it before
     spawning us); else the CLI flags, as seq 0. Either way the settings pass
-    `validate_loop_settings` against `--blend_frames` — the same rules as a live change.
+    `validate_loop_settings` — the same rules as a live change.
 
     Raises:
         SystemExit: On an invalid loop file (the app is its only writer, so that is a
@@ -632,16 +661,14 @@ def _initial_loop_settings(watcher: LoopFileWatcher | None, cfg: BmhInferenceCon
         else:
             source = f"--loop_file {watcher.path}"
             logger.info(
-                "Initial loop settings #%d read from %s: horizon=%d refetch_after=%d speed=%d%%",
+                "Initial loop settings #%d read from %s: %s",
                 settings.seq,
                 watcher.path,
-                settings.action_horizon,
-                settings.refetch_after,
-                settings.speed_pct,
+                _describe_loop(settings),
             )
     if settings is None:
         settings = _cli_loop_settings(cfg)
-    reason = validate_loop_settings(settings, cfg.blend_frames)
+    reason = validate_loop_settings(settings)
     if reason is not None:
         raise SystemExit(f"Invalid loop settings ({source}): {reason}")
     return settings
@@ -811,7 +838,13 @@ def _run_control_loop(
     current_chunk: list[dict[str, float]] = []
     idx = 0
     inflight = False
+    # What the robot was last told (shaped), and the policy command it came from (raw).
+    # `last_command` is `None` when `last_action` did not come from a chunk (Home ramp,
+    # stiffened pose): a late-chunk tick then has nothing to keep approaching.
     last_action: dict[str, float] | None = None
+    last_command: dict[str, float] | None = None
+    # Smoothing and weight between the chunk and the servos (identity at 0 / 0).
+    shaper = MotionShaper(settings.motion())
     chunk_exhausted_at: float | None = None
     # When the `late chunk` warning was last logged for the current gap (it repeats
     # every tick otherwise).
@@ -869,7 +902,8 @@ def _run_control_loop(
 
     try:
         if target.relaxed:
-            # Relax was pressed while the client was still connecting.
+            # Relax was pressed while the client was still connecting. (The shaper is
+            # still empty: nothing was sent yet.)
             _relax_motors(robot)
             relaxed = True
             logger.info("No target yet — idle, motors relaxed (torque off).")
@@ -957,10 +991,14 @@ def _run_control_loop(
                     if target.relaxed and not relaxed:
                         _relax_motors(robot)
                         relaxed = True
+                        # The arms are the operator's now; where they end up is unknown.
+                        shaper.reset()
                     elif relaxed and not target.relaxed:
                         # Hold (plain idle) or a new task: stiffen where the operator
                         # left the arms, and hold that pose until a chunk arrives.
                         last_action = _stiffen_motors(robot)
+                        last_command = None
+                        shaper.reset(last_action)
                         relaxed = False
                         logger.info("target #%d: motors stiffened, holding the current pose", target.seq)
                     # Home: ramp from the pose just commanded (or stiffened at) to the saved one.
@@ -969,13 +1007,14 @@ def _run_control_loop(
 
             # 0b. Pick up new loop settings (after the target: that order is defined).
             #     They apply from this tick on: the period at step 4, the refetch point
-            #     at step 3, the horizon when the next chunk arrives at step 1. Nothing is
-            #     re-requested. A document breaking a rule is rejected whole; the line
-            #     carries its seq with the values that stay in effect.
+            #     at step 3, smoothing and weight at step 2, the horizon and the blend
+            #     when the next chunk arrives at step 1. Nothing is re-requested. A
+            #     document breaking a rule is rejected whole; the line carries its seq
+            #     with the values that stay in effect.
             if loop_watcher is not None:
                 new_settings = loop_watcher.poll()
                 if new_settings is not None and new_settings.seq != settings.seq:
-                    reason = validate_loop_settings(new_settings, cfg.blend_frames)
+                    reason = validate_loop_settings(new_settings)
                     if reason is not None:
                         logger.error("loop settings #%d rejected: %s", new_settings.seq, reason)
                         logger.info(
@@ -983,13 +1022,8 @@ def _run_control_loop(
                         )
                     else:
                         settings = new_settings
-                        logger.info(
-                            "loop settings #%d applied: horizon=%d refetch_after=%d speed=%d%%",
-                            settings.seq,
-                            settings.action_horizon,
-                            settings.refetch_after,
-                            settings.speed_pct,
-                        )
+                        shaper.set_params(settings.motion())
+                        logger.info("loop settings #%d applied: %s", settings.seq, _describe_loop(settings))
                         logger.info(format_loop_status(settings, True, None))
 
             # 1. Try to swap in a freshly arrived chunk, time-aligned to the
@@ -1066,14 +1100,15 @@ def _run_control_loop(
                     # next actions and `new_chunk[drop:]` are the new chunk's first
                     # kept actions; after the time-align above these describe the same
                     # instants but come from different policy passes, so a cold switch
-                    # leaves a one-frame jump. Blend the first `blend_frames` of them
-                    # with a mostly-old → mostly-new ramp. The blend length is clamped
-                    # to the overlap: if the old chunk has fewer actions left than
-                    # `blend_frames` (or already ran dry — `leftover_old` empty, robot
-                    # holding position) we interpolate over only the frames available.
+                    # leaves a one-frame jump. Blend the first `blend_frames` (live
+                    # setting) of them with a mostly-old → mostly-new ramp. The blend
+                    # length is clamped to the overlap: if the old chunk has fewer
+                    # actions left than `blend_frames` (or already ran dry —
+                    # `leftover_old` empty, robot holding position) we interpolate over
+                    # only the frames available.
                     leftover_old = current_chunk[idx:]
                     new_kept = new_chunk[drop:]
-                    blend_len = min(cfg.blend_frames, len(leftover_old), len(new_kept))
+                    blend_len = min(settings.blend_frames, len(leftover_old), len(new_kept))
                     for k in range(blend_len):
                         alpha = (k + 1) / (blend_len + 1)
                         new_kept[k] = _blend_actions(leftover_old[k], new_kept[k], alpha)
@@ -1103,14 +1138,18 @@ def _run_control_loop(
 
             # 2. Send an action (or hold position if we ran out / were told to).
             #    A step also carries the policy's feedback values (see `get_action`);
-            #    only the joints go to the robot — and into `last_action`, which both
-            #    hold branches re-send. Hold / late-chunk ticks leave the tracker alone:
-            #    they are neither evidence for nor against a flag. A Home ramp (idle, so
-            #    no chunk) sends its next pose until it arrives, then the hold re-sends it.
+            #    only the joints go to the robot, through the motion shaper — and the
+            #    shaped command into `last_action`, which the hold branch re-sends.
+            #    Hold / late-chunk ticks leave the tracker alone: they are neither
+            #    evidence for nor against a flag. A Home ramp (idle, so no chunk) sends
+            #    its next pose unshaped until it arrives, then the hold re-sends it.
+            dt = settings.period_s(cfg.fps)
             if idx < len(current_chunk):
-                action, feedback = split_feedback(current_chunk[idx])
+                command, feedback = split_feedback(current_chunk[idx])
+                action = shaper.step(command, dt)
                 robot.send_action(action)
                 last_action = action
+                last_command = command
                 idx += 1
                 consumed_since_swap += 1
                 chunk_exhausted_at = None
@@ -1125,15 +1164,21 @@ def _run_control_loop(
                     home_ramp.t0 = tick_start
                 alpha = smoothstep(min(1.0, (tick_start - home_ramp.t0) / home_ramp.duration))
                 action = ramp_pose(home_ramp.start, home_ramp.target, alpha)
+                # Already smooth, and it must land exactly: no shaping. The shaper only
+                # learns that the arms are here, at rest once the ramp is done.
                 robot.send_action(action)
                 last_action = action
+                last_command = None
+                shaper.reset(action)
                 if alpha >= 1.0:
                     logger.info("target #%d: Home position reached", target.seq)
                     reached_seq = target.seq
                     home_ramp = None
             elif holding:
                 # Idle or on hold: keep the last pose, quietly (logged once above) —
-                # unless relaxed: then the arms are the operator's.
+                # unless relaxed: then the arms are the operator's. The arm stops where
+                # it was last told to be, so the shaper's velocities are zero.
+                shaper.hold()
                 if last_action is not None and not relaxed:
                     robot.send_action(last_action)
             else:
@@ -1142,6 +1187,14 @@ def _run_control_loop(
                     late_logged_at = None
                 gap_ms = (tick_start - chunk_exhausted_at) * 1000.0
                 if last_action is not None:
+                    # Waiting for the next chunk: the policy's last command still
+                    # stands, so the shaped arm keeps settling onto it (a smoothed or
+                    # heavy arm lags behind it) instead of stopping dead. With shaping
+                    # off this re-sends exactly the last action, as before.
+                    if last_command is not None:
+                        last_action = shaper.step(last_command, dt)
+                    else:
+                        shaper.hold()
                     robot.send_action(last_action)
                 # First tick of a gap, then once per second — not once per tick.
                 if late_logged_at is None or tick_start - late_logged_at >= 1.0:
@@ -1248,7 +1301,7 @@ def main(cfg: BmhInferenceConfig) -> None:
     watcher = ControlFileWatcher(Path(cfg.control_file).expanduser()) if cfg.control_file else None
     target = _initial_target(watcher, cfg.policy_host, cfg.policy_port, cfg.lang_instruction, cfg.api_token)
     # Loop settings: the app's loop file when given (and present), else the CLI flags —
-    # checked against --blend_frames with the same rules as a live change.
+    # checked with the same rules as a live change.
     loop_watcher = LoopFileWatcher(Path(cfg.loop_file).expanduser()) if cfg.loop_file else None
     settings = _initial_loop_settings(loop_watcher, cfg)
 

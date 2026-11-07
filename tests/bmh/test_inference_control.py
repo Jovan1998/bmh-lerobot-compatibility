@@ -10,6 +10,7 @@ Run with ``uv run --no-sync pytest tests/bmh/test_inference_control.py -q``.
 
 import json
 import os
+from dataclasses import replace
 
 import pytest
 
@@ -30,6 +31,7 @@ from bmh.policy_client.control import (
     smoothstep,
     validate_loop_settings,
 )
+from bmh.policy_client.motion import MotionParams
 
 VALID = {
     "seq": 1,
@@ -399,17 +401,43 @@ def test_feedback_line_is_not_a_target_line():
 
 # --------------------------------------------------------------------------- loop settings
 
-LOOP = {"seq": 3, "action_horizon": 24, "refetch_after": 10, "speed_pct": 100}
+LOOP = {
+    "seq": 3,
+    "action_horizon": 24,
+    "refetch_after": 10,
+    "speed_pct": 100,
+    "blend_frames": 4,
+    "smoothing_pct": 0,
+    "weight_pct": 0,
+}
+LOOP_SETTINGS = LoopSettings(3, 24, 10, 100, blend_frames=4, smoothing_pct=0, weight_pct=0)
 
 
 def test_parse_loop_settings_accepts_valid():
-    assert parse_loop_settings(LOOP) == LoopSettings(3, 24, 10, 100)
+    assert parse_loop_settings(LOOP) == LOOP_SETTINGS
     assert parse_loop_settings({**LOOP, "action_horizon": 60, "refetch_after": 59, "speed_pct": 150}) == (
-        LoopSettings(3, 60, 59, 150)
+        replace(LOOP_SETTINGS, action_horizon=60, refetch_after=59, speed_pct=150)
     )
     assert parse_loop_settings({**LOOP, "action_horizon": 2, "refetch_after": 1, "speed_pct": 50}) == (
-        LoopSettings(3, 2, 1, 50)
+        replace(LOOP_SETTINGS, action_horizon=2, refetch_after=1, speed_pct=50)
     )
+
+
+@pytest.mark.parametrize(
+    ("blend", "smoothing", "weight"),
+    [(0, 0, 0), (10, 100, 100), (6, 35, 70)],
+)
+def test_parse_loop_settings_accepts_the_motion_keys_in_range(blend, smoothing, weight):
+    settings = parse_loop_settings(
+        {**LOOP, "blend_frames": blend, "smoothing_pct": smoothing, "weight_pct": weight}
+    )
+    assert (settings.blend_frames, settings.smoothing_pct, settings.weight_pct) == (blend, smoothing, weight)
+
+
+def test_parse_loop_settings_accepts_a_blend_longer_than_the_horizon():
+    # The swap clamps the blend to the overlap; the old `blend < horizon` rule is gone.
+    settings = parse_loop_settings({**LOOP, "action_horizon": 5, "refetch_after": 2, "blend_frames": 10})
+    assert (settings.action_horizon, settings.blend_frames) == (5, 10)
 
 
 @pytest.mark.parametrize(
@@ -431,6 +459,14 @@ def test_parse_loop_settings_accepts_valid():
         {**LOOP, "refetch_after": 30},
         {**LOOP, "speed_pct": 49},
         {**LOOP, "speed_pct": 151},
+        *(
+            {**LOOP, key: value}
+            for key in ("blend_frames", "smoothing_pct", "weight_pct")
+            for value in (True, False, 1.0, "1", None, -1)
+        ),
+        {**LOOP, "blend_frames": 11},
+        {**LOOP, "smoothing_pct": 101},
+        {**LOOP, "weight_pct": 101},
     ],
 )
 def test_parse_loop_settings_rejects(bad):
@@ -438,15 +474,37 @@ def test_parse_loop_settings_rejects(bad):
         parse_loop_settings(bad)
 
 
+@pytest.mark.parametrize("key", ["blend_frames", "smoothing_pct", "weight_pct"])
+def test_parse_loop_settings_names_a_missing_motion_key(key):
+    # What an old controller-app's file looks like to a new client.
+    with pytest.raises(ValueError, match=f"missing '{key}'"):
+        parse_loop_settings({k: v for k, v in LOOP.items() if k != key})
+
+
 def test_validate_loop_settings():
-    assert validate_loop_settings(LoopSettings(1, 24, 10, 100), blend_frames=4) is None
-    assert validate_loop_settings(LoopSettings(1, 5, 1, 100), blend_frames=4) is None
-    assert "blend_frames=4" in validate_loop_settings(LoopSettings(1, 4, 2, 100), blend_frames=4)
-    assert "blend_frames" in validate_loop_settings(LoopSettings(1, 8, 2, 100), blend_frames=-1)
-    # The parse-time rules hold here too (CLI values never went through the parser).
-    assert "refetch_after" in validate_loop_settings(LoopSettings(1, 8, 8, 100), blend_frames=0)
-    assert "refetch_after" in validate_loop_settings(LoopSettings(1, 8, 0, 100), blend_frames=0)
-    assert "speed_pct" in validate_loop_settings(LoopSettings(1, 8, 3, 200), blend_frames=0)
+    assert validate_loop_settings(LoopSettings(1, 24, 10, 100, blend_frames=4)) is None
+    assert validate_loop_settings(LoopSettings(1, 5, 1, 100, blend_frames=4)) is None
+    # A blend as long as (or longer than) the horizon is fine now: the swap clamps it.
+    assert validate_loop_settings(LoopSettings(1, 4, 2, 100, blend_frames=4)) is None
+    assert validate_loop_settings(LoopSettings(1, 8, 2, 100, 10, 100, 100)) is None
+    # The ranges are checked here too (CLI values never went through the parser).
+    assert "blend_frames" in validate_loop_settings(LoopSettings(1, 8, 2, 100, blend_frames=-1))
+    assert "blend_frames" in validate_loop_settings(LoopSettings(1, 8, 2, 100, blend_frames=11))
+    assert "smoothing_pct" in validate_loop_settings(LoopSettings(1, 8, 2, 100, smoothing_pct=101))
+    assert "smoothing_pct" in validate_loop_settings(LoopSettings(1, 8, 2, 100, smoothing_pct=-1))
+    assert "weight_pct" in validate_loop_settings(LoopSettings(1, 8, 2, 100, weight_pct=101))
+    assert "weight_pct" in validate_loop_settings(LoopSettings(1, 8, 2, 100, weight_pct=-1))
+    assert "refetch_after" in validate_loop_settings(LoopSettings(1, 8, 8, 100))
+    assert "refetch_after" in validate_loop_settings(LoopSettings(1, 8, 0, 100))
+    assert "speed_pct" in validate_loop_settings(LoopSettings(1, 8, 3, 200))
+
+
+def test_loop_settings_motion():
+    assert LoopSettings(1, 8, 3, 100).motion() == MotionParams(0, 0)
+    assert LoopSettings(1, 8, 3, 100).motion().off
+    params = LoopSettings(1, 8, 3, 100, blend_frames=2, smoothing_pct=40, weight_pct=70).motion()
+    assert params == MotionParams(smoothing_pct=40, weight_pct=70)
+    assert not params.off
 
 
 def test_loop_settings_period():
@@ -456,7 +514,7 @@ def test_loop_settings_period():
 
 
 def test_format_loop_status_shape():
-    line = format_loop_status(LoopSettings(3, 24, 10, 80), True, None)
+    line = format_loop_status(LoopSettings(3, 24, 10, 80, 5, 30, 60), True, None)
     assert line.startswith(LOOP_STATUS_PREFIX) and "\n" not in line
     payload = json.loads(line[len(LOOP_STATUS_PREFIX) :])
     assert payload == {
@@ -466,6 +524,9 @@ def test_format_loop_status_shape():
         "action_horizon": 24,
         "refetch_after": 10,
         "speed_pct": 80,
+        "blend_frames": 5,
+        "smoothing_pct": 30,
+        "weight_pct": 60,
     }
     rejected = json.loads(
         format_loop_status(LoopSettings(4, 24, 10, 80), False, "nope")[len(LOOP_STATUS_PREFIX) :]
@@ -482,10 +543,10 @@ def test_loop_watcher_read_initial_and_poll(tmp_path):
     path = tmp_path / "loop.json"
     _write(path, LOOP, 1_000)
     watcher = LoopFileWatcher(path)
-    assert watcher.read_initial() == LoopSettings(3, 24, 10, 100)
+    assert watcher.read_initial() == LOOP_SETTINGS
     assert watcher.poll() is None  # the startup read is not a change
-    _write(path, {**LOOP, "seq": 4, "speed_pct": 150}, 2_000)
-    assert watcher.poll() == LoopSettings(4, 24, 10, 150)
+    _write(path, {**LOOP, "seq": 4, "speed_pct": 150, "weight_pct": 50}, 2_000)
+    assert watcher.poll() == replace(LOOP_SETTINGS, seq=4, speed_pct=150, weight_pct=50)
     assert watcher.poll() is None
 
 
@@ -495,7 +556,7 @@ def test_loop_watcher_missing_file(tmp_path):
     assert watcher.read_initial() is None
     assert watcher.poll() is None
     _write(path, LOOP, 1_000)
-    assert watcher.poll() == LoopSettings(3, 24, 10, 100)
+    assert watcher.poll() == LOOP_SETTINGS
 
 
 def test_loop_watcher_read_initial_invalid_file_raises(tmp_path):
