@@ -406,9 +406,10 @@ LOOP = {
     "refetch_after": 10,
     "speed_pct": 100,
     "blend_frames": 4,
+    "lookahead_frames": 0,
     "smoothing_pct": 0,
 }
-LOOP_SETTINGS = LoopSettings(3, 24, 10, 100, blend_frames=4, smoothing_pct=0)
+LOOP_SETTINGS = LoopSettings(3, 24, 10, 100, blend_frames=4, smoothing_pct=0, lookahead_frames=0)
 
 
 def test_parse_loop_settings_accepts_valid():
@@ -421,10 +422,16 @@ def test_parse_loop_settings_accepts_valid():
     )
 
 
-@pytest.mark.parametrize(("blend", "smoothing"), [(0, 0), (10, 100), (6, 35)])
-def test_parse_loop_settings_accepts_the_motion_keys_in_range(blend, smoothing):
-    settings = parse_loop_settings({**LOOP, "blend_frames": blend, "smoothing_pct": smoothing})
-    assert (settings.blend_frames, settings.smoothing_pct) == (blend, smoothing)
+@pytest.mark.parametrize(("blend", "lookahead", "smoothing"), [(0, 0, 0), (10, 10, 100), (6, 3, 35)])
+def test_parse_loop_settings_accepts_the_motion_keys_in_range(blend, lookahead, smoothing):
+    settings = parse_loop_settings(
+        {**LOOP, "blend_frames": blend, "lookahead_frames": lookahead, "smoothing_pct": smoothing}
+    )
+    assert (settings.blend_frames, settings.lookahead_frames, settings.smoothing_pct) == (
+        blend,
+        lookahead,
+        smoothing,
+    )
 
 
 def test_parse_loop_settings_ignores_unknown_keys():
@@ -459,10 +466,11 @@ def test_parse_loop_settings_accepts_a_blend_longer_than_the_horizon():
         {**LOOP, "speed_pct": 151},
         *(
             {**LOOP, key: value}
-            for key in ("blend_frames", "smoothing_pct")
+            for key in ("blend_frames", "lookahead_frames", "smoothing_pct")
             for value in (True, False, 1.0, "1", None, -1)
         ),
         {**LOOP, "blend_frames": 11},
+        {**LOOP, "lookahead_frames": 11},
         {**LOOP, "smoothing_pct": 101},
     ],
 )
@@ -471,7 +479,7 @@ def test_parse_loop_settings_rejects(bad):
         parse_loop_settings(bad)
 
 
-@pytest.mark.parametrize("key", ["blend_frames", "smoothing_pct"])
+@pytest.mark.parametrize("key", ["blend_frames", "lookahead_frames", "smoothing_pct"])
 def test_parse_loop_settings_names_a_missing_motion_key(key):
     # What an old controller-app's file looks like to a new client.
     with pytest.raises(ValueError, match=f"missing '{key}'"):
@@ -489,6 +497,9 @@ def test_validate_loop_settings():
     assert "blend_frames" in validate_loop_settings(LoopSettings(1, 8, 2, 100, blend_frames=11))
     assert "smoothing_pct" in validate_loop_settings(LoopSettings(1, 8, 2, 100, smoothing_pct=101))
     assert "smoothing_pct" in validate_loop_settings(LoopSettings(1, 8, 2, 100, smoothing_pct=-1))
+    assert validate_loop_settings(LoopSettings(1, 8, 2, 100, lookahead_frames=10)) is None
+    assert "lookahead_frames" in validate_loop_settings(LoopSettings(1, 8, 2, 100, lookahead_frames=11))
+    assert "lookahead_frames" in validate_loop_settings(LoopSettings(1, 8, 2, 100, lookahead_frames=-1))
     assert "refetch_after" in validate_loop_settings(LoopSettings(1, 8, 8, 100))
     assert "refetch_after" in validate_loop_settings(LoopSettings(1, 8, 0, 100))
     assert "speed_pct" in validate_loop_settings(LoopSettings(1, 8, 3, 200))
@@ -501,7 +512,7 @@ def test_loop_settings_period():
 
 
 def test_format_loop_status_shape():
-    line = format_loop_status(LoopSettings(3, 24, 10, 80, 5, 30), True, None)
+    line = format_loop_status(LoopSettings(3, 24, 10, 80, 5, 30, 3), True, None)
     assert line.startswith(LOOP_STATUS_PREFIX) and "\n" not in line
     payload = json.loads(line[len(LOOP_STATUS_PREFIX) :])
     assert payload == {
@@ -512,6 +523,7 @@ def test_format_loop_status_shape():
         "refetch_after": 10,
         "speed_pct": 80,
         "blend_frames": 5,
+        "lookahead_frames": 3,
         "smoothing_pct": 30,
     }
     rejected = json.loads(

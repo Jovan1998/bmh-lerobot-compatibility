@@ -40,7 +40,7 @@ from bmh.policy_client.control import (  # noqa: E402
     InferenceTarget,
     LoopSettings,
 )
-from bmh.policy_client.motion import MotionShaper  # noqa: E402
+from bmh.policy_client.motion import LookaheadSmoother, MotionShaper  # noqa: E402
 from bmh.scripts.bmh_policy_client import (  # noqa: E402
     BmhInferenceConfig,
     PolicyConnectError,
@@ -746,9 +746,10 @@ def _settings(
     speed: int = 100,
     blend: int = 0,
     smoothing: int = 0,
+    lookahead: int = 0,
 ) -> LoopSettings:
     # Blend 0 like `_cfg`, so a live change keeps every sent action traceable to its chunk.
-    return LoopSettings(seq, horizon, refetch, speed, blend, smoothing)
+    return LoopSettings(seq, horizon, refetch, speed, blend, smoothing, lookahead)
 
 
 def _loop_lines(caplog) -> list[dict]:
@@ -766,6 +767,7 @@ def _loop_line(
     error=None,
     blend: int = 0,
     smoothing: int = 0,
+    lookahead: int = 0,
 ) -> dict:
     return {
         "seq": seq,
@@ -775,6 +777,7 @@ def _loop_line(
         "refetch_after": refetch,
         "speed_pct": speed,
         "blend_frames": blend,
+        "lookahead_frames": lookahead,
         "smoothing_pct": smoothing,
     }
 
@@ -787,6 +790,7 @@ def _loop_doc(seq: int, horizon: int = HORIZON, refetch: int = 3, speed: int = 1
         "refetch_after": refetch,
         "speed_pct": speed,
         "blend_frames": motion.get("blend_frames", 0),
+        "lookahead_frames": motion.get("lookahead_frames", 0),
         "smoothing_pct": motion.get("smoothing_pct", 0),
     }
 
@@ -1053,7 +1057,7 @@ def test_blend_frames_change_live_at_the_next_swap(caplog):
     assert before and set(before) == {0}
     assert during and set(during) == {2}
     assert after and set(after) == {0}
-    assert "blend=2 smoothing=0%" in caplog.text
+    assert "blend=2 lookahead=0 smoothing=0%" in caplog.text
 
 
 def test_a_blend_as_long_as_the_horizon_is_accepted(caplog):
@@ -1086,7 +1090,7 @@ def test_motion_settings_change_is_reported(caplog):
     ]
     assert (
         f"loop settings #1 applied: horizon={HORIZON} refetch_after=3 speed=100% "
-        "blend=2 smoothing=40%" in caplog.text
+        "blend=2 lookahead=0 smoothing=40%" in caplog.text
     )
 
 
@@ -1219,6 +1223,154 @@ def test_a_task_after_relax_with_smoothing_starts_from_where_the_arms_were_left(
     assert moved[0] == pytest.approx(_first_smoothed_step(LEFT_AT_HAND, 0.0))
 
 
+class _LangAdapter(_FakeAdapter):
+    """Chunks by task: `values[lang](n, i)` with `n` the 1-based call count of that task."""
+
+    def __init__(self, values: dict[str, Callable[[int, int], float]], joints: tuple[str, ...] = ("j",)):
+        super().__init__(joints=joints)
+        self.values = values
+
+    def get_action(self, obs: dict) -> list[dict[str, float]]:
+        self.calls.append(obs["lang"])
+        n = self.calls.count(obs["lang"])
+        return [dict.fromkeys(self.joints, self.values[obs["lang"]](n, i)) for i in range(self.horizon)]
+
+
+def _lookahead_over(values: list[float], frames: int) -> list[float]:
+    """What the look-ahead sends for one chunk played from its first action, nothing before."""
+    smoother = LookaheadSmoother(frames)
+    steps = [{"j": v} for v in values]
+    return [smoother.step(steps[i], steps[i + 1 : i + 1 + frames])["j"] for i in range(len(steps))]
+
+
+@pytest.mark.parametrize("frames", [1, 3])
+def test_lookahead_averages_the_chunks_planned_actions(caplog, frames):
+    # Only the bootstrap chunk ever arrives (request 2 hangs), with jitter and feedback
+    # values on every step: the loop hands the smoother exactly that chunk's next joints.
+    gate = threading.Event()
+    robot = _FakeRobot()
+
+    def jittery(_n: int, i: int) -> float:
+        return 10.0 * i + (0.5 if i % 2 else -0.5)
+
+    adapter = _FakeAdapter(gates={2: gate}, value=jittery, feedback=lambda _n, i: {"feedback_done": i / 16})
+    with caplog.at_level("INFO"):
+        _run_control_loop(
+            robot,
+            adapter,
+            _ScriptedWatcher({TICKS: gate.set}),
+            _target(1),
+            _cfg(),
+            _Connect(),
+            settings=_settings(0, lookahead=frames),
+        )
+    chunk = [jittery(1, i) for i in range(HORIZON)]
+    sent = [a["j"] for a in robot.sent]
+    assert sent[:HORIZON] == pytest.approx(_lookahead_over(chunk, frames), abs=1e-12)
+    assert sent[HORIZON:] == [sent[HORIZON - 1]] * (TICKS - HORIZON)  # late chunk: held
+    assert _joints_only(robot)
+    # In the middle the window is full: the jitter is (mostly) gone, the ramp is kept.
+    middle = sent[frames : HORIZON - frames]
+    assert all(abs(v - 10.0 * i) < 0.5 for v, i in zip(middle, range(frames, HORIZON - frames), strict=True))
+
+
+def test_lookahead_sends_a_ramp_on_the_ramp():
+    # A centred window has no lag: a steady move comes out where the policy put it.
+    gate = threading.Event()
+    robot = _FakeRobot()
+    adapter = _FakeAdapter(gates={2: gate}, value=lambda _n, i: 10.0 * i)
+    _run_control_loop(
+        robot,
+        adapter,
+        _ScriptedWatcher({TICKS: gate.set}),
+        _target(1),
+        _cfg(),
+        _Connect(),
+        settings=_settings(0, lookahead=3),
+    )
+    assert [a["j"] for a in robot.sent[:HORIZON]] == pytest.approx(
+        [10.0 * i for i in range(HORIZON)], abs=1e-9
+    )
+
+
+@pytest.mark.parametrize("stop", ["hold", "home"])
+def test_lookahead_starts_afresh_after_a_hold_or_home(caplog, stop):
+    # Task A plays 30s, task B 0s. B's first action must not be averaged with A's.
+    robot = _HomeRobot()
+    adapter = _LangAdapter({"task A": lambda _n, _i: 30.0, "task B": lambda _n, _i: 0.0}, joints=tuple(HOME))
+    pause = InferenceTarget.make_idle(2) if stop == "hold" else InferenceTarget.make_idle(2, home=HOME)
+    watcher = _ScriptedWatcher({15: lambda: pause, 35: lambda: _target(3, lang="task B")})
+    with caplog.at_level("INFO"):
+        _run_control_loop(
+            robot,
+            adapter,
+            watcher,
+            _target(1),
+            _cfg(home_ramp_s=0.05),
+            _Connect(),
+            settings=_settings(0, lookahead=3),
+        )
+    assert robot.sent[0] == pytest.approx(dict.fromkeys(HOME, 30.0))
+    before_b = robot.sent[33]  # tick 34: still paused (A's last pose, or Home)
+    assert before_b == pytest.approx(dict.fromkeys(HOME, 30.0) if stop == "hold" else HOME)
+    b_sends = [a for a in robot.sent[34:] if a != before_b]
+    assert b_sends, "task B never played"
+    zero = dict.fromkeys(HOME, 0.0)
+    assert all(a == zero for a in b_sends)  # exactly, from B's first action on
+
+
+def test_a_hold_resets_the_smoothing_for_the_next_task():
+    # Task A: a step from 0 to 40, which smoothing 100 % trails far behind; Hold at tick 12
+    # stops the arm where it was told last. Task B (10s) then starts from that pose at
+    # rest — like a freshly reset shaper, not with the pace and command of A's move.
+    robot = _FakeRobot()
+
+    def task_a(n: int, i: int) -> float:
+        return 0.0 if (n, i) == (1, 0) else 40.0
+
+    adapter = _LangAdapter({"task A": task_a, "task B": lambda _n, _i: 10.0})
+    watcher = _ScriptedWatcher(
+        {12: lambda: InferenceTarget.make_idle(2), 25: lambda: _target(3, lang="task B")}
+    )
+    _run_control_loop(
+        robot, adapter, watcher, _target(1), _cfg(), _Connect(), settings=_settings(0, smoothing=100)
+    )
+    held = robot.sent[11]
+    assert 0.0 < held["j"] < 40.0  # trailing when Hold came
+    assert robot.sent[11:24] == [held] * 13  # held still
+    moved = [a for a in robot.sent[24:] if a != held]
+    assert moved, "task B never moved the arm"
+    assert moved[0] == pytest.approx(_first_smoothed_step(held, 10.0))
+
+
+def test_switching_smoothing_off_mid_move_eases_onto_the_command(monkeypatch, caplog):
+    # A step from 0 to 50 that smoothing 100 % trails; at tick 100 the slider goes to 0.
+    # Instead of the whole gap in one tick, the arm eases onto the command and then gets
+    # it exactly. A virtual clock keeps the 350 ticks fast.
+    monkeypatch.setattr(script, "time", _VirtualClock())
+    robot = _FakeRobot()
+    adapter = _FakeAdapter(value=lambda n, i: 0.0 if (n, i) == (1, 0) else 50.0)
+    loop = _ScriptedLoopWatcher({100: lambda: _settings(1, smoothing=0)})
+    with caplog.at_level("INFO"):
+        _run_control_loop(
+            robot,
+            adapter,
+            _ScriptedWatcher(ticks=350),
+            _target(1),
+            _cfg(),
+            _Connect(),
+            loop_watcher=loop,
+            settings=_settings(0, smoothing=100),
+        )
+    sent = [a["j"] for a in robot.sent]
+    gap = 50.0 - sent[98]  # tick 99, the last one at 100 %
+    assert gap > 5.0
+    steps = [b - a for a, b in zip(sent[98:], sent[99:], strict=False)]
+    assert max(steps) < 0.25 * gap  # no jump
+    assert all(s >= 0.0 for s in steps)  # and never past the command
+    assert sent[-50:] == [50.0] * 50  # exactly the command once eased in
+
+
 # --------------------------------------------------------------------------- main
 
 
@@ -1298,6 +1450,8 @@ def test_main_starts_idle_from_an_empty_control_file_path(fake_main, tmp_path, m
         {"blend_frames": -1},
         {"smoothing_pct": 101},
         {"smoothing_pct": -1},
+        {"lookahead_frames": 11},
+        {"lookahead_frames": -1},
     ],
 )
 def test_main_rejects_bad_loop_flags_before_touching_the_robot(fake_main, overrides):
@@ -1314,6 +1468,12 @@ def test_main_rejects_bad_loop_flags_before_touching_the_robot(fake_main, overri
         (_loop_doc(1, refetch=8), "--loop_file.*refetch_after"),
         ({**_loop_doc(1), "speed_pct": 100.0}, "--loop_file.*speed_pct"),
         (_loop_doc(1, smoothing_pct=101), "--loop_file.*smoothing_pct"),
+        (_loop_doc(1, lookahead_frames=11), "--loop_file.*lookahead_frames"),
+        # What the first BMHOS-16 app build wrote: motion keys, but no look-ahead.
+        (
+            {k: v for k, v in _loop_doc(1).items() if k != "lookahead_frames"},
+            "--loop_file.*missing 'lookahead_frames'",
+        ),
         # What an older controller-app wrote: no motion keys.
         (
             {"seq": 1, "action_horizon": 8, "refetch_after": 3, "speed_pct": 100},
@@ -1336,7 +1496,9 @@ def test_main_starts_with_the_loop_file_over_the_cli_flags(fake_main, tmp_path, 
     monkeypatch.setattr(_ScriptedWatcher, "read_initial", lambda _self: None, raising=False)
     monkeypatch.setattr(_ScriptedWatcher, "path", tmp_path / "control.json", raising=False)
     path = tmp_path / "loop.json"
-    path.write_text(json.dumps(_loop_doc(7, 12, 4, 120, blend_frames=5, smoothing_pct=20)))
+    path.write_text(
+        json.dumps(_loop_doc(7, 12, 4, 120, blend_frames=5, lookahead_frames=2, smoothing_pct=20))
+    )
     with caplog.at_level("INFO"):
         main(
             _cfg(
@@ -1344,10 +1506,11 @@ def test_main_starts_with_the_loop_file_over_the_cli_flags(fake_main, tmp_path, 
                 loop_file=str(path),
                 speed_pct=60,
                 smoothing_pct=90,
+                lookahead_frames=9,
             )
         )
-    assert _loop_lines(caplog) == [_loop_line(7, True, 12, 4, 120, blend=5, smoothing=20)]
-    assert "blend=5 smoothing=20%" in caplog.text
+    assert _loop_lines(caplog) == [_loop_line(7, True, 12, 4, 120, blend=5, smoothing=20, lookahead=2)]
+    assert "blend=5 lookahead=2 smoothing=20%" in caplog.text
     assert (robot.connected, robot.disconnected) == (1, 1)
 
 
@@ -1364,7 +1527,8 @@ def test_main_without_a_loop_file_starts_from_the_cli_flags(fake_main, tmp_path,
                 speed_pct=60,
                 blend_frames=6,
                 smoothing_pct=20,
+                lookahead_frames=4,
             )
         )
-    assert _loop_lines(caplog) == [_loop_line(0, True, HORIZON, 3, 60, blend=6, smoothing=20)]
+    assert _loop_lines(caplog) == [_loop_line(0, True, HORIZON, 3, 60, blend=6, smoothing=20, lookahead=4)]
     assert "missing.json does not exist yet" in caplog.text
