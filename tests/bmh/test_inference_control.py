@@ -1,6 +1,7 @@
 """Unit tests for the BMH-101 inference control file - no ZMQ, no hardware.
 
-Covers ``parse_target`` validation (incl. the idle, the relaxed and the Home idle document), ``InferenceTarget.endpoint``
+Covers ``parse_target`` validation (incl. the idle, the relaxed, the Home and the replay idle
+document), ``InferenceTarget.endpoint``
 equality, ``ControlFileWatcher`` change detection (stat-based, like the teleop lock watcher)
 and the ``BMH_TARGET`` / ``BMH_FEEDBACK`` status lines. Also the loop-settings file:
 ``parse_loop_settings`` / ``validate_loop_settings``, ``LoopFileWatcher`` (same base as the
@@ -14,6 +15,7 @@ from dataclasses import replace
 
 import pytest
 
+from bmh.motion.player import smoothstep
 from bmh.policy_client.control import (
     FEEDBACK_STATUS_PREFIX,
     LOOP_STATUS_PREFIX,
@@ -22,13 +24,13 @@ from bmh.policy_client.control import (
     InferenceTarget,
     LoopFileWatcher,
     LoopSettings,
+    ReplaySpec,
     format_feedback_status,
     format_loop_status,
     format_target_status,
     parse_loop_settings,
     parse_target,
     ramp_pose,
-    smoothstep,
     validate_loop_settings,
 )
 
@@ -149,6 +151,77 @@ def test_parse_target_home_idle():
 def test_parse_target_home_and_relaxed_exclude_each_other():
     with pytest.raises(ValueError, match="exclude each other"):
         parse_target({"seq": 8, "idle": True, "relaxed": True, "home": HOME})
+
+
+@pytest.fixture
+def fake_home(tmp_path, monkeypatch):
+    """A HOME of its own, so `~/.cache/bmh-101/fixed-recordings` is under `tmp_path`."""
+    monkeypatch.setenv("HOME", str(tmp_path))
+    return tmp_path
+
+
+def _motion_path(home) -> str:
+    return str(home / ".cache" / "bmh-101" / "fixed-recordings" / "wave-1a2b" / "motion.json")
+
+
+def _replay_doc(home, **overrides) -> dict:
+    replay = {"path": _motion_path(home), "start": 12, "end": 610, "mode": "blend-in", **overrides}
+    return {"seq": 9, "idle": True, "replay": replay}
+
+
+def test_parse_target_replay_idle(fake_home):
+    target = parse_target(_replay_doc(fake_home))
+    assert target == InferenceTarget.make_idle(
+        9, replay=ReplaySpec(_motion_path(fake_home), 12, 610, "blend-in")
+    )
+    assert target.idle is True and target.relaxed is False and target.home == ()
+    hash(target)
+    goto = parse_target(_replay_doc(fake_home, mode="goto-start", start=0, end=1))
+    assert goto.replay == ReplaySpec(_motion_path(fake_home), 0, 1, "goto-start")
+    # relaxed: false is the default, not a conflict; unknown replay keys are ignored.
+    assert parse_target({**_replay_doc(fake_home), "relaxed": False}) == target
+    assert parse_target(_replay_doc(fake_home, speed=2)) == target
+
+
+@pytest.mark.parametrize(
+    "overrides",
+    [
+        {"path": ""},
+        {"path": 5},
+        {"path": "/etc/passwd"},
+        {"path": "~/.cache/bmh-101/fixed-recordings"},  # the folder itself
+        {"path": "~/.cache/bmh-101/fixed-recordings/../inference-control.json"},
+        {"start": -1},
+        {"start": 10, "end": 10},
+        {"start": 11, "end": 10},
+        {"start": True},
+        {"end": 1.5},
+        {"end": "610"},
+        {"mode": "fast"},
+        {"mode": None},
+    ],
+)
+def test_parse_target_rejects_bad_replay(fake_home, overrides):
+    with pytest.raises(ValueError, match="replay"):
+        parse_target(_replay_doc(fake_home, **overrides))
+
+
+def test_parse_target_rejects_replay_that_is_not_an_object(fake_home):
+    for value in ("wave", ["a"], 1):
+        with pytest.raises(ValueError, match="replay"):
+            parse_target({"seq": 9, "idle": True, "replay": value})
+
+
+def test_parse_target_replay_excludes_relaxed_and_home(fake_home):
+    with pytest.raises(ValueError, match="excludes"):
+        parse_target({**_replay_doc(fake_home), "relaxed": True})
+    with pytest.raises(ValueError, match="excludes"):
+        parse_target({**_replay_doc(fake_home), "home": HOME})
+
+
+def test_parse_target_non_idle_ignores_replay(fake_home):
+    target = parse_target({**VALID, "replay": "nope"})
+    assert target == parse_target(VALID) and target.replay is None
 
 
 def test_parse_target_non_idle_ignores_home():
@@ -299,6 +372,8 @@ def test_format_target_status_round_trips_without_token():
         "relaxed": False,
         "home": False,
         "home_reached": False,
+        "replay": False,
+        "replay_done": False,
     }
 
     accepted = json.loads(format_target_status(target, True, None)[len(STATUS_PREFIX) :])
@@ -319,6 +394,8 @@ def test_format_target_status_idle():
         "relaxed": False,
         "home": False,
         "home_reached": False,
+        "replay": False,
+        "replay_done": False,
     }
 
 
@@ -338,6 +415,21 @@ def test_format_target_status_home():
     assert (moving["idle"], moving["home"], moving["home_reached"]) == (True, True, False)
     assert (reached["seq"], reached["home"], reached["home_reached"]) == (6, True, True)
     assert "left_shoulder_pan" not in json.dumps(moving)  # the pose itself is not echoed
+    assert (moving["replay"], reached["replay_done"]) == (False, False)
+
+
+def test_format_target_status_replay(fake_home):
+    target = InferenceTarget.make_idle(9, replay=ReplaySpec(_motion_path(fake_home), 0, 10, "goto-start"))
+    playing = json.loads(format_target_status(target, True, None)[len(STATUS_PREFIX) :])
+    done = json.loads(format_target_status(target, True, None, replay_done=True)[len(STATUS_PREFIX) :])
+    assert (playing["idle"], playing["replay"], playing["replay_done"], playing["home"]) == (
+        True,
+        True,
+        False,
+        False,
+    )
+    assert (done["seq"], done["replay"], done["replay_done"], done["home_reached"]) == (9, True, True, False)
+    assert "motion.json" not in json.dumps(playing)  # the path is not echoed
 
 
 # --------------------------------------------------------------------------- ramp

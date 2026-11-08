@@ -432,6 +432,8 @@ bmh-groot-client="bmh.scripts.bmh_policy_client:main"
 bmh-center-arm="bmh.scripts.bmh_center_arm:main"
 bmh-record="bmh.scripts.bmh_record:main"
 bmh-read-pose="bmh.scripts.bmh_read_pose:main"
+bmh-record-motion="bmh.scripts.bmh_record_motion:main"
+bmh-replay-motion="bmh.scripts.bmh_replay_motion:main"
 
 # ---------------- Tool Configurations ----------------
 

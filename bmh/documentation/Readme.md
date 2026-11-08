@@ -155,7 +155,7 @@ Locking a group again mid-blend holds the blended pose.
   explicit key sets). Every change is logged as
   `Teleop locks: left=on right=off head=off | head jitter: pan=+0.0 tilt=+0.0 | home: left`.
 - **Head jitter:** the state file may also carry `"head_jitter": {"pan": deg, "tilt": deg}`. A
-  *frozen* head is then held at its frozen pose plus that offset (degrees, clamped to ±15) and eases
+  _frozen_ head is then held at its frozen pose plus that offset (degrees, clamped to ±15) and eases
   to every new offset over `unlock_blend_s`; the offset is always relative to the frozen pose, so it
   never accumulates. It is ignored while the head is not frozen, and a file without the key means no
   offset. The controller-app writes a fresh random offset when the inter-episode reset starts
@@ -209,3 +209,94 @@ and the head) as normalized action values (`left_shoulder_pan.pos` ... `left_hea
   before the inference worker got to the seq (it may still be busy with an older one). Keys the robot has no action for are dropped with a
   warning; `home` together with `"relaxed": true` is rejected; any newer document stops the ramp
   where the robot is. Contract details: `bmh/policy_client/control.py`.
+
+## Fixed recordings (BMH extra)
+
+A **fixed recording** is a joint trajectory recorded once by teleoperation and played back
+exactly — no policy, no cameras. The controller-app's Fixed recordings tab records, trims and
+plays them; a robot script plays one between prompts with `playRecording("name")`. Code:
+`bmh/motion/` (format + replay plan, stdlib only) and the two scripts below.
+
+**Where they live.** `~/.cache/bmh-101/fixed-recordings/<id>/motion.json` (written once by the
+recorder) next to the app's `bmh.meta.json` sidecar (name, trim range). `motion.json`, version 1:
+
+```json
+{
+  "version": 1,
+  "fps": 60,
+  "keys": [
+    "left_shoulder_pan.pos",
+    "...",
+    "left_head_tilt.pos",
+    "right_shoulder_pan.pos",
+    "...",
+    "right_gripper.pos"
+  ],
+  "frames": [[0.0, 12.3, "..."], ["..."]],
+  "recorded_at": 1762600000.0
+}
+```
+
+`keys` are the 16 bimanual action keys (`bmh.motion.file.MOTION_KEYS`); one frame per control tick,
+each the action actually sent to the follower (after the group-lock blend). Degrees for joints,
+0-100 for grippers, 3 decimals; a 2-minute take is about 1 MB.
+
+**Record - `bmh-record-motion --config <file.json>`** (`bmh/scripts/bmh_record_motion.py`). Same
+JSON idea as `bmh-record` (decoded with `draccus.decode`, no CLI parse); `robot` / `teleop` are the
+sections the app writes for `bmh-record`, here without cameras, plus `output` and `fps` (default 60):
+
+```json
+{
+  "robot": {
+    "type": "bi_so_follower",
+    "id": "so_follower",
+    "left_arm_config": { "port": "/dev/ttyACM1", "with_head": true },
+    "right_arm_config": { "port": "/dev/ttyACM0" }
+  },
+  "teleop": {
+    "type": "bi_so_network_leader",
+    "left_arm_config": { "remote_ip": "192.168.1.2", "with_head": true },
+    "right_arm_config": { "remote_ip": "192.168.1.2" },
+    "lock_file": "/home/pi/.cache/bmh-101/teleop-locks.json"
+  },
+  "output": "/home/pi/.cache/bmh-101/fixed-recordings/wave-1a2b/motion.json",
+  "fps": 60
+}
+```
+
+Stdout: `MOTION_READY` (both sides connected), `MOTION_FRAMES <n>` about once per second,
+`MOTION_SAVED <n>` after SIGTERM / SIGINT, `ERROR <message>` (exit 1). After saving, the follower's
+torque goes off (`robot.disconnect()`) like at the end of any session. A signal before
+`MOTION_READY` aborts without saving.
+
+**Replay - `bmh-replay-motion`** (`bmh/scripts/bmh_replay_motion.py`), when nothing else holds the
+ports. Opens only the buses (calibration check like `bmh-read-pose`), pins every goal to the present
+position before enabling torque, plays, then holds the final pose until a newline / EOF on stdin or
+SIGTERM, and turns the torque off. SIGUSR1 during playback stops and holds where the arms are.
+
+```bash
+bmh-replay-motion --left_port /dev/ttyACM1 --right_port /dev/ttyACM0 --id so_follower \
+    --file ~/.cache/bmh-101/fixed-recordings/wave-1a2b/motion.json --start 12 --end 610 \
+    --mode blend-in   # or goto-start; --ramp_s 2.5 --blend_s 1.0 --fps 60
+```
+
+Stdout: `REPLAY_PHASE ramping` (goto-start only) / `REPLAY_PHASE playing`, `REPLAY_DONE` (holding
+the final pose), `REPLAY_PHASE holding` (after SIGUSR1), `ERROR <message>` (exit 1).
+
+**Start modes** (`bmh/motion/player.py`, the same plan in both players). `goto-start`: smoothstep ramp
+from the present pose to the first kept frame over `ramp_s`, then the recording. `blend-in`: the
+recording starts at once, shifted by (present - first frame); the shift fades out over `blend_s`, so
+the arms start where they are and slide onto the trajectory. Playback is time-indexed (linear
+interpolation at `t * fps`), so a 60 Hz recording plays at its speed from a 30 Hz loop too.
+
+**Inference - `replay`** on an idle document of the `bmh-policy-client` control file, for a script's
+`playRecording()` while the Physical Agent holds the ports:
+`{"seq": 7, "idle": true, "replay": {"path": ".../fixed-recordings/<id>/motion.json", "start": 12, "end": 610, "mode": "blend-in"}}`.
+`path` must lie under `~/.cache/bmh-101/fixed-recordings/`, `0 <= start < end`; `replay` excludes
+`relaxed: true` and `home`. The client stiffens the motors if they were relaxed, plays the range from
+the pose it last commanded (`goto-start` ramps over `--home_ramp_s`, `blend-in` fades over
+`--replay_blend_s`, default 1.0 s), then holds the final pose. It reports
+`BMH_TARGET {..., "replay": true, "replay_done": false}` and, after the last frame, a second line with
+`"replay_done": true` (always after the first). A file it cannot load or a range outside the
+recording is answered with `"accepted": false` and the reason; the robot holds. Any newer document
+stops the replay where the robot is.

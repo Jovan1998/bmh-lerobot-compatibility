@@ -53,6 +53,23 @@ and ``relaxed: true`` exclude each other; a non-idle document ignores ``home``.
 
     {"seq": 6, "idle": true, "home": {"left_shoulder_pan.pos": 0.5, "right_gripper.pos": 2.0}}
 
+An idle document may instead carry ``"replay": {path, start, end, mode}`` — play a fixed
+recording (a script's ``playRecording()``, see ``bmh/motion/``). ``path`` is the
+recording's ``motion.json`` and must lie under ``~/.cache/bmh-101/fixed-recordings/``,
+``[start, end)`` is the kept frame range (``0 <= start < end``), ``mode`` is
+``"goto-start"`` or ``"blend-in"``. The client stiffens the motors if they were relaxed,
+loads the file, plays the range from where the arms are and then holds the final pose
+like a plain idle. Like Home, it answers the ``seq`` with a second ``BMH_TARGET`` line once
+the last frame was played (``"replay_done": true``). A file the client cannot load, or a
+range outside it, is answered with ``"accepted": false`` and the reason; the robot holds.
+``replay`` excludes ``relaxed: true`` and ``home``; a non-idle document ignores it.
+
+.. code-block:: json
+
+    {"seq": 7, "idle": true,
+     "replay": {"path": "/home/pi/.cache/bmh-101/fixed-recordings/wave-1a2b/motion.json",
+                "start": 12, "end": 610, "mode": "blend-in"}}
+
 Idle is never expressed by deleting the file — a missing file means "keep the
 current target" (see :class:`ControlFileWatcher`).
 
@@ -104,6 +121,8 @@ from collections.abc import Mapping
 from dataclasses import dataclass, field
 from pathlib import Path
 
+from bmh.motion.file import is_under_motion_root
+from bmh.motion.player import MODES, Mode
 from bmh.policy_client.motion import LOOKAHEAD_MAX_FRAMES
 
 logger = logging.getLogger(__name__)
@@ -146,6 +165,23 @@ _MISSING_SIGNATURE = (-1, -1, -1)
 
 
 @dataclass(frozen=True)
+class ReplaySpec:
+    """The fixed recording an idle target plays: ``motion.json`` path, kept range, start mode.
+
+    Attributes:
+        path: The recording's ``motion.json`` (under ``~/.cache/bmh-101/fixed-recordings/``).
+        start: First kept frame (inclusive).
+        end: End of the kept frames (exclusive), ``> start``.
+        mode: ``"goto-start"`` or ``"blend-in"`` (see ``bmh/motion/player.py``).
+    """
+
+    path: str
+    start: int
+    end: int
+    mode: Mode
+
+
+@dataclass(frozen=True)
 class InferenceTarget:
     """One requested inference target: which server to ask, with which instruction.
 
@@ -161,6 +197,8 @@ class InferenceTarget:
         home: Idle at the Home position: ``(action key, value)`` pairs, sorted by key, the
             robot ramps to and then holds. Empty for every other target; a tuple so the
             frozen dataclass stays hashable. Read it as a dict via :attr:`home_pose`.
+        replay: Idle playing this fixed recording, then holding its final pose. ``None``
+            for every other target.
     """
 
     seq: int
@@ -171,13 +209,21 @@ class InferenceTarget:
     idle: bool = False
     relaxed: bool = False
     home: tuple[tuple[str, float], ...] = ()
+    replay: ReplaySpec | None = None
 
     @classmethod
     def make_idle(
-        cls, seq: int, relaxed: bool = False, home: Mapping[str, float] | None = None
+        cls,
+        seq: int,
+        relaxed: bool = False,
+        home: Mapping[str, float] | None = None,
+        replay: ReplaySpec | None = None,
     ) -> InferenceTarget:
-        """The idle target for ``seq``: no server to ask, nothing to do — torque off if
-        ``relaxed``, moving to and holding ``home`` if given."""
+        """The idle target for ``seq``: no server to ask, nothing to do.
+
+        Torque off if ``relaxed``, moving to and holding ``home`` if given, playing
+        ``replay`` if given.
+        """
         return cls(
             seq=seq,
             policy_host="",
@@ -186,6 +232,7 @@ class InferenceTarget:
             idle=True,
             relaxed=relaxed,
             home=tuple(sorted((key, float(value)) for key, value in (home or {}).items())),
+            replay=replay,
         )
 
     @property
@@ -227,13 +274,14 @@ def parse_target(data: object) -> InferenceTarget:
     Returns:
         The target, with host / instruction / token whitespace-stripped — or the idle
         target for ``seq`` when the document says ``"idle": true`` (of its other keys
-        only ``relaxed`` and ``home`` are read).
+        only ``relaxed``, ``home`` and ``replay`` are read).
 
     Raises:
         ValueError: If a required key is missing or has the wrong type / range.
             Bools are rejected where ints are expected; ``idle`` and an idle
             document's ``relaxed`` must be bools, its ``home`` a non-empty object of
-            finite numbers, and ``home`` cannot be combined with ``relaxed: true``.
+            finite numbers, its ``replay`` an object as described in the module
+            docstring, and at most one of ``relaxed: true``, ``home`` and ``replay``.
     """
     if not isinstance(data, dict):
         raise ValueError(f"expected a JSON object, got {type(data).__name__}")
@@ -250,7 +298,10 @@ def parse_target(data: object) -> InferenceTarget:
         home = _parse_home(data.get("home"))
         if home and relaxed:
             raise ValueError("'home' and 'relaxed' exclude each other")
-        return InferenceTarget.make_idle(seq, relaxed=relaxed, home=home)
+        replay = _parse_replay(data.get("replay"))
+        if replay is not None and (relaxed or home):
+            raise ValueError("'replay' excludes 'relaxed' and 'home'")
+        return InferenceTarget.make_idle(seq, relaxed=relaxed, home=home, replay=replay)
     host = data.get("policy_host")
     if not isinstance(host, str) or not host.strip():
         raise ValueError("'policy_host' must be a non-empty string")
@@ -288,6 +339,33 @@ def _parse_home(value: object) -> dict[str, float] | None:
             raise ValueError(f"'home' position for {key!r} must be a finite number, got {position!r}")
         home[key] = float(position)
     return home
+
+
+def _parse_replay(value: object) -> ReplaySpec | None:
+    """An idle document's optional ``replay``: ``None`` when absent, else the spec.
+
+    Only the document is checked here (shape, range order, that the path lies under the
+    fixed-recordings folder); the control loop loads the file and answers a file it cannot
+    use with a rejection.
+    """
+    if value is None:
+        return None
+    if not isinstance(value, dict):
+        raise ValueError("'replay' must be an object with path, start, end and mode")
+    path = value.get("path")
+    if not isinstance(path, str) or not path.strip():
+        raise ValueError("'replay.path' must be a non-empty string")
+    if not is_under_motion_root(path):
+        raise ValueError(f"'replay.path' must lie under ~/.cache/bmh-101/fixed-recordings, got {path!r}")
+    start, end = value.get("start"), value.get("end")
+    if type(start) is not int or type(end) is not int or not 0 <= start < end:
+        raise ValueError(
+            f"'replay.start' / 'replay.end' must be integers with 0 <= start < end, got {start!r} / {end!r}"
+        )
+    mode = value.get("mode")
+    if mode not in MODES:
+        raise ValueError(f"'replay.mode' must be one of {', '.join(MODES)}, got {mode!r}")
+    return ReplaySpec(path=path, start=start, end=end, mode=mode)
 
 
 @dataclass(frozen=True)
@@ -425,15 +503,6 @@ def format_loop_status(settings: LoopSettings, accepted: bool, error: str | None
     )
 
 
-def smoothstep(t: float) -> float:
-    """Cubic ease-in/ease-out on [0, 1]; clamps outside that range."""
-    if t <= 0.0:
-        return 0.0
-    if t >= 1.0:
-        return 1.0
-    return t * t * (3.0 - 2.0 * t)
-
-
 def ramp_pose(start: Mapping[str, float], target: Mapping[str, float], alpha: float) -> dict[str, float]:
     """Pose ``alpha`` of the way from ``start`` to ``target`` (0 = start, 1 = target).
 
@@ -543,18 +612,25 @@ class LoopFileWatcher(_JsonFileWatcher[LoopSettings]):
 
 
 def format_target_status(
-    target: InferenceTarget, accepted: bool, error: str | None, home_reached: bool = False
+    target: InferenceTarget,
+    accepted: bool,
+    error: str | None,
+    home_reached: bool = False,
+    replay_done: bool = False,
 ) -> str:
     """One-line ``BMH_TARGET {json}`` status for the app to parse. Never includes the token.
 
     Args:
         target: The target that was decided on (accepted or rejected). An idle target
             reports ``"idle": true`` with an empty host / instruction and port 0, a
-            relaxed one also ``"relaxed": true``, one at the Home position ``"home": true``.
+            relaxed one also ``"relaxed": true``, one at the Home position ``"home": true``,
+            one playing a fixed recording ``"replay": true``.
         accepted: Whether the client now runs against ``target``.
         error: Reason for a rejection, ``None`` when accepted.
         home_reached: ``True`` on the second line of a Home target, logged once the
             robot arrived at the pose (same ``seq``).
+        replay_done: ``True`` on the second line of a replay target, logged once the last
+            frame was played (same ``seq``).
     """
     return STATUS_PREFIX + json.dumps(
         {
@@ -568,6 +644,8 @@ def format_target_status(
             "relaxed": target.relaxed,
             "home": bool(target.home),
             "home_reached": home_reached,
+            "replay": target.replay is not None,
+            "replay_done": replay_done,
         }
     )
 
