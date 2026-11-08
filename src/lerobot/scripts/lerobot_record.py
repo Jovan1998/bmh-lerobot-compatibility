@@ -177,6 +177,10 @@ class RecordConfig:
     dataset: DatasetRecordConfig
     # Teleoperator to control the robot (required)
     teleop: TeleoperatorConfig | None = None
+    # BMH: rate at which the robot is commanded, in Hz. Defaults to `dataset.fps`. Must be a
+    # multiple of it: a frame is recorded on every `control_fps // dataset.fps`-th command, so
+    # e.g. 60 drives the arms at 60 Hz while the dataset and its videos stay at 30 fps.
+    control_fps: int | None = None
     # Display all cameras on screen
     display_data: bool = False
     # Visualization backend used when display_data is True: "rerun" or "foxglove".
@@ -200,14 +204,32 @@ class RecordConfig:
                 "Use --teleop.type=... to specify one. "
                 "For policy-based deployment, use lerobot-rollout instead."
             )
+        if self.control_fps is not None and (
+            self.control_fps <= 0 or self.control_fps % self.dataset.fps != 0
+        ):
+            raise ValueError(
+                f"control_fps ({self.control_fps}) must be a positive multiple of "
+                f"dataset.fps ({self.dataset.fps})."
+            )
+
+    @property
+    def control_multiplier(self) -> int:
+        """Loop ticks (robot commands) per recorded frame."""
+        return 1 if self.control_fps is None else self.control_fps // self.dataset.fps
 
 
 """ --------------- record_loop() data flow --------------------------
+The loop ticks at `fps * control_multiplier` Hz. Every tick reads the teleoperator and
+commands the robot; the observation and the dataset frame are taken only on every
+`control_multiplier`-th tick (the "record tick", the first of each group). The other
+ticks hand the action processors the observation of the last record tick. Once a frame
+has used up its 1/fps, the group's remaining ticks are skipped and the next tick records.
+
        [ Robot ]
            V
-     [ robot.get_observation() ] ---> raw_obs
+     [ robot.get_observation() ] ---> raw_obs           (record ticks only)
            V
-     [ robot_observation_processor ] ---> processed_obs
+     [ robot_observation_processor ] ---> processed_obs (record ticks only)
            V
      [ Teleoperator ]
      |
@@ -222,9 +244,11 @@ class RecordConfig:
                                V
                     [ robot.send_action() ] -- (Robot Executes)
                                V
-                    ( Save to Dataset )
+                    ( Save to Dataset )       (record ticks only)
                                V
-                  ( Rerun Log / Loop Wait )
+                  ( Rerun Log )               (record ticks only)
+                               V
+                  ( Loop Wait )
 """
 
 
@@ -250,20 +274,38 @@ def record_loop(
     display_mode: str = "rerun",
     display_compressed_images: bool = False,
     timer: CycleTimer | None = None,
+    control_multiplier: int = 1,
 ) -> None:
-    """Drive the robot from the teleoperator at *fps*, optionally recording each frame.
+    """Drive the robot from the teleoperator, optionally recording a frame at *fps*.
+
+    The loop ticks at ``fps * control_multiplier`` Hz.  Every tick reads the
+    teleoperator and commands the robot; the robot is observed and a dataset frame is
+    written only on the first tick of each group of *control_multiplier* ticks (the
+    record tick).  The other ticks reuse that tick's observation for the action
+    processors.  When a frame has already used up its ``1/fps`` (a record tick that
+    overran), the group's remaining ticks are skipped and the next tick records.  At
+    the default ``control_multiplier == 1`` every tick is a record tick.
 
     *timer* lets a caller that runs several phases — :func:`record` records one episode
     per call, with an unrecorded reset phase in between — keep one
     :class:`~lerobot.utils.cycle_timer.CycleTimer` across all of them, so the cadence
     statistics span the whole session and are reported per episode.  Without it each
     call gets a private timer: identical pacing and identical slow-loop warnings, just
-    no end-of-run summary, since a single phase has no run to summarise.
+    no end-of-run summary, since a single phase has no run to summarise.  A passed
+    timer must pace the same number of ticks per frame (``multiplier``) as
+    *control_multiplier*.
     """
     if dataset is not None and dataset.fps != fps:
         raise ValueError(f"The dataset fps should be equal to requested fps ({dataset.fps} != {fps}).")
     if control_time_s is None:
         raise ValueError("`control_time_s` is required: it is how long the loop runs.")
+    if control_multiplier < 1:
+        raise ValueError(f"control_multiplier must be >= 1, got {control_multiplier}")
+    if timer is not None and timer.multiplier != control_multiplier:
+        raise ValueError(
+            f"The timer paces {timer.multiplier} tick(s) per frame, but control_multiplier is "
+            f"{control_multiplier}."
+        )
 
     # Multi-teleop is LeKiwi-only: one arm leader plus a keyboard that drives the base.
     multi_teleop: tuple[Teleoperator, KeyboardTeleop] | None = None
@@ -293,9 +335,14 @@ def record_loop(
         multi_teleop = (teleop_arm, teleop_keyboard)
 
     if timer is None:
-        timer = CycleTimer(fps, records_data=dataset is not None)
+        timer = CycleTimer(fps, control_multiplier, records_data=dataset is not None)
 
     no_action_count = 0
+    # Ticks since the last record tick.  Starting at 0 makes the first tick of every call
+    # a record tick, so `obs` below is always set before an in-between tick reuses it.
+    ticks_in_frame = 0
+    frame_interval = 1.0 / fps
+    frame_start = 0.0
     timestamp = 0.0
     start_episode_t = time.perf_counter()
     while timestamp < control_time_s:
@@ -305,18 +352,30 @@ def record_loop(
             events["exit_early"] = False
             break
 
-        timer.tick()
+        # A record tick starts every `control_multiplier` ticks, or earlier once the
+        # current frame has used up its 1/fps: after a record tick that overran the whole
+        # frame, the in-between ticks are skipped so they can't make the next frame later
+        # still (recorded frames come first).  Re-anchoring the timer's pacing on each
+        # record tick keeps recorded frames 1/fps apart, also when the previous call (the
+        # previous episode, on a shared timer) ended mid-group.
+        now = time.perf_counter()
+        record_tick = ticks_in_frame % control_multiplier == 0 or now - frame_start >= frame_interval
+        if record_tick:
+            frame_start = now
+            ticks_in_frame = 0
+        timer.tick(new_cycle=record_tick)
 
-        with timer.section("observe"):
-            # Get robot observation
-            obs = robot.get_observation()
+        if record_tick:
+            with timer.section("observe"):
+                # Get robot observation
+                obs = robot.get_observation()
 
-        with timer.section("process_obs"):
-            # Applies a pipeline to the raw robot observation, default is IdentityProcessor
-            obs_processed = robot_observation_processor(obs)
+            with timer.section("process_obs"):
+                # Applies a pipeline to the raw robot observation, default is IdentityProcessor
+                obs_processed = robot_observation_processor(obs)
 
-            if dataset is not None:
-                observation_frame = build_dataset_frame(dataset.features, obs_processed, prefix=OBS_STR)
+                if dataset is not None:
+                    observation_frame = build_dataset_frame(dataset.features, obs_processed, prefix=OBS_STR)
 
         with timer.section("teleop"):
             # Get action from teleop
@@ -355,6 +414,7 @@ def record_loop(
         # spin at full CPU speed on a `control_time_s` that never advanced.
         if robot_action_to_send is None:
             timer.wait()
+            ticks_in_frame += 1
             timestamp = time.perf_counter() - start_episode_t
             continue
 
@@ -366,13 +426,13 @@ def record_loop(
             _sent_action = robot.send_action(robot_action_to_send)
 
         # Write to dataset
-        if dataset is not None:
+        if record_tick and dataset is not None:
             with timer.section("record"):
                 action_frame = build_dataset_frame(dataset.features, action_values, prefix=ACTION)
                 frame = {**observation_frame, **action_frame, "task": single_task}
                 dataset.add_frame(frame)
 
-        if display_data:
+        if record_tick and display_data:
             with timer.section("telemetry"):
                 log_visualization_data(
                     display_mode,
@@ -386,6 +446,7 @@ def record_loop(
             break
 
         timer.wait()
+        ticks_in_frame += 1
 
         timestamp = time.perf_counter() - start_episode_t
 
@@ -410,7 +471,7 @@ def record(
     )
 
     robot = make_robot_from_config(cfg.robot)
-    check_control_rate(robot, cfg.dataset.fps, "--dataset.fps")
+    check_control_rate(robot, cfg.dataset.fps, "--dataset.fps", cfg.control_multiplier)
     teleop = make_teleoperator_from_config(cfg.teleop) if cfg.teleop is not None else None
 
     # Fall back to identity pipelines when the caller doesn't supply processors.
@@ -446,7 +507,7 @@ def record(
     # than one episode's slice of it.  The reset phases below deliberately run on their
     # own private timers: they write no frames, so folding their ticks in would dilute
     # every number that answers "did I record at `fps`?".
-    timer = CycleTimer(cfg.dataset.fps)
+    timer = CycleTimer(cfg.dataset.fps, cfg.control_multiplier)
 
     try:
         if cfg.resume:
@@ -498,6 +559,11 @@ def record(
         if teleop is not None:
             teleop.connect()
         robot.connect()
+        logging.info(
+            "Recording at %d fps, arm commands at %d Hz",
+            cfg.dataset.fps,
+            cfg.dataset.fps * cfg.control_multiplier,
+        )
 
         listener, events = init_keyboard_listener()
         # BMH: SIGUSR1 / SIGUSR2 / SIGTERM = next / re-record / stop, for the headless follower Pi
@@ -533,6 +599,7 @@ def record(
                     display_mode=cfg.display_mode,
                     display_compressed_images=display_compressed_images,
                     timer=timer,
+                    control_multiplier=cfg.control_multiplier,
                 )
 
                 # Execute a few seconds without recording to give time to manually reset the environment
@@ -555,6 +622,8 @@ def record(
                         display_data=cfg.display_data,
                         display_mode=cfg.display_mode,
                         display_compressed_images=display_compressed_images,
+                        # The operator steers between episodes too.
+                        control_multiplier=cfg.control_multiplier,
                     )
 
                 if events["rerecord_episode"]:
