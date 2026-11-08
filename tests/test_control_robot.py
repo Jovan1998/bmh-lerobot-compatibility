@@ -16,6 +16,8 @@
 
 import math
 import re
+import time
+from typing import Any
 from unittest.mock import patch
 
 import pytest
@@ -391,6 +393,50 @@ def test_record_loop_starts_a_new_cycle_on_every_record_tick():
     # stay 1/fps apart even after an episode that ended after an odd number of ticks.
     assert spy.new_cycles == [True, False, True] + [True, False, True, False]
     assert observations == 2 + 2
+
+
+def test_record_loop_skips_the_in_between_tick_after_a_frame_overran():
+    robot = make_robot_from_config(MockRobotConfig())
+    teleop = make_teleoperator_from_config(MockTeleopConfig())
+    robot.connect()
+    teleop.connect()
+    teleop_action_processor, robot_action_processor, robot_observation_processor = make_default_processors()
+    observations = 0
+    real_get_observation = robot.get_observation
+
+    def slow_second_observation() -> dict[str, Any]:
+        nonlocal observations
+        observations += 1
+        if observations == 2:
+            time.sleep(0.05)  # longer than a whole 33.3 ms frame at 30 fps
+        return real_get_observation()
+
+    robot.get_observation = slow_second_observation
+    events = _events()
+    spy = _TickSpy(events, multiplier=2)
+    spy.stop_at = 6
+
+    try:
+        record_loop(
+            robot=robot,
+            events=events,
+            fps=30,
+            teleop_action_processor=teleop_action_processor,
+            robot_action_processor=robot_action_processor,
+            robot_observation_processor=robot_observation_processor,
+            teleop=teleop,
+            control_time_s=1.0,  # safety cap; `stop_at` ends the call first
+            timer=spy,
+            control_multiplier=2,
+        )
+    finally:
+        robot.disconnect()
+        teleop.disconnect()
+
+    # Tick 2 records and overruns its frame, so tick 3 records right away instead of
+    # running as an in-between tick that would make that frame later still.
+    assert spy.new_cycles == [True, False, True, True, False, True]
+    assert observations == 4
 
 
 def test_record_loop_rejects_a_timer_with_a_different_multiplier():

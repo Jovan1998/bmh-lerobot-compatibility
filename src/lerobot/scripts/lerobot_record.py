@@ -222,7 +222,8 @@ class RecordConfig:
 The loop ticks at `fps * control_multiplier` Hz. Every tick reads the teleoperator and
 commands the robot; the observation and the dataset frame are taken only on every
 `control_multiplier`-th tick (the "record tick", the first of each group). The other
-ticks hand the action processors the observation of the last record tick.
+ticks hand the action processors the observation of the last record tick. Once a frame
+has used up its 1/fps, the group's remaining ticks are skipped and the next tick records.
 
        [ Robot ]
            V
@@ -281,7 +282,9 @@ def record_loop(
     teleoperator and commands the robot; the robot is observed and a dataset frame is
     written only on the first tick of each group of *control_multiplier* ticks (the
     record tick).  The other ticks reuse that tick's observation for the action
-    processors.  At the default ``control_multiplier == 1`` every tick is a record tick.
+    processors.  When a frame has already used up its ``1/fps`` (a record tick that
+    overran), the group's remaining ticks are skipped and the next tick records.  At
+    the default ``control_multiplier == 1`` every tick is a record tick.
 
     *timer* lets a caller that runs several phases — :func:`record` records one episode
     per call, with an unrecorded reset phase in between — keep one
@@ -335,7 +338,11 @@ def record_loop(
         timer = CycleTimer(fps, control_multiplier, records_data=dataset is not None)
 
     no_action_count = 0
-    tick_index = 0
+    # Ticks since the last record tick.  Starting at 0 makes the first tick of every call
+    # a record tick, so `obs` below is always set before an in-between tick reuses it.
+    ticks_in_frame = 0
+    frame_interval = 1.0 / fps
+    frame_start = 0.0
     timestamp = 0.0
     start_episode_t = time.perf_counter()
     while timestamp < control_time_s:
@@ -345,11 +352,17 @@ def record_loop(
             events["exit_early"] = False
             break
 
-        # The first tick of every call is a record tick, so `obs` below is always set
-        # before an in-between tick reuses it.  Re-anchoring the timer's pacing on each
-        # record tick keeps recorded frames exactly 1/fps apart, also when the previous
-        # call (the previous episode, on a shared timer) ended mid-group.
-        record_tick = tick_index % control_multiplier == 0
+        # A record tick starts every `control_multiplier` ticks, or earlier once the
+        # current frame has used up its 1/fps: after a record tick that overran the whole
+        # frame, the in-between ticks are skipped so they can't make the next frame later
+        # still (recorded frames come first).  Re-anchoring the timer's pacing on each
+        # record tick keeps recorded frames 1/fps apart, also when the previous call (the
+        # previous episode, on a shared timer) ended mid-group.
+        now = time.perf_counter()
+        record_tick = ticks_in_frame % control_multiplier == 0 or now - frame_start >= frame_interval
+        if record_tick:
+            frame_start = now
+            ticks_in_frame = 0
         timer.tick(new_cycle=record_tick)
 
         if record_tick:
@@ -401,7 +414,7 @@ def record_loop(
         # spin at full CPU speed on a `control_time_s` that never advanced.
         if robot_action_to_send is None:
             timer.wait()
-            tick_index += 1
+            ticks_in_frame += 1
             timestamp = time.perf_counter() - start_episode_t
             continue
 
@@ -433,7 +446,7 @@ def record_loop(
             break
 
         timer.wait()
-        tick_index += 1
+        ticks_in_frame += 1
 
         timestamp = time.perf_counter() - start_episode_t
 

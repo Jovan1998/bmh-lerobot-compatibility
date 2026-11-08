@@ -64,13 +64,17 @@ lerobot-record \
     --teleop.type=bi_so_network_leader \
     --teleop.left_arm_config.remote_ip=192.168.0.200 \
     --teleop.left_arm_config.port_zmq=5555 \
+    --teleop.left_arm_config.polling_timeout_ms=5 \
     --teleop.right_arm_config.remote_ip=192.168.0.200 \
     --teleop.right_arm_config.port_zmq=5557 \
+    --teleop.right_arm_config.polling_timeout_ms=5 \
     --dataset.repo_id=my_local_sets/fun_set_2 \
+    --dataset.fps=30 \
     --dataset.num_episodes=5 \
     --dataset.single_task="Pick up the Controller" \
     --dataset.encoder_threads=2 \
     --dataset.push_to_hub=false \
+    --control_fps=60 \
     --play_sounds=false
 
 ```
@@ -110,8 +114,8 @@ cat > /tmp/record.json <<'JSON'
                                 "cameras": {"front": {"type": "opencv", "index_or_path": 4, "width": 640, "height": 480, "fps": 30, "fourcc": "MJPG", "warmup_s": 2}}},
             "right_arm_config": {"port": "/dev/ttyACM1", "cameras": {}}},
   "teleop": {"type": "bi_so_network_leader",
-             "left_arm_config": {"remote_ip": "192.168.0.200", "port_zmq": 5555, "with_head": true},
-             "right_arm_config": {"remote_ip": "192.168.0.200", "port_zmq": 5557}},
+             "left_arm_config": {"remote_ip": "192.168.0.200", "port_zmq": 5555, "with_head": true, "polling_timeout_ms": 5},
+             "right_arm_config": {"remote_ip": "192.168.0.200", "port_zmq": 5557, "polling_timeout_ms": 5}},
   "dataset": {"repo_id": "my_local_sets/fun_set_2", "fps": 30, "num_episodes": 5, "single_task": "Pick up the Controller",
               "encoder_threads": 2, "push_to_hub": false},
   "control_fps": 60,
@@ -125,7 +129,10 @@ bmh-record --config /tmp/record.json
 It defaults to `dataset.fps` (upstream behaviour) and must be a multiple of it: with 60 and a
 30 fps dataset the loop reads the leader and commands the arms every 16.7 ms, like
 `lerobot-teleoperate`, but observes the robot and records a frame only on every second tick, so
-the dataset and its videos stay at 30 fps.
+the dataset and its videos stay at 30 fps. Set `polling_timeout_ms: 5` on both leader arms with
+it (the controller-app does): at 60 Hz the follower sometimes asks just before the next leader
+message lands, and the default 15 ms wait per arm could then make a recorded frame late. On a
+timeout the tick resends the last leader position.
 
 ## Teleop group locks (BMH extra)
 
