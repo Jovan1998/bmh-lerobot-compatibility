@@ -7,7 +7,9 @@ chunk that was still in flight, a failing request holds instead of ending the pr
 and a failing startup never leaks a connected (torqued) robot. A relaxed idle target turns
 the torque off on both arms' buses and sends nothing until a Hold or a new task, which
 stiffen the arms where they were left. A Home idle target ramps the arms from where they
-are to the saved pose, holds it and reports the arrival; a newer target stops the ramp. The policy's feedback
+are to the saved pose, holds it and reports the arrival; a newer target stops the ramp. A
+replay idle target plays a fixed recording (from a temp ``motion.json``) the same way and
+reports its end; a recording that cannot be played is rejected and the robot holds. The policy's feedback
 values (``feedback_*``) never reach the robot, and come back as ``BMH_FEEDBACK`` lines
 under the seq of the target whose chunk set them. Live loop settings (from a scripted loop
 watcher) change the tick period, the refetch point and the horizon cut from the next tick /
@@ -34,11 +36,13 @@ pytest.importorskip("draccus")
 pytest.importorskip("zmq")
 
 import bmh.scripts.bmh_policy_client as script  # noqa: E402
+from bmh.motion.file import MotionFile, motion_root, save_motion  # noqa: E402
 from bmh.policy_client.control import (  # noqa: E402
     FEEDBACK_STATUS_PREFIX,
     LOOP_STATUS_PREFIX,
     InferenceTarget,
     LoopSettings,
+    ReplaySpec,
 )
 from bmh.policy_client.motion import LookaheadSmoother, MotionShaper  # noqa: E402
 from bmh.scripts.bmh_policy_client import (  # noqa: E402
@@ -535,6 +539,189 @@ def test_home_keys_the_robot_does_not_have_are_dropped(caplog):
     assert all(set(a) == set(LEFT_AT_HAND) for a in robot.sent)
     assert robot.sent[-1] == {"left_j.pos": 30.0, "right_j.pos": 22.0}  # right arm stays put
     assert _home_statuses(caplog, 1) == [False, True]
+
+
+# --------------------------------------------------------------------------- fixed recordings
+
+# 13 frames at 60 fps (0.2 s): the left joint climbs 30 -> 42, the right one falls 0 -> -12.
+REPLAY_FRAMES = tuple((30.0 + i, -float(i)) for i in range(13))
+REPLAY_FIRST = {"left_j.pos": 30.0, "right_j.pos": 0.0}
+REPLAY_LAST = {"left_j.pos": 42.0, "right_j.pos": -12.0}
+
+
+@pytest.fixture
+def motion_path(tmp_path, monkeypatch) -> str:
+    """A recording on `_HomeRobot`'s keys, saved under a fake HOME's fixed-recordings folder."""
+    monkeypatch.setenv("HOME", str(tmp_path))
+    path = motion_root() / "wave-1a2b" / "motion.json"
+    save_motion(path, MotionFile(fps=60, keys=tuple(REPLAY_FIRST), frames=REPLAY_FRAMES, recorded_at=1.0))
+    return str(path)
+
+
+def _replay(seq: int, path: str, mode: str = "goto-start", start: int = 0, end: int = 13) -> InferenceTarget:
+    return InferenceTarget.make_idle(seq, replay=ReplaySpec(path, start, end, mode))  # type: ignore[arg-type]
+
+
+def _replay_statuses(caplog, seq: int) -> list[tuple[bool, bool]]:
+    """`(accepted, replay_done)` of every `BMH_TARGET` line for `seq`, in log order."""
+    lines = [_status_json(s) for s in _statuses(caplog)]
+    assert all(line["replay"] for line in lines if line["seq"] == seq)
+    return [(line["accepted"], line["replay_done"]) for line in lines if line["seq"] == seq]
+
+
+def test_replay_ramps_to_the_start_plays_then_holds_and_reports_the_end(caplog, motion_path):
+    robot, adapter, connect = _HomeRobot(), _FakeAdapter(), _Connect()
+    watcher = _ScriptedWatcher({3: lambda: _replay(1, motion_path)}, ticks=150)
+    with caplog.at_level("INFO"):
+        _run_control_loop(
+            robot, adapter, watcher, InferenceTarget.make_idle(0), _cfg(home_ramp_s=0.05), connect
+        )
+
+    # From the pose read off the buses (torque untouched), up to the first frame, along the
+    # recording, and held at its last frame.
+    assert robot.bus_calls() == [("left", "read Present_Position"), ("right", "read Present_Position")]
+    assert robot.sent[0] == LEFT_AT_HAND
+    # Ramp and recording run the same way here (left up 11 -> 30 -> 42, right down 22 -> 0 -> -12).
+    for key in REPLAY_FIRST:
+        assert _monotonic([a[key] for a in robot.sent])
+    assert any(30.0 < a["left_j.pos"] < 42.0 for a in robot.sent)  # it played, not just ramped
+    assert robot.sent[-1] == REPLAY_LAST
+    assert robot.sent.count(REPLAY_LAST) > 10
+    assert _replay_statuses(caplog, 1) == [(True, False), (True, True)]
+    assert connect.calls == [] and adapter.calls == []
+
+
+def test_replay_blend_in_starts_at_the_present_pose(caplog, motion_path):
+    robot, adapter, connect = _HomeRobot(), _FakeAdapter(), _Connect()
+    watcher = _ScriptedWatcher({3: lambda: _replay(1, motion_path, mode="blend-in")}, ticks=150)
+    with caplog.at_level("INFO"):
+        _run_control_loop(
+            robot,
+            adapter,
+            watcher,
+            InferenceTarget.make_idle(0),
+            _cfg(home_ramp_s=10.0, replay_blend_s=0.1),
+            connect,
+        )
+
+    assert robot.sent[0] == LEFT_AT_HAND  # exactly where the arms are: no jump
+    assert robot.sent[-1] == REPLAY_LAST  # done after the blend, not after a 10 s ramp
+    assert _replay_statuses(caplog, 1) == [(True, False), (True, True)]
+
+
+def test_replay_plays_the_kept_range_only(caplog, motion_path):
+    robot, adapter, connect = _HomeRobot(), _FakeAdapter(), _Connect()
+    watcher = _ScriptedWatcher({3: lambda: _replay(1, motion_path, start=4, end=9)}, ticks=120)
+    with caplog.at_level("INFO"):
+        _run_control_loop(
+            robot, adapter, watcher, InferenceTarget.make_idle(0), _cfg(home_ramp_s=0.05), connect
+        )
+
+    lefts = [a["left_j.pos"] for a in robot.sent]
+    assert max(lefts) == 38.0 and robot.sent[-1] == {"left_j.pos": 38.0, "right_j.pos": -8.0}
+    assert min(a["right_j.pos"] for a in robot.sent) == -8.0
+
+
+def test_new_target_mid_replay_holds_where_the_robot_is(caplog, motion_path):
+    robot, adapter, connect = _HomeRobot(), _FakeAdapter(), _Connect()
+    sent_at_hold: list[int] = []
+
+    def hold() -> InferenceTarget:
+        sent_at_hold.append(len(robot.sent))
+        return InferenceTarget.make_idle(2)
+
+    watcher = _ScriptedWatcher({3: lambda: _replay(1, motion_path), 13: hold})
+    with caplog.at_level("INFO"):
+        _run_control_loop(
+            robot, adapter, watcher, InferenceTarget.make_idle(0), _cfg(home_ramp_s=10.0), connect
+        )
+
+    here = robot.sent[sent_at_hold[0] - 1]
+    assert LEFT_AT_HAND["left_j.pos"] < here["left_j.pos"] < REPLAY_FIRST["left_j.pos"]
+    assert robot.sent[sent_at_hold[0] :] == [here] * (len(robot.sent) - sent_at_hold[0])
+    assert _replay_statuses(caplog, 1) == [(True, False)]  # never done
+
+
+def test_replay_after_relax_stiffens_first_and_starts_from_the_hand_pose(caplog, motion_path):
+    robot, adapter, connect = _HomeRobot(), _FakeAdapter(), _Connect()
+    watcher = _ScriptedWatcher(
+        {3: lambda: InferenceTarget.make_idle(1, relaxed=True), 6: lambda: _replay(2, motion_path)}, ticks=150
+    )
+    with caplog.at_level("INFO"):
+        _run_control_loop(
+            robot, adapter, watcher, InferenceTarget.make_idle(0), _cfg(home_ramp_s=0.05), connect
+        )
+
+    assert robot.bus_calls() == RELAX_CALLS + STIFFEN_CALLS
+    assert robot.sent[0] == LEFT_AT_HAND and robot.sent[-1] == REPLAY_LAST
+    assert _replay_statuses(caplog, 2) == [(True, False), (True, True)]
+
+
+def test_replay_at_startup_plays(caplog, motion_path):
+    robot, adapter, connect = _HomeRobot(), _FakeAdapter(), _Connect()
+    with caplog.at_level("INFO"):
+        _run_control_loop(
+            robot,
+            adapter,
+            _ScriptedWatcher(ticks=150),
+            _replay(0, motion_path, mode="blend-in"),
+            _cfg(replay_blend_s=0.05),
+            connect,
+        )
+    assert robot.sent[0] == LEFT_AT_HAND and robot.sent[-1] == REPLAY_LAST
+    assert _replay_statuses(caplog, 0) == [(True, False), (True, True)]
+
+
+def test_replay_mid_task_drops_the_chunk_and_the_client(caplog, motion_path):
+    robot, adapter, connect = _HomeRobot(), _FakeAdapter(joints=tuple(LEFT_AT_HAND)), _Connect()
+    watcher = _ScriptedWatcher({10: lambda: _replay(2, motion_path)}, ticks=150)
+    with caplog.at_level("INFO"):
+        _run_control_loop(robot, adapter, watcher, _target(1), _cfg(home_ramp_s=0.05), connect)
+
+    assert robot.sent[-1] == REPLAY_LAST
+    assert connect.clients[0].closed == 1  # the worker let go of the policy server
+    assert _replay_statuses(caplog, 2) == [(True, False), (True, True)]
+
+
+@pytest.mark.parametrize(
+    ("make", "reason"),
+    [
+        (lambda path: _replay(1, path.replace("wave-1a2b", "gone")), "cannot load"),
+        (lambda path: _replay(1, path, end=14), "cannot play"),
+    ],
+)
+def test_a_recording_that_cannot_be_played_is_rejected_and_the_robot_holds(caplog, motion_path, make, reason):
+    robot, adapter, connect = _HomeRobot(), _FakeAdapter(), _Connect()
+    watcher = _ScriptedWatcher({3: lambda: make(motion_path)})
+    with caplog.at_level("INFO"):
+        _run_control_loop(
+            robot, adapter, watcher, InferenceTarget.make_idle(0), _cfg(home_ramp_s=0.05), connect
+        )
+
+    lines = [_status_json(s) for s in _statuses(caplog) if _status_json(s)["seq"] == 1]
+    assert len(lines) == 1  # the worker never answers it as an accepted idle
+    assert lines[0]["accepted"] is False and reason in lines[0]["error"]
+    assert robot.sent == []  # nothing was commanded before: still nothing to hold
+
+
+def test_a_rejected_replay_mid_task_holds_the_last_command(caplog, motion_path):
+    robot, adapter, connect = _HomeRobot(), _FakeAdapter(joints=tuple(LEFT_AT_HAND)), _Connect()
+    sent_at_replay: list[int] = []
+
+    def bad_replay() -> InferenceTarget:
+        sent_at_replay.append(len(robot.sent))
+        return _replay(2, motion_path, end=99)
+
+    watcher = _ScriptedWatcher({10: bad_replay})
+    with caplog.at_level("INFO"):
+        _run_control_loop(robot, adapter, watcher, _target(1), _cfg(home_ramp_s=0.05), connect)
+
+    here = robot.sent[sent_at_replay[0] - 1]
+    assert robot.sent[sent_at_replay[0] :] == [here] * (len(robot.sent) - sent_at_replay[0])
+    assert [(line["seq"], line["accepted"]) for line in map(_status_json, _statuses(caplog))][-1] == (
+        2,
+        False,
+    )
 
 
 def test_late_chunk_warning_is_rate_limited(caplog):

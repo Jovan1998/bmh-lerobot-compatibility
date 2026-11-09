@@ -50,3 +50,6 @@ the matching `with_head` value.
 - `bmh_read_pose.py` — `bmh-read-pose`: prints both follower arms' present pose (head included) as
   one `POSE {json}` line without moving anything; the controller-app saves it as the Home position.
   See [`../documentation/Readme.md`](../documentation/Readme.md#home-position-bmh-extra).
+- `bmh_record_motion.py` / `bmh_replay_motion.py` — `bmh-record-motion` and `bmh-replay-motion`:
+  record a fixed recording (joint trajectory only) by teleoperation, and play one back. See
+  [`../documentation/Readme.md`](../documentation/Readme.md#fixed-recordings-bmh-extra).

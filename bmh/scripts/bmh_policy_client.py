@@ -43,7 +43,12 @@ the torque off on every motor, so the operator can move the arms by hand; the ne
 document that is not relaxed turns it back on, holding wherever the arms were left.
 An idle document with a *home* pose (the robot's saved Home position) ramps the arms
 and head there over `--home_ramp_s` seconds and then holds it, reporting the arrival
-with a second `BMH_TARGET` line (`"home_reached": true`).
+with a second `BMH_TARGET` line (`"home_reached": true`). An idle document with a
+*replay* plays a fixed recording (bmh/motion/) from where the arms are — after a
+`--home_ramp_s` ramp to its first frame (`goto-start`) or sliding onto it over
+`--replay_blend_s` (`blend-in`) — then holds its final pose, reporting the end with a
+second `BMH_TARGET` line (`"replay_done": true`). A recording the client cannot load is
+answered with `"accepted": false`; the robot holds.
 
 A skill trained with *feedbacks* returns extra `feedback_<key>` action keys (e.g.
 `feedback_done`). They ride along with each chunk step, never reach the robot, and are
@@ -63,8 +68,8 @@ Every chunk action passes through two stages (bmh/policy_client/motion.py) on it
 the robot, both off by default, in which case the action goes out untouched:
 `LookaheadSmoother` (`lookahead_frames`, a centred average over the played and the
 planned actions — it needs the chunk, so it runs first) and then `MotionShaper`
-(`smoothing_pct`, a speed-gated low-pass). The Home ramp bypasses both and reseeds the
-shaper where the arms are; Relax, Stiffen and the start of a hold reset it. Any tick that
+(`smoothing_pct`, a speed-gated low-pass). The Home ramp and a replay bypass both and
+reseed the shaper where the arms are; Relax, Stiffen and the start of a hold reset it. Any tick that
 plays no chunk action clears the look-ahead's history.
 """
 
@@ -82,6 +87,8 @@ import cv2
 import draccus
 import numpy as np
 
+from bmh.motion.file import load_motion
+from bmh.motion.player import ReplayPlan, plan_replay, smoothstep
 from bmh.policy_client import PolicyClient
 from bmh.policy_client.control import (
     ControlFileWatcher,
@@ -94,7 +101,6 @@ from bmh.policy_client.control import (
     format_loop_status,
     format_target_status,
     ramp_pose,
-    smoothstep,
     validate_loop_settings,
 )
 from bmh.policy_client.feedback import FeedbackTracker
@@ -577,8 +583,12 @@ class BmhInferenceConfig:
     feedback_off_threshold: float = 0.4
     feedback_debounce_ticks: int = 5
     # Seconds the robot takes to ramp from where it is to the Home position of an idle
-    # document's `home` pose (smoothstep, like `bmh-center-arm`). Must be > 0.
+    # document's `home` pose (smoothstep, like `bmh-center-arm`). Must be > 0. Also the
+    # lead-in of a `goto-start` replay: the ramp from where the arms are to its first frame.
     home_ramp_s: float = 2.5
+    # Seconds over which a `blend-in` replay fades out the offset between where the arms
+    # were and the recording's first frame (bmh/motion/player.py). Must be > 0.
+    replay_blend_s: float = 1.0
 
 
 def _initial_target(
@@ -747,6 +757,8 @@ def _idle_suffix(target: InferenceTarget) -> str:
         return " (motors relaxed)"
     if target.home:
         return " (Home position)"
+    if target.replay is not None:
+        return " (fixed recording)"
     return ""
 
 
@@ -797,6 +809,71 @@ def _begin_home(
         return None
     start = dict(last_action) if last_action is not None else _present_pose(robot)
     return _HomeRamp(start=start, target=goal, duration=duration)
+
+
+@dataclass
+class _ReplayRun:
+    """A fixed recording being played: `plan.pose_at(now - t0)` on top of `base`.
+
+    `base` is the full pose the replay started from, so a recording that lacks some of
+    the robot's keys still leaves `last_action` complete. `t0` is the first replay tick
+    (`None` until then).
+    """
+
+    plan: ReplayPlan
+    base: dict[str, float]
+    t0: float | None = None
+
+
+def _begin_replay(
+    robot: Robot,
+    target: InferenceTarget,
+    last_action: dict[str, float] | None,
+    cfg: BmhInferenceConfig,
+) -> tuple[_ReplayRun | None, str | None]:
+    """Load a replay target's recording and plan it from the last commanded (or present) pose.
+
+    Returns:
+        `(run, None)`, or `(None, reason)` when the file cannot be read, is invalid, or its
+        range or keys do not fit — the caller rejects the target and holds.
+    """
+    spec = target.replay
+    if spec is None:
+        return None, "not a replay target"
+    try:
+        motion = load_motion(spec.path)
+    except (OSError, ValueError) as e:
+        return None, f"cannot load the fixed recording: {e}"
+    start = dict(last_action) if last_action is not None else _present_pose(robot)
+    present = {key: value for key, value in start.items() if key in robot.action_features}
+    try:
+        plan = plan_replay(
+            present,
+            motion,
+            spec.start,
+            spec.end,
+            spec.mode,
+            ramp_s=cfg.home_ramp_s,
+            blend_s=cfg.replay_blend_s,
+        )
+    except ValueError as e:
+        return None, f"cannot play the fixed recording: {e}"
+    if plan.dropped_keys:
+        logger.warning(
+            "target #%d: ignoring recording keys the robot does not have: %s",
+            target.seq,
+            ", ".join(plan.dropped_keys),
+        )
+    logger.info(
+        "target #%d: playing fixed recording %s (%s, frames %d-%d, %.1f s)",
+        target.seq,
+        spec.path,
+        spec.mode,
+        spec.start,
+        spec.end,
+        plan.duration_s,
+    )
+    return _ReplayRun(plan=plan, base=start), None
 
 
 def _run_control_loop(
@@ -881,12 +958,15 @@ def _run_control_loop(
     # Set while an idle target with a Home pose ramps the robot there; cleared on arrival
     # (the hold branch then keeps sending the pose) or by any newer target.
     home_ramp: _HomeRamp | None = None
-    # The arrival line (`home_reached`) goes out only after the target's accepted line:
-    # `accepted_seq` is the seq whose accepted line is out (logged at startup, or by the
-    # worker before it answers an idle target with `Idle`), `reached_seq` the seq that
-    # arrived but is not reported yet. A worker still busy with an older seq would
-    # otherwise log that seq's status between the two, and the app reads the arrival as
-    # superseded.
+    # Set while an idle target with a replay plays its fixed recording; cleared after the
+    # last frame (the hold branch then keeps sending the final pose) or by any newer target.
+    replay_run: _ReplayRun | None = None
+    # The arrival line (`home_reached`, or `replay_done` for a replay) goes out only after
+    # the target's accepted line: `accepted_seq` is the seq whose accepted line is out
+    # (logged at startup, or by the worker before it answers an idle target with `Idle`),
+    # `reached_seq` the seq that arrived but is not reported yet. A worker still busy with
+    # an older seq would otherwise log that seq's status between the two, and the app reads
+    # the arrival as superseded.
     accepted_seq = -1
     reached_seq: int | None = None
     # Chunk ownership, for the policy's feedback flags. `fire_seq` is the target the
@@ -908,6 +988,7 @@ def _run_control_loop(
     worker: threading.Thread | None = None
 
     try:
+        startup_error: str | None = None
         if target.relaxed:
             # Relax was pressed while the client was still connecting. (The shaper is
             # still empty: nothing was sent yet.)
@@ -918,6 +999,11 @@ def _run_control_loop(
             # Home was pressed while the client was still connecting.
             home_ramp = _begin_home(robot, target, None, cfg.home_ramp_s)
             logger.info("No target yet — idle, moving to the Home position.")
+        elif target.replay is not None:
+            # A script played a recording while the client was still connecting.
+            replay_run, startup_error = _begin_replay(robot, target, None, cfg)
+            if startup_error is not None:
+                logger.error("target #%d rejected: %s — holding position", target.seq, startup_error)
         elif target.idle:
             logger.info("No target yet — idle, holding position until the controller-app applies one.")
         else:
@@ -925,7 +1011,7 @@ def _run_control_loop(
                 adapter.policy = connect(target)
             except PolicyConnectError as e:
                 raise SystemExit(str(e)) from e
-        logger.info(format_target_status(target, True, None))
+        logger.info(format_target_status(target, startup_error is None, startup_error))
         accepted_seq = target.seq
         # The effective loop settings, also when there is no loop file (seq 0, CLI values).
         logger.info(format_loop_status(settings, True, None))
@@ -965,6 +1051,7 @@ def _run_control_loop(
                     target = new_target
                     fire_now = True
                     home_ramp = None
+                    replay_run = None
                     reached_seq = None
                     if target.idle:
                         # Stop at once instead of playing out the rest of the chunk;
@@ -988,6 +1075,8 @@ def _run_control_loop(
                             logger.info(
                                 "target #%d requested: idle — moving to the Home position", target.seq
                             )
+                        elif target.replay is not None:
+                            logger.info("target #%d requested: idle — playing a fixed recording", target.seq)
                         else:
                             logger.info("target #%d requested: idle — holding position", target.seq)
                     else:
@@ -1016,6 +1105,17 @@ def _run_control_loop(
                     # Home: ramp from the pose just commanded (or stiffened at) to the saved one.
                     if target.home:
                         home_ramp = _begin_home(robot, target, last_action, cfg.home_ramp_s)
+                    # Replay: play the recording from there. A file that cannot be played is
+                    # rejected here, and the worker never hears of this seq — it would answer
+                    # it as an accepted idle. The robot holds (`holding` is set above).
+                    if target.replay is not None:
+                        replay_run, replay_error = _begin_replay(robot, target, last_action, cfg)
+                        if replay_error is not None:
+                            logger.error(
+                                "target #%d rejected: %s — holding position", target.seq, replay_error
+                            )
+                            logger.info(format_target_status(target, False, replay_error))
+                            fire_now = False
 
             # 0b. Pick up new loop settings (after the target: that order is defined).
             #     They apply from this tick on: the period at step 4, the refetch point
@@ -1200,6 +1300,22 @@ def _run_control_loop(
                     logger.info("target #%d: Home position reached", target.seq)
                     reached_seq = target.seq
                     home_ramp = None
+            elif replay_run is not None and not relaxed:
+                # Time-indexed: the recording plays at its own fps whatever this loop's rate.
+                # Unshaped like the Home ramp; the shaper only learns where the arms are.
+                if replay_run.t0 is None:
+                    replay_run.t0 = tick_start
+                elapsed_s = tick_start - replay_run.t0
+                action = {**replay_run.base, **replay_run.plan.pose_at(elapsed_s)}
+                robot.send_action(action)
+                last_action = action
+                last_command = None
+                shaper.reset(action)
+                lookahead.clear()
+                if replay_run.plan.phase_at(elapsed_s) == "done":
+                    logger.info("target #%d: fixed recording played — holding the final pose", target.seq)
+                    reached_seq = target.seq
+                    replay_run = None
             elif holding:
                 # Idle or on hold: keep the last pose, quietly (logged once above) —
                 # unless relaxed: then the arms are the operator's.
@@ -1227,7 +1343,15 @@ def _run_control_loop(
                     )
                     late_logged_at = tick_start
             if reached_seq == target.seq and accepted_seq == target.seq:
-                logger.info(format_target_status(target, True, None, home_reached=True))
+                logger.info(
+                    format_target_status(
+                        target,
+                        True,
+                        None,
+                        home_reached=bool(target.home),
+                        replay_done=target.replay is not None,
+                    )
+                )
                 reached_seq = None
 
             # 3. Fire the next request once we've consumed `refetch_after`
@@ -1320,6 +1444,8 @@ def main(cfg: BmhInferenceConfig) -> None:
         raise SystemExit(f"--feedback_debounce_ticks must be >= 1; got {cfg.feedback_debounce_ticks}.")
     if not cfg.home_ramp_s > 0:
         raise SystemExit(f"--home_ramp_s must be > 0; got {cfg.home_ramp_s}.")
+    if not cfg.replay_blend_s > 0:
+        raise SystemExit(f"--replay_blend_s must be > 0; got {cfg.replay_blend_s}.")
 
     # Initial target: the controller-app's control file when given, else the CLI
     # flags, else idle. A real target is validated by `_connect_policy` (ping +
