@@ -121,6 +121,42 @@ def test_network_leader_returns_last_positions_when_host_goes_quiet():
         net.disconnect()
 
 
+def test_last_message_age_resets_on_a_message_and_grows_when_the_host_goes_quiet():
+    port = _free_port()
+    leader = _FakeLeader({f"{m}.pos": 1.0 for m in ARM})
+    net = SONetworkLeader(SONetworkLeaderConfig(remote_ip="127.0.0.1", port_zmq=port, connect_timeout_s=5))
+    assert net.last_message_age_s == float("inf")  # nothing was ever received
+    with _running_host(leader, port):
+        net.connect()
+        assert net.last_message_age_s < 0.5
+        time.sleep(0.05)
+        net.get_action()  # the host streams at 200 Hz: a fresh message is waiting
+        assert net.last_message_age_s < 0.04
+    # Host stopped: drain what was still queued, then the cached pose only gets older.
+    try:
+        net.get_action()
+        quiet_since = time.perf_counter()
+        time.sleep(0.15)
+        before = net.last_message_age_s
+        net.get_action()  # returns the cached pose; no message arrived
+        assert net.last_message_age_s >= before >= 0.1
+        assert net.last_message_age_s <= time.perf_counter() - quiet_since + 0.1
+    finally:
+        net.disconnect()
+
+
+def test_bimanual_leader_reports_the_staler_arm():
+    from lerobot.teleoperators.bi_so_network_leader import BiSONetworkLeader, BiSONetworkLeaderConfig
+
+    bi = BiSONetworkLeader(BiSONetworkLeaderConfig())
+    assert bi.last_message_age_s == float("inf")
+    now = time.perf_counter()
+    bi.left_arm._last_message_at = now - 0.01
+    assert bi.last_message_age_s == float("inf")  # the right arm never spoke
+    bi.right_arm._last_message_at = now - 2.0
+    assert 2.0 <= bi.last_message_age_s < 2.5
+
+
 # --- create_leader: headless connect on the real SOLeader --------------------------------
 
 

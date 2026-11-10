@@ -1,5 +1,6 @@
 import json
 import logging
+import time
 from functools import cached_property
 from typing import Any
 
@@ -49,6 +50,19 @@ class SONetworkLeader(Teleoperator):
         self._is_connected = False
         # Set from the first message in connect(); get_action() is only reachable after that.
         self._last_action: dict[str, float] = {}
+        # BMH: `time.perf_counter()` of the last message received (None before connect()).
+        self._last_message_at: float | None = None
+
+    @property
+    def last_message_age_s(self) -> float:
+        """Seconds since the last message from the leader host (``inf`` before the first).
+
+        `get_action()` keeps returning the cached positions when nothing arrives, so a dead
+        stream looks like a leader that stands still; this tells the two apart.
+        """
+        if self._last_message_at is None:
+            return float("inf")
+        return time.perf_counter() - self._last_message_at
 
     @cached_property
     def action_features(self) -> dict[str, type]:
@@ -102,6 +116,7 @@ class SONetworkLeader(Teleoperator):
         # Read and cache the first message
         msg = self.zmq_socket.recv_string(zmq.NOBLOCK)
         self._last_action = json.loads(msg)
+        self._last_message_at = time.perf_counter()
         self._is_connected = True
         logger.info(f"SONetworkLeader connected to {zmq_url}")
 
@@ -131,6 +146,7 @@ class SONetworkLeader(Teleoperator):
                 break
 
         if last_msg is not None:
+            self._last_message_at = time.perf_counter()
             try:
                 self._last_action = json.loads(last_msg)
             except json.JSONDecodeError as e:

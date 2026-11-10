@@ -300,3 +300,120 @@ the pose it last commanded (`goto-start` ramps over `--home_ramp_s`, `blend-in` 
 `"replay_done": true` (always after the first). A file it cannot load or a range outside the
 recording is answered with `"accepted": false` and the reason; the robot holds. Any newer document
 stops the replay where the robot is.
+
+## DAgger recording (BMH extra)
+
+`bmh-dagger --config <file.json>` (`bmh/scripts/bmh_dagger.py`, logic in `bmh/dagger/`) runs a
+**DAgger session**: a policy drives the robot, the operator pauses it, optionally rewinds the
+robot along the motion it just made, takes over with the leader arms and finishes the task.
+Only that correction is recorded, as one episode per take-over.
+
+One process owns the robot for the whole session, because `bmh-policy-client` and `bmh-record`
+both need the serial ports and the cameras and take ~10 s to start. It connects follower,
+cameras, leader stream and dataset writer once and switches between policy, hold, rewind and
+teleoperation inside one loop. `bmh-policy-client` and `lerobot-record` are not changed: the
+adapter, the policy connect, the inference worker, look-ahead and smoothing are imported from
+the policy client as they are, and its chunk swap / refetch logic is ported into
+`bmh/dagger/policy_runner.py` (same variables, same tests).
+
+**Config.** `robot`, `teleop` and `dataset` are exactly the blocks of `bmh-record`, so the
+staging dataset has the features of a recording staging dataset and the app's converter merges
+it unchanged:
+
+```json
+{
+  "robot": { "type": "bi_so_follower", "...": "as for bmh-record" },
+  "teleop": { "type": "bi_so_network_leader", "...": "as for bmh-record" },
+  "dataset": { "repo_id": "local/my-set", "root": "/path/to/recording-staging", "...": "as for bmh-record" },
+  "control_fps": 60,
+  "loop_file": "/home/pi/.cache/bmh-101/inference-loop.json",
+  "jpeg_quality": 80
+}
+```
+
+| Key | Default | Meaning |
+| --- | --- | --- |
+| `control_fps` | 60 | Arm command rate while the operator steers; a multiple of `dataset.fps` (a frame every `control_fps / dataset.fps`-th command, as in `bmh-record`). |
+| `loop_file` | none | The Physical Agent's loop-settings file. Polled every tick and answered with the same `BMH_LOOP` lines as `bmh-policy-client`. |
+| `jpeg_quality` | 80 | Camera JPEG quality of the policy requests. |
+| `history_s` | 60 | Seconds of sent actions kept for rewinding (30 frames per second). |
+| `align_arm_tol_deg` / `align_gripper_tol` | 4 / 5 | The leader counts as aligned when every joint is this close to the held pose (degrees; 0..100 for grippers). |
+| `align_hold_s` | 0.4 | Aligned for this long without a gap starts the take by itself. |
+| `takeover_blend_s` | 1.0 | Shortest fade of the leader / follower offset at the start of a take. A larger gap stretches it (45 deg/s at most). |
+| `home_ramp_s` | 2.5 | Duration of the Home ramp. |
+| `probe_timeout_ms` / `timeout_ms` | 5000 / 15000 | Policy server timeouts, as for `bmh-policy-client`. |
+
+**Phases.**
+
+| Phase | Robot | Leaves on |
+| --- | --- | --- |
+| `connecting` | not connected yet | both sides connected: `paused` (prints `DAGGER_READY`) |
+| `paused` | holds `history[cursor]` | `run`, `step`, `home`, `align`, `finish` |
+| `running` | policy chunks through look-ahead and smoothing | `pause`, `align`; a policy error: `paused` |
+| `stepping` | one history frame per tick toward the cursor | arrival: `paused`; `pause`, `run`, `step`, `home`, `align` |
+| `homing` | smoothstep ramp to the Home pose | arrival: `paused` (the history restarts there); `pause` |
+| `aligning` | holds; reads the leader, reports `leader - hold` | aligned for `align_hold_s` with `auto_start`, or `record`: `recording`; `cancel`: `paused` |
+| `recording` | follows the leader (blended in), writes frames | `save` / `discard`, or `dataset.episode_time_s` reached: `saving` |
+| `saving` | servos keep their last goal (the loop blocks in `save_episode`) | done: `paused` |
+| `finishing` | `dataset.finalize()`, disconnect | exit 0 |
+
+**Commands**, one JSON object per line on stdin, each with an integer `id`:
+
+```json
+{"id": 1, "cmd": "policy", "policy_host": "1.2.3.4", "policy_port": 5555, "api_token": "...", "lang_instruction": "put the cube in the bowl"}
+{"id": 2, "cmd": "run"}
+{"id": 3, "cmd": "pause"}
+{"id": 4, "cmd": "step", "cursor": 45}
+{"id": 5, "cmd": "home", "pose": {"left_shoulder_pan.pos": 0.0}}
+{"id": 6, "cmd": "align", "task": "put the cube in the bowl", "auto_start": true, "assist": false, "assist_torque_pct": 10}
+{"id": 7, "cmd": "record"}
+{"id": 8, "cmd": "cancel"}
+{"id": 9, "cmd": "save"}
+{"id": 10, "cmd": "discard"}
+{"id": 11, "cmd": "finish"}
+```
+
+stdin, not a polled file like the policy client's control file: these are events, and two of
+them inside one tick must both arrive, in order. The API token never touches the disk, and
+stdin EOF (the app died) ends the session instead of leaving a policy running unsupervised. A
+command that is not valid in the current phase is refused (`ok: false` with the reason), never
+queued. `cursor` is "frames back from the newest history frame"; it is absolute, and the loop
+walks toward it by one frame per tick, so lost or repeated key events cannot make the robot
+jump. `run` with a policy that had failed asks for it again. `assist` is accepted, but this
+build has no follower-to-leader channel yet, so the status reports `"assist": "unavailable"`.
+
+**Output** the app parses (stdout; log lines go through `logging`):
+
+```text
+DAGGER_READY
+BMH_DAGGER_ACK {"id": 6, "ok": true}
+BMH_DAGGER_ACK {"id": 7, "ok": false, "error": "not aligning"}
+BMH_DAGGER {"phase": "aligning", "policy": "ready", "history": 412, "cursor": 0, "episodes": 3, "hold": {"left_shoulder_pan.pos": 12.3}, "align": {"diff": {"left_shoulder_pan.pos": -3.2}, "aligned": false, "leader_age_ms": 14, "assist": "off"}, "take": {"frames": 0}}
+BMH_TARGET {...}   as bmh-policy-client, logged by the reused inference worker
+BMH_LOOP {...}     as bmh-policy-client
+ERROR <message>    then exit 1
+```
+
+`BMH_DAGGER` goes out twice a second, ten times a second while `aligning`, and once on every
+phase change. `policy` is `none | connecting | ready | error` (the reason of an error is in the
+`BMH_TARGET` line). `hold` is present while `paused` and `aligning`, `align` while `aligning`,
+`take` from `aligning` to `saving`. Values are rounded to 2 decimals.
+
+**How a take starts.** The reference for the alignment is the pose the follower was last
+*commanded*, not the pose it measures: a gripper squeezing an object never reaches its goal, and
+aligning to the measured position would relax the grip the moment teleoperation starts. The
+first teleop action is shifted by `hold - leader`, so it equals the hold pose exactly, and that
+shift fades out with a smoothstep; after the fade the leader's action passes through untouched.
+The action recorded is the action sent. A take never starts on a leader stream that has been
+silent for more than 0.5 s (`SONetworkLeader.last_message_age_s`; `get_action()` itself keeps
+returning the cached pose).
+
+**How a session ends.** `finish`, stdin EOF, SIGTERM / SIGINT and any error take the same path:
+an unsaved take is discarded, the dataset is finalized, robot and leader are disconnected. An
+error (for example a servo that drops off the bus) then prints `ERROR ...` and exits 1, so the
+episodes saved before it survive.
+
+**Bench test for the leader assist.** `bmh-center-arm --type leader ... --torque_limit 100`
+drives a leader arm weakly: `Torque_Limit` is written to every motor before any torque comes on,
+the motors are enabled one at a time 50 ms apart, and the previous limits are written back on
+release. It answers whether the leader Pi and its USB bus stay up while the arm pulls lightly.

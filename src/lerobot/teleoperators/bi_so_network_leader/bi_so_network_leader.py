@@ -88,6 +88,11 @@ class BiSONetworkLeader(Teleoperator):
         return self.left_arm.is_connected and self.right_arm.is_connected
 
     @property
+    def last_message_age_s(self) -> float:
+        """Seconds since the staler of the two arms last heard from the leader host."""
+        return max(self.left_arm.last_message_age_s, self.right_arm.last_message_age_s)
+
+    @property
     def is_calibrated(self) -> bool:
         return True
 

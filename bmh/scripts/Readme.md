@@ -46,7 +46,12 @@ the matching `with_head` value.
   controller-app for every recording session. Config layout and example:
   [`../documentation/Readme.md`](../documentation/Readme.md#fast-startup-bmh-extras).
 - `bmh_policy_client.py` — `bmh-policy-client`: policy client for any BMH policy server, GR00T or SmolVLA (see its module docstring). `bmh_groot_client.py` / `bmh-groot-client` remain as aliases for one release.
+- `bmh_dagger.py` — `bmh-dagger --config <file.json>`: DAgger recording. A policy runs, the
+  operator pauses / rewinds / takes over with the leader, and only the correction is recorded.
+  Driven by JSON commands on stdin. See
+  [`../documentation/Readme.md`](../documentation/Readme.md#dagger-recording-bmh-extra).
 - `bmh_center_arm.py` — `bmh-center-arm`: moves an arm to its calibrated center pose.
+  `--torque_limit <0..1000>` does it with a low torque limit (bench test for the leader assist).
 - `bmh_read_pose.py` — `bmh-read-pose`: prints both follower arms' present pose (head included) as
   one `POSE {json}` line without moving anything; the controller-app saves it as the Home position.
   See [`../documentation/Readme.md`](../documentation/Readme.md#home-position-bmh-extra).
