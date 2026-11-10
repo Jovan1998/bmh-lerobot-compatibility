@@ -35,6 +35,9 @@ of leaving a policy running unsupervised.
                 "episodes": 3, "hold": {...}, "align": {...}, "take": {"frames": 0}}
     ERROR <message>
 
+These lines are printed, not logged: the process's log goes to stderr, and a log line of
+level ERROR would otherwise look like the final ``ERROR`` line.
+
 stdlib only, so it is unit-testable anywhere.
 """
 

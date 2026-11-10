@@ -382,7 +382,10 @@ walks toward it by one frame per tick, so lost or repeated key events cannot mak
 jump. `run` with a policy that had failed asks for it again. `assist` is accepted, but this
 build has no follower-to-leader channel yet, so the status reports `"assist": "unavailable"`.
 
-**Output** the app parses (stdout; log lines go through `logging`):
+**Output** the app parses. The `DAGGER_READY`, `BMH_DAGGER`, `BMH_DAGGER_ACK` and `ERROR` lines are
+printed on stdout; `BMH_TARGET` and `BMH_LOOP` are log lines like everything else and go to stderr.
+The app reads the final `ERROR` line from stdout only, because a log line of level ERROR starts
+the same way:
 
 ```text
 DAGGER_READY
