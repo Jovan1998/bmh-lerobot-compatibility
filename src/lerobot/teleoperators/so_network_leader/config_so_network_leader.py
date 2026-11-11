@@ -26,6 +26,11 @@ class SONetworkLeaderBaseConfig:
     # Must match the leader host's with_head setting.
     with_head: bool = False
 
+    # BMH: ZMQ port the leader host receives leader-assist goals for this arm on
+    # (`so_leader_host --left_feedback_port / --right_feedback_port`). None: no feedback,
+    # `send_feedback` raises NotImplementedError as upstream.
+    feedback_port_zmq: int | None = None
+
 
 @TeleoperatorConfig.register_subclass("so_network_leader")
 @dataclass

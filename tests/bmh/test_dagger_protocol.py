@@ -10,6 +10,7 @@ from bmh.dagger.protocol import (
     ACK_PREFIX,
     STATUS_PREFIX,
     Align,
+    Assist,
     Cancel,
     Discard,
     Eof,
@@ -82,8 +83,16 @@ def test_step_home_and_align():
     )
     assert parse_command(_line(id=6, cmd="align", task=" fold ")) == Align(6, "fold", True, False, 10)
     assert parse_command(
-        _line(id=6, cmd="align", task="fold", auto_start=False, assist=True, assist_torque_pct=30)
-    ) == Align(6, "fold", False, True, 30)
+        _line(id=6, cmd="align", task="fold", auto_start=False, assist=True, assist_torque_pct=20)
+    ) == Align(6, "fold", False, True, 20)
+
+
+def test_assist():
+    assert parse_command(_line(id=12, cmd="assist", assist=True, assist_torque_pct=15)) == Assist(
+        12, True, 15
+    )
+    assert parse_command(_line(id=12, cmd="assist", assist=True)) == Assist(12, True, 10)
+    assert parse_command(_line(id=12, cmd="assist")) == Assist(12, False, 10)
 
 
 # --------------------------------------------------------------------------- reject
@@ -112,10 +121,13 @@ def test_step_home_and_align():
         (_line(id=1, cmd="align"), "'task' must be a non-empty string"),
         (_line(id=1, cmd="align", task="  "), "'task' must be a non-empty string"),
         (_line(id=1, cmd="align", task="t", assist_torque_pct=0), "'assist_torque_pct' must be"),
-        (_line(id=1, cmd="align", task="t", assist_torque_pct=31), "'assist_torque_pct' must be"),
+        (_line(id=1, cmd="align", task="t", assist_torque_pct=21), "'assist_torque_pct' must be"),
         (_line(id=1, cmd="align", task="t", assist_torque_pct=10.0), "'assist_torque_pct' must be"),
         (_line(id=1, cmd="align", task="t", auto_start="yes"), "'auto_start' must be a boolean"),
         (_line(id=1, cmd="align", task="t", assist=1), "'assist' must be a boolean"),
+        (_line(id=1, cmd="assist", assist="on"), "'assist' must be a boolean"),
+        (_line(id=1, cmd="assist", assist=True, assist_torque_pct=0), "'assist_torque_pct' must be"),
+        (_line(id=1, cmd="assist", assist=True, assist_torque_pct=21), "'assist_torque_pct' must be"),
         (_line(id=1, cmd="policy", policy_port=1, lang_instruction="x"), "'policy_host' must be"),
         (_line(id=1, cmd="policy", policy_host="h", lang_instruction="x"), "'policy_port' must be"),
         (

@@ -35,6 +35,14 @@ worker (which logs the `BMH_TARGET` lines), look-ahead and smoothing, and the lo
 settings file (`--loop_file` of `bmh-policy-client`, answered with the same `BMH_LOOP`
 lines), so corrections are collected under the motion shaping the policy is deployed with.
 
+Leader assist: with `assist` on (in `align`, or the `assist` command while aligning) and a
+leader stream that has the feedback channel (`feedback_port_zmq` on both arms of the
+`bi_so_network_leader` config), every aligning tick sends the hold pose of the arm joints
+and grippers that are not locked to the leader host, which pulls the leader arms toward it
+with a low torque. Leaving `aligning` (the take starts, cancel, finish, an error) releases
+the leader at once; the leader host also lets go by itself 0.3 s after the messages stop.
+Without the channel the status reports `"assist": "unavailable"`.
+
 Rewind: every action sent while the robot is being moved (policy, teleop) goes into a ring
 buffer, one frame per 30 Hz tick. `step` carries an absolute cursor and the loop walks
 toward it by one frame per tick, so the robot replays its own motion and lost or repeated
@@ -74,6 +82,7 @@ from bmh.dagger.protocol import (
     ERROR_PREFIX,
     READY_LINE,
     Align,
+    Assist,
     AssistState,
     Cancel,
     Command,
@@ -120,6 +129,8 @@ STATUS_HZ = 2.0
 ALIGN_STATUS_HZ = 10.0
 # A leader message older than this means the stream is dead; a take must not start on it.
 LEADER_STALE_S = 0.5
+# `assist_torque_pct` is percent of full torque; the servos' `Torque_Limit` counts in 0.1 %.
+TORQUE_LIMIT_PER_PCT = 10
 
 
 @dataclass
@@ -282,6 +293,9 @@ class DaggerSession:
         self._task = ""
         self._auto_start = True
         self._assist: AssistState = "off"
+        self._assist_torque_limit = 0
+        # A goal went to the leader since the last release.
+        self._assisting = False
         self._gate = AlignGate(cfg.align_hold_s)
         self._align: AlignState | None = None
         self._leader: dict[str, float] | None = None
@@ -360,6 +374,7 @@ class DaggerSession:
             logger.info("Stop signal received — finishing the session.")
             self._finish = True
         if self._finish:
+            self._release_assist()
             if self.phase == "saving":
                 # Save was pressed just before the end: the take must not be lost to it.
                 self._finish_take()
@@ -391,6 +406,9 @@ class DaggerSession:
             # dropped), so the app sees `ready` or the error before Run.
             self._runner.tick(now)
             self._runner.fire(self._robot.get_observation)
+        if self.phase != "aligning" or self._assist != "on":
+            # The same tick the take starts (or the take-over ends): the leader goes limp.
+            self._release_assist()
         self._emit_status(now)
         return True
 
@@ -462,12 +480,16 @@ class DaggerSession:
                 self._runner.suspend()
             self._task = cmd.task
             self._auto_start = cmd.auto_start
-            # The leader assist needs the follower-to-leader channel, which this build lacks.
-            self._assist = "unavailable" if cmd.assist else "off"
+            self._set_assist(cmd.assist, cmd.assist_torque_pct)
             self._gate.reset()
             self._align = None
             self._leader = None
             self.phase = "aligning"
+            return None
+        if isinstance(cmd, Assist):
+            if phase != "aligning":
+                return "not aligning"
+            self._set_assist(cmd.assist, cmd.assist_torque_pct)
             return None
         if isinstance(cmd, Record):
             if phase != "aligning":
@@ -549,11 +571,35 @@ class DaggerSession:
         self._leader_age_s = float(getattr(self._teleop, "last_message_age_s", 0.0))
         return leader
 
+    def _set_assist(self, on: bool, torque_pct: int) -> None:
+        if not on:
+            self._assist = "off"
+        elif getattr(self._teleop, "has_feedback", False):
+            self._assist = "on"
+        else:
+            # The leader stream was started without the follower-to-leader channel.
+            self._assist = "unavailable"
+        self._assist_torque_limit = torque_pct * TORQUE_LIMIT_PER_PCT
+
+    def _pull_leader(self, hold: dict[str, float]) -> None:
+        """Send the leader the hold pose of every arm joint whose group follows the leader."""
+        locked: frozenset[str] = getattr(self._teleop, "locked_keys", frozenset())
+        goal = {key: hold[key] for key in self._teleop.feedback_features if key in hold and key not in locked}
+        self._teleop.send_feedback(goal, self._assist_torque_limit)
+        self._assisting = True
+
+    def _release_assist(self) -> None:
+        if self._assisting:
+            self._assisting = False
+            self._teleop.release_feedback()
+
     def _tick_aligning(self, now: float) -> None:
         hold = self.hold
         leader = self._read_leader()
         self._align = alignment(leader, hold, self._cfg.align_arm_tol_deg, self._cfg.align_gripper_tol)
         self._send(hold)
+        if self._assist == "on":
+            self._pull_leader(hold)
         fresh = self._leader_age_s <= LEADER_STALE_S
         if self._gate.update(self._align.aligned and fresh, now) and self._auto_start:
             self._begin_take(leader)

@@ -371,6 +371,7 @@ it unchanged:
 {"id": 9, "cmd": "save"}
 {"id": 10, "cmd": "discard"}
 {"id": 11, "cmd": "finish"}
+{"id": 12, "cmd": "assist", "assist": true, "assist_torque_pct": 15}
 ```
 
 stdin, not a polled file like the policy client's control file: these are events, and two of
@@ -379,8 +380,8 @@ stdin EOF (the app died) ends the session instead of leaving a policy running un
 command that is not valid in the current phase is refused (`ok: false` with the reason), never
 queued. `cursor` is "frames back from the newest history frame"; it is absolute, and the loop
 walks toward it by one frame per tick, so lost or repeated key events cannot make the robot
-jump. `run` with a policy that had failed asks for it again. `assist` is accepted, but this
-build has no follower-to-leader channel yet, so the status reports `"assist": "unavailable"`.
+jump. `run` with a policy that had failed asks for it again. `assist` (only while `aligning`)
+switches the leader assist on or off or changes its torque; `align` sets it for the take-over.
 
 **Output** the app parses. The `DAGGER_READY`, `BMH_DAGGER`, `BMH_DAGGER_ACK` and `ERROR` lines are
 printed on stdout; `BMH_TARGET` and `BMH_LOOP` are log lines like everything else and go to stderr.
@@ -416,7 +417,36 @@ an unsaved take is discarded, the dataset is finalized, robot and leader are dis
 error (for example a servo that drops off the bus) then prints `ERROR ...` and exits 1, so the
 episodes saved before it survive.
 
+**Leader assist.** While the operator lines the leader arms up with the robot, the leader arms
+can pull lightly toward the pose the robot holds, so the operator feels where to go. With
+`assist: true` and `assist_torque_pct` (1..20, percent of full torque: 10 is a `Torque_Limit` of
+100), every `aligning` tick sends the hold pose of the arm joints and grippers to the leader host,
+one ZMQ PUSH socket per arm (`SONetworkLeader.send_feedback`). Arms whose group is locked get a
+release instead, and the head is never driven. The moment `aligning` ends (the take starts,
+`cancel`, `finish`, an error) the leader is released, so the operator must be holding the arms
+when the take starts. The status's `assist` is `on`, `off`, or `unavailable` when the leader stream
+has no feedback channel.
+
+It needs the channel on both sides:
+
+- leader Pi: `so_leader_host.py ... --left_feedback_port 5556 --right_feedback_port 5558`
+  (optionally `--assist_max_torque_limit`, default 200). The host binds one PULL socket per arm.
+- follower: `feedback_port_zmq` in both arm configs of the `bi_so_network_leader` teleop
+  (`"left_arm_config": {..., "feedback_port_zmq": 5556}`, `5558` on the right).
+
+Messages, JSON, latest only: `{"goal": {"shoulder_pan.pos": 12.0, ...}, "torque_limit": 100}`
+and `{"release": true}`. The follower's PUSH socket conflates; the host's PULL socket does not
+and reads to the latest message each tick, because a conflating receiver drops a message it has
+not read yet when the sender disconnects, and that is the follower's last `release`. The rules are enforced on the leader
+(`bmh/dagger/leader_assist.py`), not by the sender: the limit is capped at
+`--assist_max_torque_limit` and written to every joint before any torque comes on; the joints come
+on one at a time, 50 ms apart, each pinned to where it is, without stalling the position stream;
+the goal walks toward the target at 60 degrees (gripper: 60 %) per second; 0.3 s without a
+message turns the torque off by itself; a bus error releases. On release the torque goes off
+first and the limits read before the first engage are written back.
+
 **Bench test for the leader assist.** `bmh-center-arm --type leader ... --torque_limit 100`
 drives a leader arm weakly: `Torque_Limit` is written to every motor before any torque comes on,
 the motors are enabled one at a time 50 ms apart, and the previous limits are written back on
-release. It answers whether the leader Pi and its USB bus stay up while the arm pulls lightly.
+release. Run on both leader arms at once with 100 and 200 (2026-11-12): the leader Pi stayed up,
+which is why the assist is capped at 200 (20 %).

@@ -8,6 +8,7 @@ from lerobot.utils.decorators import check_if_already_connected, check_if_not_co
 
 from ..so_network_leader import SONetworkLeader
 from ..so_network_leader.config_so_network_leader import SONetworkLeaderConfig
+from ..so_network_leader.so_network_leader import DEFAULT_FEEDBACK_TORQUE_LIMIT
 from .config_bi_so_network_leader import BiSONetworkLeaderConfig
 from .group_lock import ActionGroupLock, LockFileWatcher, bimanual_lock_groups, head_jitter_offsets
 
@@ -38,6 +39,7 @@ class BiSONetworkLeader(Teleoperator):
             connect_timeout_s=config.left_arm_config.connect_timeout_s,
             use_degrees=config.left_arm_config.use_degrees,
             with_head=config.left_arm_config.with_head,
+            feedback_port_zmq=config.left_arm_config.feedback_port_zmq,
         )
 
         right_arm_config = SONetworkLeaderConfig(
@@ -49,6 +51,7 @@ class BiSONetworkLeader(Teleoperator):
             connect_timeout_s=config.right_arm_config.connect_timeout_s,
             use_degrees=config.right_arm_config.use_degrees,
             with_head=config.right_arm_config.with_head,
+            feedback_port_zmq=config.right_arm_config.feedback_port_zmq,
         )
 
         self.left_arm = SONetworkLeader(left_arm_config)
@@ -56,8 +59,9 @@ class BiSONetworkLeader(Teleoperator):
 
         # BMH-101 group locks (left arm / right arm / head), driven by a JSON state file
         # the controller-app writes. Disabled (pure passthrough) when lock_file is None.
+        self._lock_groups = bimanual_lock_groups(left_with_head=config.left_arm_config.with_head)
         self._lock = ActionGroupLock(
-            bimanual_lock_groups(left_with_head=config.left_arm_config.with_head),
+            self._lock_groups,
             blend_s=config.unlock_blend_s,
             pose_blend_s=config.home_blend_s,
         )
@@ -79,9 +83,27 @@ class BiSONetworkLeader(Teleoperator):
             **{f"right_{k}": v for k, v in right_features.items()},
         }
 
+    @property
+    def has_feedback(self) -> bool:
+        """BMH: whether both arms have a feedback channel to the leader host."""
+        return self.left_arm.has_feedback and self.right_arm.has_feedback
+
     @cached_property
     def feedback_features(self) -> dict[str, type]:
-        return {}
+        if not self.has_feedback:
+            return {}
+        return {
+            **{f"left_{k}": v for k, v in self.left_arm.feedback_features.items()},
+            **{f"right_{k}": v for k, v in self.right_arm.feedback_features.items()},
+        }
+
+    @property
+    def locked_keys(self) -> frozenset[str]:
+        """BMH: action keys of the groups that are locked right now (they do not follow the leader)."""
+        if self._lock_watcher is None:
+            return frozenset()
+        locks = self._lock.locks
+        return frozenset(key for group, keys in self._lock_groups.items() if locks.get(group) for key in keys)
 
     @property
     def is_connected(self) -> bool:
@@ -141,8 +163,35 @@ class BiSONetworkLeader(Teleoperator):
             )
         return self._lock.apply(action_dict, now)
 
-    def send_feedback(self, feedback: dict[str, float]) -> None:
-        raise NotImplementedError
+    @check_if_not_connected
+    def send_feedback(
+        self, feedback: dict[str, float], torque_limit: int = DEFAULT_FEEDBACK_TORQUE_LIMIT
+    ) -> None:
+        """BMH: pull the leader arms toward ``feedback`` (``left_`` / ``right_`` action keys).
+
+        An arm none of whose keys is in ``feedback`` is released, so leaving an arm out lets
+        go of it at once. See `SONetworkLeader.send_feedback`.
+
+        Raises:
+            NotImplementedError: Unless both arms have a feedback channel.
+        """
+        if not self.has_feedback:
+            raise NotImplementedError(
+                "BiSONetworkLeader has no feedback channel (feedback_port_zmq is not set on both arms)"
+            )
+        for prefix, arm in (("left_", self.left_arm), ("right_", self.right_arm)):
+            part = {
+                key.removeprefix(prefix): value for key, value in feedback.items() if key.startswith(prefix)
+            }
+            if part:
+                arm.send_feedback(part, torque_limit)
+            else:
+                arm.release_feedback()
+
+    def release_feedback(self) -> None:
+        """BMH: let go of both leader arms now."""
+        self.left_arm.release_feedback()
+        self.right_arm.release_feedback()
 
     @check_if_not_connected
     def disconnect(self) -> None:

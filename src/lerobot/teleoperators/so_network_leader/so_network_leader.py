@@ -1,3 +1,4 @@
+import contextlib
 import json
 import logging
 import time
@@ -27,6 +28,11 @@ HEAD_MOTOR_NAMES = [
     "head_pan",
     "head_tilt",
 ]
+# BMH: `Torque_Limit` (0..1000) of a feedback goal sent without one: 10 % of full torque.
+DEFAULT_FEEDBACK_TORQUE_LIMIT = 100
+# BMH: how long closing the feedback socket may wait to deliver the last message (the
+# release). The leader host releases by itself 0.3 s after the messages stop anyway.
+_FEEDBACK_LINGER_MS = 200
 
 
 class SONetworkLeader(Teleoperator):
@@ -35,6 +41,10 @@ class SONetworkLeader(Teleoperator):
     Drop-in replacement for SOLeader on the follower Pi.
 
     Pair with so_leader_host.py running on the leader Pi.
+
+    BMH: with ``feedback_port_zmq`` set, `send_feedback` pushes goal positions back to the
+    leader host, which pulls the leader arm toward them with a low torque limit (the DAgger
+    leader assist, see ``bmh/dagger/leader_assist.py``).
     """
 
     config_class = SONetworkLeaderConfig
@@ -47,6 +57,7 @@ class SONetworkLeader(Teleoperator):
         # zmq is imported lazily in connect(), so these stay untyped here.
         self.zmq_context: Any = None
         self.zmq_socket: Any = None
+        self._feedback_socket: Any = None
         self._is_connected = False
         # Set from the first message in connect(); get_action() is only reachable after that.
         self._last_action: dict[str, float] = {}
@@ -69,9 +80,17 @@ class SONetworkLeader(Teleoperator):
         motor_names = ARM_MOTOR_NAMES + (HEAD_MOTOR_NAMES if self.config.with_head else [])
         return {f"{motor}.pos": float for motor in motor_names}
 
+    @property
+    def has_feedback(self) -> bool:
+        """Whether `send_feedback` can reach the leader host (``feedback_port_zmq`` is set)."""
+        return self.config.feedback_port_zmq is not None
+
     @cached_property
     def feedback_features(self) -> dict[str, type]:
-        return {}
+        # The leader host never drives the head, so only the arm joints take feedback.
+        if not self.has_feedback:
+            return {}
+        return {f"{motor}.pos": float for motor in ARM_MOTOR_NAMES}
 
     @property
     def is_connected(self) -> bool:
@@ -117,6 +136,14 @@ class SONetworkLeader(Teleoperator):
         msg = self.zmq_socket.recv_string(zmq.NOBLOCK)
         self._last_action = json.loads(msg)
         self._last_message_at = time.perf_counter()
+
+        if self.config.feedback_port_zmq is not None:
+            self._feedback_socket = self.zmq_context.socket(zmq.PUSH)
+            self._feedback_socket.setsockopt(zmq.CONFLATE, 1)
+            self._feedback_socket.setsockopt(zmq.LINGER, _FEEDBACK_LINGER_MS)
+            feedback_url = f"tcp://{self.config.remote_ip}:{self.config.feedback_port_zmq}"
+            self._feedback_socket.connect(feedback_url)
+            logger.info(f"SONetworkLeader sends leader-assist feedback to {feedback_url}")
         self._is_connected = True
         logger.info(f"SONetworkLeader connected to {zmq_url}")
 
@@ -154,11 +181,43 @@ class SONetworkLeader(Teleoperator):
 
         return self._last_action
 
-    def send_feedback(self, feedback: dict[str, float]) -> None:
-        raise NotImplementedError
+    @check_if_not_connected
+    def send_feedback(
+        self, feedback: dict[str, float], torque_limit: int = DEFAULT_FEEDBACK_TORQUE_LIMIT
+    ) -> None:
+        """BMH: pull the leader arm toward ``feedback`` (goal positions by action key).
+
+        The leader host drives the arm joints it was asked for with ``torque_limit`` (0..1000,
+        capped on its side), ignores the head, and lets go 0.3 s after the last message, so
+        call this every tick for as long as the pull should last. Never blocks.
+
+        Raises:
+            NotImplementedError: Without ``feedback_port_zmq`` (upstream behaviour).
+        """
+        if self._feedback_socket is None:
+            raise NotImplementedError(
+                "SONetworkLeader has no feedback channel (feedback_port_zmq is not set)"
+            )
+        goal = {key: float(value) for key, value in feedback.items()}
+        self._push_feedback({"goal": goal, "torque_limit": int(torque_limit)})
+
+    def release_feedback(self) -> None:
+        """BMH: let go of the leader arm now. A no-op without a feedback channel."""
+        if self._feedback_socket is not None:
+            self._push_feedback({"release": True})
+
+    def _push_feedback(self, message: dict[str, Any]) -> None:
+        # zmq.Again: the leader host is not reachable (yet); the next tick tries again.
+        with contextlib.suppress(self._zmq.Again):
+            self._feedback_socket.send_string(json.dumps(message), self._zmq.NOBLOCK)
 
     @check_if_not_connected
     def disconnect(self) -> None:
+        if self._feedback_socket is not None:
+            # Never leave the leader pulling; the linger gives the release time to go out.
+            self.release_feedback()
+            self._feedback_socket.close()
+            self._feedback_socket = None
         if self.zmq_socket:
             self.zmq_socket.close()
         if self.zmq_context:

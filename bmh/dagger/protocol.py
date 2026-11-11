@@ -18,6 +18,11 @@
     {"id": 9, "cmd": "save"}
     {"id": 10, "cmd": "discard"}
     {"id": 11, "cmd": "finish"}
+    {"id": 12, "cmd": "assist", "assist": true, "assist_torque_pct": 15}
+
+``assist`` switches the leader assist (the leader arms pull lightly toward the pose the
+robot holds) on or off, or changes its torque, during a take-over; ``align`` sets it at the
+start of one.
 
 stdin rather than a polled file (the policy client's control file) because these are
 events, not a desired state: two of them inside one tick must both arrive, in order. The
@@ -49,7 +54,7 @@ import queue
 import threading
 from collections.abc import Mapping
 from dataclasses import dataclass, field
-from typing import IO, Literal
+from typing import IO, Literal, TypeGuard
 
 READY_LINE = "DAGGER_READY"
 STATUS_PREFIX = "BMH_DAGGER "
@@ -62,9 +67,11 @@ Phase = Literal[
 PolicyState = Literal["none", "connecting", "ready", "error"]
 AssistState = Literal["off", "on", "unavailable"]
 
-# Range of `align`'s `assist_torque_pct` (percent of the servo's torque limit).
+# Range of `assist_torque_pct`: percent of a servo's full torque, so 10 is a `Torque_Limit`
+# of 100. 20 % is what the leader arms were bench-tested with (2026-11-12); the leader host
+# caps the limit again by itself (`so_leader_host --assist_max_torque_limit`).
 ASSIST_TORQUE_PCT_MIN = 1
-ASSIST_TORQUE_PCT_MAX = 30
+ASSIST_TORQUE_PCT_MAX = 20
 ASSIST_TORQUE_PCT_DEFAULT = 10
 
 
@@ -121,6 +128,15 @@ class Align:
 
 
 @dataclass(frozen=True)
+class Assist:
+    """Switch the leader assist on or off, or change its torque, while aligning."""
+
+    id: int
+    assist: bool
+    assist_torque_pct: int = ASSIST_TORQUE_PCT_DEFAULT
+
+
+@dataclass(frozen=True)
 class Record:
     """Start recording now, aligned or not."""
 
@@ -155,7 +171,7 @@ class Finish:
     id: int
 
 
-Command = Policy | Run | Pause | Step | Home | Align | Record | Cancel | Save | Discard | Finish
+Command = Policy | Run | Pause | Step | Home | Align | Assist | Record | Cancel | Save | Discard | Finish
 
 
 @dataclass(frozen=True)
@@ -182,15 +198,15 @@ _PLAIN: dict[str, type[Run | Pause | Record | Cancel | Save | Discard | Finish]]
 }
 
 
-def _is_int(value: object) -> bool:
+def _is_int(value: object) -> TypeGuard[int]:
     return type(value) is int
 
 
 def _command_id(data: Mapping[str, object]) -> int:
     value = data.get("id")
-    if not _is_int(value) or value < 0:  # type: ignore[operator]
+    if not _is_int(value) or value < 0:
         raise ValueError(f"'id' must be a non-negative integer, got {value!r}")
-    return value  # type: ignore[return-value]
+    return value
 
 
 def _flag(data: Mapping[str, object], key: str, default: bool) -> bool:
@@ -205,6 +221,16 @@ def _text(data: Mapping[str, object], key: str) -> str:
     if not isinstance(value, str) or not value.strip():
         raise ValueError(f"'{key}' must be a non-empty string")
     return value.strip()
+
+
+def _assist_torque_pct(data: Mapping[str, object]) -> int:
+    value = data.get("assist_torque_pct", ASSIST_TORQUE_PCT_DEFAULT)
+    if not _is_int(value) or not ASSIST_TORQUE_PCT_MIN <= value <= ASSIST_TORQUE_PCT_MAX:
+        raise ValueError(
+            f"'assist_torque_pct' must be an integer in [{ASSIST_TORQUE_PCT_MIN}, "
+            f"{ASSIST_TORQUE_PCT_MAX}], got {value!r}"
+        )
+    return value
 
 
 def _pose(value: object) -> dict[str, float]:
@@ -229,7 +255,7 @@ def parse_command(line: str) -> Command:
         ValueError: With a message naming the problem: not a JSON object, a missing or
             non-integer ``id``, an unknown ``cmd``, or a field of the command with the
             wrong type or range (``cursor`` not an int >= 0, ``pose`` not a non-empty map
-            of finite numbers, ``assist_torque_pct`` outside 1..30, an empty ``task``,
+            of finite numbers, ``assist_torque_pct`` outside 1..20, an empty ``task``,
             a missing ``policy_host`` / ``lang_instruction``, a port outside 1..65535).
     """
     try:
@@ -264,18 +290,18 @@ def parse_command(line: str) -> Command:
     if cmd == "home":
         return Home(command_id, _pose(data.get("pose")))
     if cmd == "align":
-        torque = data.get("assist_torque_pct", ASSIST_TORQUE_PCT_DEFAULT)
-        if not _is_int(torque) or not ASSIST_TORQUE_PCT_MIN <= torque <= ASSIST_TORQUE_PCT_MAX:
-            raise ValueError(
-                f"'assist_torque_pct' must be an integer in [{ASSIST_TORQUE_PCT_MIN}, "
-                f"{ASSIST_TORQUE_PCT_MAX}], got {torque!r}"
-            )
         return Align(
             id=command_id,
             task=_text(data, "task"),
             auto_start=_flag(data, "auto_start", True),
             assist=_flag(data, "assist", False),
-            assist_torque_pct=torque,
+            assist_torque_pct=_assist_torque_pct(data),
+        )
+    if cmd == "assist":
+        return Assist(
+            id=command_id,
+            assist=_flag(data, "assist", False),
+            assist_torque_pct=_assist_torque_pct(data),
         )
     raise ValueError(f"unknown cmd {cmd!r}")
 

@@ -131,6 +131,29 @@ class _Leader:
         return dict(self.pose)
 
 
+class _FeedbackLeader(_Leader):
+    """A leader stream with the follower-to-leader channel (feedback ports on both arms)."""
+
+    has_feedback = True
+    # As `BiSONetworkLeader`: the arm joints and grippers, never the head.
+    feedback_features = dict.fromkeys([f"left_{m}.pos" for m in ARM] + [f"right_{m}.pos" for m in ARM], float)
+
+    def __init__(self, pose: dict[str, float] | None = None):
+        super().__init__(pose)
+        self.locked_keys: frozenset[str] = frozenset()
+        self.feedback: list[tuple] = []
+
+    def send_feedback(self, feedback: dict[str, float], torque_limit: int) -> None:
+        self.feedback.append(("goal", dict(feedback), torque_limit))
+
+    def release_feedback(self) -> None:
+        self.feedback.append(("release",))
+
+    def disconnect(self) -> None:
+        self.release_feedback()  # as `SONetworkLeader.disconnect`
+        super().disconnect()
+
+
 class _Runner:
     """Scripted policy: while resumed, tick `n` plays every joint at `100 + n`."""
 
@@ -177,7 +200,15 @@ class _Runner:
 
 
 class _Rig:
-    def __init__(self, tmp_path, *, control_fps: int = 60, episode_time_s: float = 600, **cfg):
+    def __init__(
+        self,
+        tmp_path,
+        *,
+        control_fps: int = 60,
+        episode_time_s: float = 600,
+        leader: _Leader | None = None,
+        **cfg,
+    ):
         self.root = tmp_path / "recording-staging"
         self.cfg = DaggerConfig(
             robot=None,
@@ -195,7 +226,7 @@ class _Rig:
             **cfg,
         )
         self.robot = _Robot()
-        self.leader = _Leader()
+        self.leader = leader if leader is not None else _Leader()
         self.runner = _Runner()
         self.dataset = open_dataset(self.cfg.dataset, self.robot)
         self.recorder = TakeRecorder(self.dataset)
@@ -543,10 +574,103 @@ def test_a_stale_leader_never_starts_a_take(rig):
     assert rig.session.phase == "recording"
 
 
-def test_assist_is_reported_unavailable(rig):
+def test_assist_is_reported_unavailable_without_the_feedback_channel(rig):
     rig.do("align", task=TASK, auto_start=False, assist=True)
     rig.tick(6)
     assert _align_status(rig)["align"]["assist"] == "unavailable"
+
+
+@pytest.fixture
+def assist_rig(tmp_path) -> _Rig:
+    return _Rig(tmp_path, leader=_FeedbackLeader())
+
+
+def _goals(rig) -> list[tuple]:
+    return [f for f in rig.leader.feedback if f[0] == "goal"]
+
+
+ARM_KEYS = [f"left_{m}.pos" for m in ARM] + [f"right_{m}.pos" for m in ARM]
+
+
+def test_assist_pulls_the_leader_to_the_hold_pose_of_the_arm_joints_only(assist_rig):
+    rig = assist_rig
+    rig.policy_run(5)
+    rig.leader.pose = _shifted(_pose(105.0), 30.0)  # far off: no auto-start
+    assert rig.do("align", task=TASK, assist=True, assist_torque_pct=15)["ok"]
+    rig.tick(9)
+    goals = _goals(rig)
+    assert len(goals) == 10  # every aligning tick
+    assert goals[0] == ("goal", dict.fromkeys(ARM_KEYS, 105.0), 150)  # grippers included, no head
+    assert _align_status(rig)["align"]["assist"] == "on"
+    assert rig.leader.feedback[-1][0] == "goal"  # not released while aligning
+
+
+def test_assist_lets_go_the_tick_the_take_starts(assist_rig):
+    rig = assist_rig
+    rig.policy_run(5)
+    rig.leader.pose = _shifted(_pose(105.0), 2.0)  # inside tolerance: auto-start after 0.4 s
+    rig.do("align", task=TASK, assist=True)
+    rig.tick(30)
+    assert rig.session.phase == "recording"
+    goal_ticks = len(_goals(rig))
+    assert rig.leader.feedback[-1] == ("release",)
+    assert rig.leader.feedback[goal_ticks:] == [("release",)]  # once, right after the last goal
+    rig.tick(30)
+    assert len(rig.leader.feedback) == goal_ticks + 1  # nothing more while recording
+
+
+@pytest.mark.parametrize("how", ["cancel", "record", "finish", "stop"])
+def test_every_exit_from_aligning_releases_the_leader(assist_rig, how):
+    rig = assist_rig
+    rig.policy_run(5)
+    rig.leader.pose = _shifted(_pose(105.0), 30.0)
+    rig.do("align", task=TASK, assist=True, auto_start=False)
+    rig.tick(3)
+    if how == "stop":
+        rig.stop = True
+        rig.tick()
+    else:
+        assert rig.do(how)["ok"]
+    assert rig.leader.feedback[-1] == ("release",)
+
+
+def test_assist_command_switches_it_and_changes_the_torque_while_aligning(assist_rig):
+    rig = assist_rig
+    rig.policy_run(5)
+    rig.leader.pose = _shifted(_pose(105.0), 30.0)
+    rig.do("align", task=TASK, auto_start=False)  # assist off
+    rig.tick(3)
+    assert rig.leader.feedback == []
+    assert _align_status(rig)["align"]["assist"] == "off"
+
+    assert rig.do("assist", assist=True, assist_torque_pct=20)["ok"]
+    assert _goals(rig)[-1][2] == 200
+    assert rig.do("assist", assist=True, assist_torque_pct=5)["ok"]
+    assert _goals(rig)[-1][2] == 50
+    assert rig.do("assist", assist=False)["ok"]
+    assert rig.leader.feedback[-1] == ("release",)
+    rig.tick(5)
+    assert rig.leader.feedback[-1] == ("release",)  # stays off
+    rig.tick(6)
+    assert _align_status(rig)["align"]["assist"] == "off"
+
+
+def test_assist_command_outside_aligning_is_refused(assist_rig):
+    assert assist_rig.do("assist", assist=True) == {
+        "id": assist_rig.next_id,
+        "ok": False,
+        "error": "not aligning",
+    }
+    assert assist_rig.leader.feedback == []
+
+
+def test_a_locked_arm_is_not_pulled(assist_rig):
+    rig = assist_rig
+    rig.policy_run(5)
+    rig.leader.pose = _shifted(_pose(105.0), 30.0)
+    rig.leader.locked_keys = frozenset(f"right_{m}.pos" for m in ARM)
+    rig.do("align", task=TASK, assist=True, auto_start=False)
+    assert set(_goals(rig)[-1][1]) == {f"left_{m}.pos" for m in ARM}
 
 
 def test_cancel_returns_to_paused_at_the_same_cursor(rig):
@@ -966,10 +1090,16 @@ TAKE = {
 }
 
 
-def _run(tmp_path, robot: _Robot, steps: dict[int, str | None], stop_after: int | None = None):
+def _run(
+    tmp_path,
+    robot: _Robot,
+    steps: dict[int, str | None],
+    stop_after: int | None = None,
+    leader: _Leader | None = None,
+):
     stream = _Stream()
     script = _Script(stream, steps)
-    leader = _Leader()
+    leader = leader if leader is not None else _Leader()
     lines: list[str] = []
     code = run_session(
         _session_cfg(tmp_path),
@@ -1019,6 +1149,16 @@ def test_a_hardware_error_still_finalizes_and_exits_1(tmp_path):
     assert meta.total_episodes == 1
     assert list(meta.tasks.index) == [TASK]
     assert (robot.disconnected, leader.disconnected) == (1, 1)
+
+
+def test_a_hardware_error_while_the_assist_pulls_releases_the_leader(tmp_path):
+    robot = _Robot(fail_on_send=20)
+    leader = _FeedbackLeader(_shifted(START, 30.0))
+    steps = {5: _cmd(1, "align", task=TASK, auto_start=False, assist=True)}
+    code, lines, leader, meta = _run(tmp_path, robot, steps, leader=leader)
+    assert code == 1
+    assert any(f[0] == "goal" for f in leader.feedback)
+    assert leader.feedback[-1] == ("release",) and leader.disconnected == 1
 
 
 def test_a_failed_connect_reports_the_error_and_leaves_nothing_connected(tmp_path):

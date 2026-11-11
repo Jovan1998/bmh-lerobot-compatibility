@@ -29,6 +29,13 @@ controls whether the left arm's bus also carries the BMH-101 head servos
 (`head_pan`/`head_tilt`, IDs 8/9). The follower side must be configured with
 the matching `with_head` value.
 
+`--left_feedback_port` / `--right_feedback_port` (default: off) bind one more
+socket per arm for the DAgger **leader assist**: the follower sends the pose the
+robot holds, and the arm joints and gripper (never the head) pull lightly toward
+it, capped at `--assist_max_torque_limit` (default 200 of 1000). Torque goes off
+by itself 0.3 s after the messages stop. See
+[`../documentation/Readme.md`](../documentation/Readme.md#dagger-recording-bmh-extra).
+
 ## Wire Protocol
 
 - **Transport**: ZMQ PUSH → PULL, `tcp://*:{port}`
@@ -36,6 +43,9 @@ the matching `with_head` value.
 - **Message**: `{"shoulder_pan.pos": 45.2, "shoulder_lift.pos": -12.1, ...}` (7 floats per arm; 9 on the left arm with head enabled — adds `head_pan.pos`/`head_tilt.pos`)
 - **Socket option**: `CONFLATE=1` (latest-only, no buffering)
 - **Rate**: configurable, default 60 Hz
+- **Leader assist** (follower → leader, PUSH with `CONFLATE=1` → PULL on the feedback ports,
+  drained to the latest message each tick):
+  `{"goal": {"shoulder_pan.pos": 12.0, ...}, "torque_limit": 100}` or `{"release": true}`
 
 ---
 

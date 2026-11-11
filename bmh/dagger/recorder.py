@@ -47,7 +47,7 @@ def open_dataset(cfg: DatasetRecordConfig, robot: Robot) -> LeRobotDataset:
     if repo_name.startswith("eval_"):
         raise ValueError("Dataset names starting with 'eval_' are reserved for policy evaluation.")
     cfg.stamp_repo_id()
-    num_cameras = len(robot.cameras)  # type: ignore[attr-defined]
+    num_cameras = len(robot.cameras)
     return LeRobotDataset.create(
         cfg.repo_id,
         cfg.fps,
