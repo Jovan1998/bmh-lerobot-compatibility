@@ -92,7 +92,7 @@ class TakeoverBlend:
 
         Args:
             hold: The pose the follower holds (what the first action must equal).
-            leader_start: The leader's action at the moment the take starts.
+            leader_start: The leader's action at the moment the arms connect.
             blend_s: Shortest fade, in seconds.
             max_speed_deg_s: The fade is stretched so the largest offset closes no faster
                 than this on average.

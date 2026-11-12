@@ -210,6 +210,11 @@ def test_status_line_with_hold_align_and_take_in_fixed_order():
     assert "\n" not in line
 
 
+def test_status_line_while_settling_says_when_the_recording_starts():
+    line = format_status("settling", "ready", 412, 0, 3, take_frames=0, record_in_s=2.3456)
+    assert _payload(line, STATUS_PREFIX)["take"] == {"frames": 0, "record_in_s": 2.35}
+
+
 # --------------------------------------------------------------------------- stdin
 
 

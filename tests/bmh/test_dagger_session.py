@@ -210,6 +210,8 @@ class _Rig:
         **cfg,
     ):
         self.root = tmp_path / "recording-staging"
+        # Most tests look at the take itself; the 3 s settle before it has its own tests.
+        cfg.setdefault("takeover_settle_s", 0.0)
         self.cfg = DaggerConfig(
             robot=None,
             teleop=None,
@@ -531,7 +533,7 @@ def test_align_from_running_pauses_the_policy_first(rig):
     assert rig.robot.sent[-1] == _pose(104.0)
 
 
-def test_recording_starts_by_itself_only_after_the_gate(rig):
+def test_the_arms_connect_by_themselves_only_after_the_gate(rig):
     rig.policy_run(5)
     rig.leader.pose = _shifted(_pose(105.0), 10.0)  # far off
     rig.do("align", task=TASK)
@@ -546,7 +548,7 @@ def test_recording_starts_by_itself_only_after_the_gate(rig):
     rig.tick(23)
     assert rig.session.phase == "aligning"
     rig.tick(3)
-    assert rig.session.phase == "recording"
+    assert rig.session.phase == "settling"
 
 
 def test_auto_start_off_waits_for_record(rig):
@@ -571,7 +573,7 @@ def test_a_stale_leader_never_starts_a_take(rig):
     assert rig.do("record") == {"id": rig.next_id, "ok": False, "error": "the leader stream is stale"}
     rig.leader.last_message_age_s = 0.01
     rig.tick(30)
-    assert rig.session.phase == "recording"
+    assert rig.session.phase in ("settling", "recording")
 
 
 def test_assist_is_reported_unavailable_without_the_feedback_channel(rig):
@@ -605,18 +607,19 @@ def test_assist_pulls_the_leader_to_the_hold_pose_of_the_arm_joints_only(assist_
     assert rig.leader.feedback[-1][0] == "goal"  # not released while aligning
 
 
-def test_assist_lets_go_the_tick_the_take_starts(assist_rig):
-    rig = assist_rig
+def test_assist_lets_go_the_tick_the_arms_connect(tmp_path):
+    rig = _Rig(tmp_path, leader=_FeedbackLeader(), takeover_settle_s=3.0)
     rig.policy_run(5)
     rig.leader.pose = _shifted(_pose(105.0), 2.0)  # inside tolerance: auto-start after 0.4 s
     rig.do("align", task=TASK, assist=True)
     rig.tick(30)
-    assert rig.session.phase == "recording"
+    assert rig.session.phase == "settling"  # connected, not recording yet
     goal_ticks = len(_goals(rig))
     assert rig.leader.feedback[-1] == ("release",)
     assert rig.leader.feedback[goal_ticks:] == [("release",)]  # once, right after the last goal
-    rig.tick(30)
-    assert len(rig.leader.feedback) == goal_ticks + 1  # nothing more while recording
+    rig.tick(240)
+    assert rig.session.phase == "recording"
+    assert len(rig.leader.feedback) == goal_ticks + 1  # nothing more while settling or recording
 
 
 @pytest.mark.parametrize("how", ["cancel", "record", "finish", "stop"])
@@ -822,13 +825,97 @@ def test_a_take_is_saved_by_itself_at_episode_time_s(tmp_path):
     assert rig.finalize().total_frames == 30
 
 
-def test_save_without_a_frame_writes_nothing(rig):
-    rig.do("align", task=TASK, auto_start=False)
-    rig.cmd("record")
-    rig.cmd("save")
-    rig.tick(3)
+# --------------------------------------------------------------------------- settling
+
+
+@pytest.fixture
+def settle_rig(tmp_path) -> _Rig:
+    return _Rig(tmp_path, takeover_settle_s=3.0)
+
+
+def test_the_arms_connect_first_and_the_recording_starts_3_s_later(settle_rig):
+    rig = settle_rig
+    leader = _shifted(_pose(105.0), 2.0)
+    first = _start_take(rig, leader)
+    assert rig.session.phase == "settling"
+    assert rig.robot.sent[first] == _pose(105.0)  # the connection starts at the hold pose
+    observations = rig.robot.observations
+    history = len(rig.session.history)
+    rig.tick(179)  # the record tick and 179 more: 2.98 s at 60 Hz
+    assert rig.session.phase == "settling"
+    assert rig.recorder.frames == 0
+    assert rig.robot.observations == observations  # no camera frame is taken for nothing
+    assert rig.robot.sent[-1] == leader  # following the leader (the 1 s blend is over)
+    assert len(rig.session.history) - history == 89  # one frame per 30 Hz: it can be rewound
+    rig.tick()
+    assert rig.session.phase == "recording"
+    assert rig.recorder.frames == 1
+    assert rig.phases()[-3:] == ["aligning", "settling", "recording"]
+
+    rig.tick(59)
+    assert rig.recorder.frames == 30
+    assert rig.do("save")["ok"]
+    rig.tick(2)
+    rig.finalize()
+    assert list(rig.frames()["action"].iloc[0]) == [107.0] * len(JOINTS)  # the leader, not the blend
+
+
+def test_the_status_counts_down_to_the_recording_at_10hz(settle_rig):
+    rig = settle_rig
+    _start_take(rig, _pose(105.0))
+    before = len(rig.statuses()) - 1  # the record tick's line is the first one of settling
+    rig.tick(179)
+    settling = rig.statuses()[before:]
+    assert {s["phase"] for s in settling} == {"settling"}
+    assert 30 <= len(settling) <= 31
+    countdown = [s["take"]["record_in_s"] for s in settling]
+    assert countdown[0] == 3.0
+    assert all(b < a for a, b in zip(countdown, countdown[1:], strict=False))
+    assert 0 < countdown[-1] <= 0.1
+    assert {s["take"]["frames"] for s in settling} == {0}
+    rig.tick()
+    assert "record_in_s" not in rig.statuses()[-1]["take"]
+
+
+def test_auto_start_connects_the_arms_too(settle_rig):
+    rig = settle_rig
+    rig.policy_run(5)
+    rig.leader.pose = _pose(105.0)
+    rig.do("align", task=TASK)
+    rig.tick(30)
+    assert rig.session.phase == "settling"
+
+
+def test_cancel_while_settling_holds_where_the_leader_took_the_robot(settle_rig):
+    rig = settle_rig
+    _start_take(rig, _pose(105.0))
+    rig.leader.pose = _pose(110.0)
+    rig.tick(60)
+    assert rig.do("cancel")["ok"]
     assert rig.session.phase == "paused"
-    assert rig.recorder.episodes == 0
+    assert rig.recorder.frames == 0
+    assert rig.session.hold == _pose(110.0)
+    rig.tick(3)
+    assert rig.robot.sent[-4:] == [_pose(110.0)] * 4  # the cancel tick holds too
+    assert rig.finalize().total_episodes == 0
+
+
+@pytest.mark.parametrize(
+    "cmd, error",
+    [("save", "not recording"), ("discard", "not recording"), ("record", "not aligning")],
+)
+def test_a_take_cannot_be_ended_or_restarted_while_settling(settle_rig, cmd, error):
+    _start_take(settle_rig, _pose(105.0))
+    assert settle_rig.do(cmd) == {"id": settle_rig.next_id, "ok": False, "error": error}
+    assert settle_rig.session.phase == "settling"
+
+
+def test_finish_while_settling_writes_nothing(settle_rig):
+    _start_take(settle_rig, _pose(105.0))
+    settle_rig.tick(30)
+    settle_rig.cmd("finish")
+    assert settle_rig.tick() is False
+    assert settle_rig.finalize().total_episodes == 0
 
 
 # --------------------------------------------------------------------------- refusals / end
@@ -840,7 +927,7 @@ def test_save_without_a_frame_writes_nothing(rig):
         ([], "save", {}, "not recording"),
         ([], "discard", {}, "not recording"),
         ([], "record", {}, "not aligning"),
-        ([], "cancel", {}, "not aligning"),
+        ([], "cancel", {}, "nothing to cancel"),
         ([], "pause", {}, "nothing to pause"),
         (["policy", "run"], "step", {"cursor": 2}, "not paused"),
         (["policy", "run"], "home", {"pose": {JOINTS[0]: 0.0}}, "not paused"),
@@ -855,6 +942,7 @@ def test_save_without_a_frame_writes_nothing(rig):
         ),
         (["align", "record"], "step", {"cursor": 1}, "not paused"),
         (["align", "record"], "record", {}, "not aligning"),
+        (["align", "record"], "cancel", {}, "nothing to cancel"),
     ],
 )
 def test_a_command_in_the_wrong_phase_is_refused_not_queued(rig, setup, cmd, fields, error):
@@ -999,6 +1087,7 @@ def test_config_decodes_the_recording_blocks_and_its_own_keys(tmp_path):
     assert (cfg.control_fps, cfg.control_multiplier, cfg.jpeg_quality) == (60, 2, 80)
     assert cfg.loop_file.endswith("inference-loop.json")
     assert (cfg.history_s, cfg.align_arm_tol_deg, cfg.align_hold_s, cfg.takeover_blend_s) == (60, 4, 0.4, 1.0)
+    assert cfg.takeover_settle_s == 3.0
 
 
 def test_config_rejects_a_control_rate_that_is_no_multiple_of_the_dataset_fps(tmp_path):
@@ -1076,6 +1165,7 @@ def _session_cfg(tmp_path) -> DaggerConfig:
             push_to_hub=False,
             no_stamp=True,
         ),
+        takeover_settle_s=0.0,
     )
 
 

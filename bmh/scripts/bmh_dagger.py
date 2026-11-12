@@ -8,7 +8,10 @@ costs one tick. (`bmh-policy-client` and `bmh-record` each need the serial ports
 cameras, and ~10 s to start, so they cannot be alternated.)
 
 Only the operator's correction is recorded: each take-over becomes one episode of a v3
-staging dataset that has exactly the features of a `bmh-record` staging dataset.
+staging dataset that has exactly the features of a `bmh-record` staging dataset. The
+connection itself is not: the follower follows the leader for `takeover_settle_s` before
+the first frame is written, so the bounce of the connection (the blend, the leader assist
+letting go, the operator taking the arms' weight) stays out of the episode.
 
 Session phases:
 
@@ -18,8 +21,10 @@ Session phases:
     stepping    one history frame per tick to the cursor   -> arrival -> paused; pause, run, step, home, align
     homing      smoothstep ramp to the Home pose           -> arrival -> paused; pause
     aligning    holds; compares the leader with the hold   -> aligned 0.4 s (auto_start) or record
-                                                              -> recording; cancel -> paused
-    recording   follows the leader (blended in), writes    -> save / discard -> saving
+                                                              -> settling; cancel -> paused
+    settling    follows the leader (blended in), writes    -> 3 s later -> recording; cancel -> paused
+                nothing yet
+    recording   follows the leader, writes                 -> save / discard -> saving
     saving      servos keep their last goal (loop blocked) -> paused
     finishing   dataset.finalize(), disconnect             -> exit 0
 
@@ -39,7 +44,7 @@ Leader assist: with `assist` on (in `align`, or the `assist` command while align
 leader stream that has the feedback channel (`feedback_port_zmq` on both arms of the
 `bi_so_network_leader` config), every aligning tick sends the hold pose of the arm joints
 and grippers that are not locked to the leader host, which pulls the leader arms toward it
-with a low torque. Leaving `aligning` (the take starts, cancel, finish, an error) releases
+with a low torque. Leaving `aligning` (the arms connect, cancel, finish, an error) releases
 the leader at once; the leader host also lets go by itself 0.3 s after the messages stop.
 Without the channel the status reports `"assist": "unavailable"`.
 
@@ -153,10 +158,13 @@ class DaggerConfig:
     # (degrees; 0..100 for the grippers) ...
     align_arm_tol_deg: float = 4.0
     align_gripper_tol: float = 5.0
-    # ... for this long without a gap; then a take with `auto_start` begins by itself.
+    # ... for this long without a gap; then, with `auto_start`, the arms connect by themselves.
     align_hold_s: float = 0.4
     # Shortest fade of the leader / follower offset at the start of a take.
     takeover_blend_s: float = 1.0
+    # Seconds the follower follows the leader before the take's first frame is written
+    # (`settling`); 0 writes from the connection on.
+    takeover_settle_s: float = 3.0
     home_ramp_s: float = 2.5
     # Policy server timeouts, as for `bmh-policy-client`.
     probe_timeout_ms: int = 5000
@@ -174,6 +182,8 @@ class DaggerConfig:
         for name in ("history_s", "home_ramp_s", "takeover_blend_s"):
             if not getattr(self, name) > 0:
                 raise ValueError(f"{name} must be > 0, got {getattr(self, name)}.")
+        if not self.takeover_settle_s >= 0:
+            raise ValueError(f"takeover_settle_s must be >= 0, got {self.takeover_settle_s}.")
 
     @property
     def control_multiplier(self) -> int:
@@ -343,7 +353,7 @@ class DaggerSession:
         """Seconds until the next tick is due, by phase."""
         if self.phase == "running":
             return self._runner.period_s()
-        if self.phase in ("aligning", "recording"):
+        if self.phase in ("aligning", "settling", "recording"):
             return 1.0 / self._cfg.control_fps
         return 1.0 / POLICY_FPS
 
@@ -397,8 +407,8 @@ class DaggerSession:
             self._tick_homing(now)
         elif self.phase == "aligning":
             self._tick_aligning(now)
-        elif self.phase == "recording":
-            self._tick_recording(now)
+        elif self.phase in ("settling", "recording"):
+            self._tick_take(now)
         else:
             self._send(self.hold)
         if self.phase in ("paused", "stepping", "homing"):
@@ -407,7 +417,7 @@ class DaggerSession:
             self._runner.tick(now)
             self._runner.fire(self._robot.get_observation)
         if self.phase != "aligning" or self._assist != "on":
-            # The same tick the take starts (or the take-over ends): the leader goes limp.
+            # The same tick the arms connect (or the take-over ends): the leader goes limp.
             self._release_assist()
         self._emit_status(now)
         return True
@@ -436,7 +446,7 @@ class DaggerSession:
             self._finish = True
             return None
         if isinstance(cmd, Policy):
-            if phase in ("aligning", "recording", "saving"):
+            if phase in ("aligning", "settling", "recording", "saving"):
                 return "not during a take-over"
             self._runner.set_target(cmd.policy_host, cmd.policy_port, cmd.lang_instruction, cmd.api_token)
             return None
@@ -500,8 +510,11 @@ class DaggerSession:
             self._begin_take(leader)
             return None
         if isinstance(cmd, Cancel):
-            if phase != "aligning":
-                return "not aligning"
+            if phase == "settling":
+                # Nothing was written yet; the robot stays where the leader took it.
+                self._stop_following()
+            elif phase != "aligning":
+                return "nothing to cancel"
             self.phase = "paused"
             return None
         if isinstance(cmd, (Save, Discard)):
@@ -611,17 +624,30 @@ class DaggerSession:
         self._ticks_in_frame = 0
         self._frame_start = 0.0
         self._recorder.frames = 0
-        self.phase = "recording"
-        logger.info('take started: "%s" (blend %.2f s)', self._task, self._blend.duration_s)
+        self.phase = "settling"
+        logger.info(
+            "arms connected (blend %.2f s); recording in %.1f s",
+            self._blend.duration_s,
+            self._cfg.takeover_settle_s,
+        )
 
-    def _tick_recording(self, now: float) -> None:
+    def _tick_take(self, now: float) -> None:
+        """Settling or recording: the follower follows the leader, blended in from the hold pose."""
         blend = self._blend
         if blend is None:
-            raise RuntimeError("recording without a take")
+            raise RuntimeError("following the leader without a take")
         if self._take_t0 is None:
             self._take_t0 = now
+        connected_s = now - self._take_t0
+        # 1 µs of slack: tick times are sums of float periods.
+        if self.phase == "settling" and connected_s >= self._cfg.takeover_settle_s - 1e-6:
+            self.phase = "recording"
+            self._ticks_in_frame = 0  # the take's first frame is this tick's
+            logger.info('recording: "%s"', self._task)
+        writing = self.phase == "recording"
         # A frame every `control_multiplier` ticks, or earlier once the current frame has
-        # used up its 1/fps (as `record_loop`: recorded frames come first).
+        # used up its 1/fps (as `record_loop`: recorded frames come first). While settling the
+        # same ticks only feed the rewind history.
         record_tick = (
             self._ticks_in_frame % self._cfg.control_multiplier == 0
             or now - self._frame_start >= 1.0 / self._cfg.dataset.fps
@@ -630,24 +656,29 @@ class DaggerSession:
         if record_tick:
             self._frame_start = now
             self._ticks_in_frame = 0
-            observation = self._robot.get_observation()
-        action = blend.apply(self._read_leader(), now - self._take_t0)
+            if writing:
+                observation = self._robot.get_observation()
+        action = blend.apply(self._read_leader(), connected_s)
         self._send(action)
         if record_tick:
-            # The action recorded is the action sent, as in `record_loop`.
-            self._recorder.add(observation, action, self._task)
+            if writing:
+                # The action recorded is the action sent, as in `record_loop`.
+                self._recorder.add(observation, action, self._task)
             self._history.push(action)
         self._ticks_in_frame += 1
-        if self._recorder.frames >= self._max_take_frames:
+        if writing and self._recorder.frames >= self._max_take_frames:
             logger.info("take reached dataset.episode_time_s — saving it")
             self._end_take(save=True)
 
-    def _end_take(self, save: bool) -> None:
+    def _stop_following(self) -> None:
         # The frame the robot stopped on becomes the newest, so paused holds exactly it.
         if self._last_sent and self._history.at(0) != self._last_sent:
             self._history.push(self._last_sent)
         self._cursor = 0
         self._blend = None
+
+    def _end_take(self, save: bool) -> None:
+        self._stop_following()
         self._save_pending = save
         self.phase = "saving"
 
@@ -683,7 +714,7 @@ class DaggerSession:
     # ------------------------------------------------------------------ status
 
     def _emit_status(self, now: float, force: bool = False) -> None:
-        interval = 1.0 / (ALIGN_STATUS_HZ if self.phase == "aligning" else STATUS_HZ)
+        interval = 1.0 / (ALIGN_STATUS_HZ if self.phase in ("aligning", "settling") else STATUS_HZ)
         # 1 ms of slack: tick times are sums of float periods and land just short of the interval.
         if not force and self.phase == self._reported_phase and now - self._status_at < interval - 1e-3:
             return
@@ -698,6 +729,10 @@ class DaggerSession:
                 self._leader_age_s * 1000.0,
                 self._assist,
             )
+        record_in_s = None
+        if self.phase == "settling":
+            connected_s = 0.0 if self._take_t0 is None else now - self._take_t0
+            record_in_s = max(0.0, self._cfg.takeover_settle_s - connected_s)
         self._emit(
             format_status(
                 self.phase,
@@ -708,8 +743,9 @@ class DaggerSession:
                 hold=self.hold if self.phase in ("paused", "aligning") else None,
                 align=align,
                 take_frames=self._recorder.frames
-                if self.phase in ("aligning", "recording", "saving")
+                if self.phase in ("aligning", "settling", "recording", "saving")
                 else None,
+                record_in_s=record_in_s,
             )
         )
 

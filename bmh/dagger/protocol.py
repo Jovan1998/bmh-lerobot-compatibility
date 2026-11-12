@@ -38,6 +38,7 @@ of leaving a policy running unsupervised.
     BMH_DAGGER_ACK {"id": 7, "ok": false, "error": "not aligning"}
     BMH_DAGGER {"phase": "aligning", "policy": "ready", "history": 412, "cursor": 0,
                 "episodes": 3, "hold": {...}, "align": {...}, "take": {"frames": 0}}
+    BMH_DAGGER {"phase": "settling", ..., "take": {"frames": 0, "record_in_s": 2.35}}
     ERROR <message>
 
 These lines are printed, not logged: the process's log goes to stderr, and a log line of
@@ -62,7 +63,16 @@ ACK_PREFIX = "BMH_DAGGER_ACK "
 ERROR_PREFIX = "ERROR "
 
 Phase = Literal[
-    "connecting", "paused", "running", "stepping", "homing", "aligning", "recording", "saving", "finishing"
+    "connecting",
+    "paused",
+    "running",
+    "stepping",
+    "homing",
+    "aligning",
+    "settling",
+    "recording",
+    "saving",
+    "finishing",
 ]
 PolicyState = Literal["none", "connecting", "ready", "error"]
 AssistState = Literal["off", "on", "unavailable"]
@@ -355,6 +365,7 @@ def format_status(
     hold: Mapping[str, float] | None = None,
     align: Mapping[str, object] | None = None,
     take_frames: int | None = None,
+    record_in_s: float | None = None,
 ) -> str:
     """One ``BMH_DAGGER {json}`` line; keys in this fixed order, optional ones left out.
 
@@ -366,7 +377,9 @@ def format_status(
         episodes: Episodes saved to the staging dataset so far.
         hold: The pose the robot holds (while paused / aligning), 2 decimals.
         align: `format_align` output (while aligning).
-        take_frames: Frames in the running take (while aligning / recording / saving).
+        take_frames: Frames in the running take (from aligning to saving).
+        record_in_s: Seconds until the take's first frame is written (while settling),
+            2 decimals; goes into the ``take`` object.
     """
     payload: dict[str, object] = {
         "phase": phase,
@@ -380,7 +393,10 @@ def format_status(
     if align is not None:
         payload["align"] = dict(align)
     if take_frames is not None:
-        payload["take"] = {"frames": take_frames}
+        take: dict[str, object] = {"frames": take_frames}
+        if record_in_s is not None:
+            take["record_in_s"] = round(float(record_in_s), 2)
+        payload["take"] = take
     return STATUS_PREFIX + json.dumps(payload)
 
 
