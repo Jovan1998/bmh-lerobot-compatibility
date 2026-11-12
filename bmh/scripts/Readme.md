@@ -29,6 +29,13 @@ controls whether the left arm's bus also carries the BMH-101 head servos
 (`head_pan`/`head_tilt`, IDs 8/9). The follower side must be configured with
 the matching `with_head` value.
 
+`--left_feedback_port` / `--right_feedback_port` (default: off) bind one more
+socket per arm for the DAgger **leader assist**: the follower sends the pose the
+robot holds, and the arm joints and gripper (never the head) pull lightly toward
+it, capped at `--assist_max_torque_limit` (default 200 of 1000). Torque goes off
+by itself 0.3 s after the messages stop. See
+[`../documentation/Readme.md`](../documentation/Readme.md#dagger-recording-bmh-extra).
+
 ## Wire Protocol
 
 - **Transport**: ZMQ PUSH → PULL, `tcp://*:{port}`
@@ -36,6 +43,9 @@ the matching `with_head` value.
 - **Message**: `{"shoulder_pan.pos": 45.2, "shoulder_lift.pos": -12.1, ...}` (7 floats per arm; 9 on the left arm with head enabled — adds `head_pan.pos`/`head_tilt.pos`)
 - **Socket option**: `CONFLATE=1` (latest-only, no buffering)
 - **Rate**: configurable, default 60 Hz
+- **Leader assist** (follower → leader, PUSH with `CONFLATE=1` → PULL on the feedback ports,
+  drained to the latest message each tick):
+  `{"goal": {"shoulder_pan.pos": 12.0, ...}, "torque_limit": 100}` or `{"release": true}`
 
 ---
 
@@ -46,7 +56,12 @@ the matching `with_head` value.
   controller-app for every recording session. Config layout and example:
   [`../documentation/Readme.md`](../documentation/Readme.md#fast-startup-bmh-extras).
 - `bmh_policy_client.py` — `bmh-policy-client`: policy client for any BMH policy server, GR00T or SmolVLA (see its module docstring). `bmh_groot_client.py` / `bmh-groot-client` remain as aliases for one release.
+- `bmh_dagger.py` — `bmh-dagger --config <file.json>`: DAgger recording. A policy runs, the
+  operator pauses / rewinds / takes over with the leader, and only the correction is recorded.
+  Driven by JSON commands on stdin. See
+  [`../documentation/Readme.md`](../documentation/Readme.md#dagger-recording-bmh-extra).
 - `bmh_center_arm.py` — `bmh-center-arm`: moves an arm to its calibrated center pose.
+  `--torque_limit <0..1000>` does it with a low torque limit (bench test for the leader assist).
 - `bmh_read_pose.py` — `bmh-read-pose`: prints both follower arms' present pose (head included) as
   one `POSE {json}` line without moving anything; the controller-app saves it as the Home position.
   See [`../documentation/Readme.md`](../documentation/Readme.md#home-position-bmh-extra).

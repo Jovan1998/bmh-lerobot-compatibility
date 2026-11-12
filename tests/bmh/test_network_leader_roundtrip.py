@@ -2,10 +2,14 @@
 
 `bmh/scripts/so_leader_host.py` reads the SO leader arms on the leader Pi and PUSHes their
 positions; `SONetworkLeader` on the follower Pi PULLs them as a drop-in `Teleoperator`.
+With feedback ports on both sides, `send_feedback` goes the other way: the DAgger leader
+assist, driven by the host's `LeaderAssist` on the arm's bus.
 """
 
 import json
+import signal
 import socket
+import subprocess
 import sys
 import threading
 import time
@@ -51,8 +55,17 @@ class _FakeLeader:
 
 
 @contextmanager
-def _running_host(leader: _FakeLeader, port: int):
-    argv = ["so_leader_host", "--left_port", "/dev/fake", "--left_zmq_port", str(port), "--fps", "200"]
+def _running_host(leader: _FakeLeader, port: int, *extra: str):
+    argv = [
+        "so_leader_host",
+        "--left_port",
+        "/dev/fake",
+        "--left_zmq_port",
+        str(port),
+        "--fps",
+        "200",
+        *extra,
+    ]
     with (
         patch.object(sys, "argv", argv),
         patch.object(so_leader_host, "create_leader", return_value=leader) as create_leader,
@@ -119,6 +132,329 @@ def test_network_leader_returns_last_positions_when_host_goes_quiet():
         assert net.get_action() == positions
     finally:
         net.disconnect()
+
+
+def test_last_message_age_resets_on_a_message_and_grows_when_the_host_goes_quiet():
+    port = _free_port()
+    leader = _FakeLeader({f"{m}.pos": 1.0 for m in ARM})
+    net = SONetworkLeader(SONetworkLeaderConfig(remote_ip="127.0.0.1", port_zmq=port, connect_timeout_s=5))
+    assert net.last_message_age_s == float("inf")  # nothing was ever received
+    with _running_host(leader, port):
+        net.connect()
+        assert net.last_message_age_s < 0.5
+        time.sleep(0.05)
+        net.get_action()  # the host streams at 200 Hz: a fresh message is waiting
+        assert net.last_message_age_s < 0.04
+    # Host stopped: drain what was still queued, then the cached pose only gets older.
+    try:
+        net.get_action()
+        quiet_since = time.perf_counter()
+        time.sleep(0.15)
+        before = net.last_message_age_s
+        net.get_action()  # returns the cached pose; no message arrived
+        assert net.last_message_age_s >= before >= 0.1
+        assert net.last_message_age_s <= time.perf_counter() - quiet_since + 0.1
+    finally:
+        net.disconnect()
+
+
+def test_bimanual_leader_reports_the_staler_arm():
+    from lerobot.teleoperators.bi_so_network_leader import BiSONetworkLeader, BiSONetworkLeaderConfig
+
+    bi = BiSONetworkLeader(BiSONetworkLeaderConfig())
+    assert bi.last_message_age_s == float("inf")
+    now = time.perf_counter()
+    bi.left_arm._last_message_at = now - 0.01
+    assert bi.last_message_age_s == float("inf")  # the right arm never spoke
+    bi.right_arm._last_message_at = now - 2.0
+    assert 2.0 <= bi.last_message_age_s < 2.5
+
+
+# --- leader assist: follower → leader feedback ---------------------------------------------
+
+
+class _AssistBus:
+    """The leader arm's bus as the host's `LeaderAssist` uses it; records torque and goals."""
+
+    def __init__(self, motors):
+        self.motors = dict.fromkeys(motors)
+        self.limits = dict.fromkeys(motors, 1000)
+        self.torque_on: set[str] = set()
+        self.goal: dict[str, float] = {}
+
+    def read(self, data_name, motor, *, normalize=True):
+        return self.limits[motor]
+
+    def write(self, data_name, motor, value, *, normalize=True):
+        if data_name == "Torque_Limit":
+            self.limits[motor] = value
+        else:
+            self.goal[motor] = value
+
+    def enable_torque(self, motor):
+        self.torque_on.add(motor)
+
+    def disable_torque(self, motors):
+        self.torque_on.difference_update(motors)
+
+    def sync_write(self, data_name, values):
+        self.goal.update(values)
+
+
+class _AssistLeader(_FakeLeader):
+    def __init__(self, positions):
+        super().__init__(positions)
+        self.bus = _AssistBus([key.removesuffix(".pos") for key in positions])
+
+
+def _wait_for(condition, what: str, timeout_s: float = 3.0) -> None:
+    deadline = time.monotonic() + timeout_s
+    while not condition():
+        assert time.monotonic() < deadline, what
+        time.sleep(0.005)
+
+
+def _feedback_pair(port: int, feedback_port: int, *extra: str):
+    positions = {f"{m}.pos": 0.0 for m in ARM + ["head_pan", "head_tilt"]}
+    leader = _AssistLeader(positions)
+    host = _running_host(leader, port, "--left_feedback_port", str(feedback_port), *extra)
+    net = SONetworkLeader(
+        SONetworkLeaderConfig(
+            remote_ip="127.0.0.1",
+            port_zmq=port,
+            connect_timeout_s=5,
+            with_head=True,
+            feedback_port_zmq=feedback_port,
+        )
+    )
+    return leader, host, net
+
+
+def test_feedback_drives_the_arm_joints_and_gripper_never_the_head():
+    leader, host, net = _feedback_pair(_free_port(), _free_port(), "--assist_max_torque_limit", "150")
+    bus = leader.bus
+    with host:
+        net.connect()
+        try:
+            assert set(net.feedback_features) == {f"{m}.pos" for m in ARM}
+            goal = {f"{m}.pos": 5.0 for m in ARM} | {"head_pan.pos": 40.0}
+
+            def all_on() -> bool:
+                net.send_feedback(goal, torque_limit=900)
+                return bus.torque_on == set(ARM)
+
+            _wait_for(all_on, "the arm joints never came on")
+            assert {bus.limits[m] for m in ARM} == {150}  # clamped on the leader
+            assert bus.limits["head_pan"] == 1000 and "head_pan" not in bus.goal
+
+            net.release_feedback()
+            _wait_for(lambda: not bus.torque_on, "release did not turn the torque off")
+            assert {bus.limits[m] for m in ARM} == {1000}
+        finally:
+            net.disconnect()
+
+
+def test_leader_lets_go_by_itself_when_the_feedback_stops():
+    leader, host, net = _feedback_pair(_free_port(), _free_port())
+    bus = leader.bus
+    with host:
+        net.connect()
+        try:
+            goal = {"shoulder_pan.pos": 1.0}
+
+            def on() -> bool:
+                net.send_feedback(goal)
+                return "shoulder_pan" in bus.torque_on
+
+            _wait_for(on, "the assist never engaged")
+            quiet_since = time.monotonic()
+            _wait_for(lambda: not bus.torque_on, "the watchdog never released", timeout_s=2.0)
+            assert time.monotonic() - quiet_since >= 0.25
+        finally:
+            net.disconnect()
+
+
+def test_disconnect_releases_the_leader():
+    leader, host, net = _feedback_pair(_free_port(), _free_port())
+    bus = leader.bus
+    with host:
+        net.connect()
+
+        def on() -> bool:
+            net.send_feedback({"gripper.pos": 30.0})
+            return "gripper" in bus.torque_on
+
+        _wait_for(on, "the assist never engaged")
+        released_by = time.monotonic() + 0.2  # well inside the 0.3 s watchdog
+        net.disconnect()
+        _wait_for(lambda: not bus.torque_on, "disconnect did not release")
+        assert time.monotonic() < released_by
+
+
+def test_host_releases_on_shutdown():
+    leader, host, net = _feedback_pair(_free_port(), _free_port())
+    bus = leader.bus
+    with host:
+        net.connect()
+
+        def on() -> bool:
+            net.send_feedback({"shoulder_lift.pos": 3.0})
+            return "shoulder_lift" in bus.torque_on
+
+        _wait_for(on, "the assist never engaged")
+    # The host thread ended (KeyboardInterrupt) while the assist was on.
+    assert not bus.torque_on
+    net.disconnect()
+
+
+# A host process with a fake leader whose assist is always asked to pull; the bus prints
+# its torque calls. Signal handlers belong to a process' main thread, hence a subprocess.
+_SIGTERM_HOST = """
+from unittest.mock import patch
+
+from bmh.dagger.leader_assist import AssistGoal
+from bmh.scripts import so_leader_host
+
+
+class Bus:
+    motors = dict.fromkeys(["shoulder_pan", "gripper"])
+
+    def read(self, data_name, motor, *, normalize=True):
+        return 1000
+
+    def write(self, data_name, motor, value, *, normalize=True):
+        pass
+
+    def sync_write(self, data_name, values):
+        pass
+
+    def enable_torque(self, motor):
+        print("on", motor, flush=True)
+
+    def disable_torque(self, motors):
+        print("off", *motors, flush=True)
+
+
+class Leader:
+    bus = Bus()
+
+    def get_action(self):
+        return {"shoulder_pan.pos": 0.0, "gripper.pos": 0.0}
+
+    def disconnect(self):
+        print("disconnected", flush=True)
+
+
+goal = AssistGoal({"shoulder_pan": 1.0, "gripper": 1.0}, 100)
+with (
+    patch.object(so_leader_host, "create_leader", return_value=Leader()),
+    patch.object(so_leader_host, "receive_feedback", return_value=goal),
+):
+    so_leader_host.main()
+"""
+
+
+def test_sigterm_releases_the_assist_before_the_host_exits():
+    """The app stops the leader stream with SIGTERM, which must not skip the release."""
+    argv = ["--left_port", "/dev/fake", "--left_zmq_port", str(_free_port())]
+    argv += ["--left_feedback_port", str(_free_port()), "--fps", "200"]
+    proc = subprocess.Popen(
+        [sys.executable, "-c", _SIGTERM_HOST, *argv],
+        stdout=subprocess.PIPE,
+        stderr=subprocess.DEVNULL,
+        text=True,
+    )
+    lines: list[str] = []
+    reader = threading.Thread(target=lambda: lines.extend(line.strip() for line in proc.stdout), daemon=True)
+    reader.start()
+    try:
+        _wait_for(lambda: "on shoulder_pan" in lines, "the assist never engaged", timeout_s=30.0)
+        proc.send_signal(signal.SIGTERM)
+        assert proc.wait(timeout=5) == 0
+    finally:
+        if proc.poll() is None:
+            proc.kill()
+    reader.join(timeout=5)
+    assert "off shoulder_pan gripper" in lines
+    assert lines.index("off shoulder_pan gripper") < lines.index("disconnected")
+
+
+def test_send_feedback_without_a_feedback_port_keeps_upstream_behaviour():
+    net = SONetworkLeader(SONetworkLeaderConfig(remote_ip="127.0.0.1", port_zmq=_free_port()))
+    assert not net.has_feedback and net.feedback_features == {}
+    net._is_connected = True
+    with pytest.raises(NotImplementedError):
+        net.send_feedback({"shoulder_pan.pos": 1.0})
+    net.release_feedback()  # nothing to release: a no-op
+
+
+class _FeedbackArm:
+    def __init__(self, keys):
+        self.is_connected = True
+        self.has_feedback = True
+        self.feedback_features = dict.fromkeys(keys, float)
+        self.action = dict.fromkeys(keys, 0.0)
+        self.sent: list = []
+
+    def send_feedback(self, feedback, torque_limit):
+        self.sent.append(("goal", feedback, torque_limit))
+
+    def release_feedback(self):
+        self.sent.append(("release",))
+
+    def get_action(self):
+        return dict(self.action)
+
+
+def _bimanual(tmp_path=None):
+    from lerobot.teleoperators.bi_so_network_leader import BiSONetworkLeader, BiSONetworkLeaderConfig
+    from lerobot.teleoperators.so_network_leader.config_so_network_leader import SONetworkLeaderBaseConfig
+
+    config = BiSONetworkLeaderConfig(
+        left_arm_config=SONetworkLeaderBaseConfig(port_zmq=5555, with_head=True, feedback_port_zmq=5556),
+        right_arm_config=SONetworkLeaderBaseConfig(port_zmq=5557, feedback_port_zmq=5558),
+        lock_file=str(tmp_path / "locks.json") if tmp_path else None,
+    )
+    bi = BiSONetworkLeader(config)
+    assert bi.left_arm.config.feedback_port_zmq == 5556
+    assert bi.right_arm.config.feedback_port_zmq == 5558
+    assert bi.has_feedback
+    bi.left_arm = _FeedbackArm([f"{m}.pos" for m in ARM + ["head_pan", "head_tilt"]])
+    bi.right_arm = _FeedbackArm([f"{m}.pos" for m in ARM])
+    return bi
+
+
+def test_bimanual_feedback_splits_by_arm_and_releases_an_arm_left_out():
+    bi = _bimanual()
+    bi.send_feedback({"left_shoulder_pan.pos": 1.0, "left_gripper.pos": 20.0}, 120)
+    assert bi.left_arm.sent == [("goal", {"shoulder_pan.pos": 1.0, "gripper.pos": 20.0}, 120)]
+    assert bi.right_arm.sent == [("release",)]
+    bi.release_feedback()
+    assert bi.left_arm.sent[-1] == ("release",) and bi.right_arm.sent[-1] == ("release",)
+
+
+def test_bimanual_feedback_needs_both_channels():
+    from lerobot.teleoperators.bi_so_network_leader import BiSONetworkLeader, BiSONetworkLeaderConfig
+    from lerobot.teleoperators.so_network_leader.config_so_network_leader import SONetworkLeaderBaseConfig
+
+    bi = BiSONetworkLeader(
+        BiSONetworkLeaderConfig(left_arm_config=SONetworkLeaderBaseConfig(feedback_port_zmq=5556))
+    )
+    assert not bi.has_feedback and bi.feedback_features == {}
+    bi.left_arm._is_connected = bi.right_arm._is_connected = True
+    with pytest.raises(NotImplementedError):
+        bi.send_feedback({"left_shoulder_pan.pos": 1.0})
+
+
+def test_bimanual_locked_keys_follow_the_lock_file(tmp_path):
+    bi = _bimanual(tmp_path)
+    assert bi.locked_keys == frozenset()
+    (tmp_path / "locks.json").write_text(json.dumps({"left": False, "right": True, "head": True}))
+    bi.get_action()  # the lock file is read inside get_action
+    assert bi.locked_keys == frozenset(
+        [f"right_{m}.pos" for m in ARM] + ["left_head_pan.pos", "left_head_tilt.pos"]
+    )
+    assert _bimanual().locked_keys == frozenset()  # no lock file: nothing is ever locked
 
 
 # --- create_leader: headless connect on the real SOLeader --------------------------------
