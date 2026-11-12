@@ -212,6 +212,38 @@ def test_goal_walks_toward_the_target_at_max_speed():
     assert goals[28] == pytest.approx(29.0)
 
 
+def test_a_joint_moved_ahead_of_the_goal_is_never_pulled_back():
+    bus = _Bus()
+    assist = LeaderAssist(bus, ["shoulder_pan"], max_speed=60.0)
+    assist.update(10.0, PRESENT, _goal(90.0, joints=["shoulder_pan"]))  # pinned at 0.0
+    # The operator moves the joint at 180 deg/s, three times the goal's speed.
+    t = 10.0
+    for i in range(1, 16):
+        t += 1 / 60
+        position = 3.0 * i
+        assist.update(t, {"shoulder_pan.pos": position}, _goal(90.0, joints=["shoulder_pan"]))
+        assert bus.goal["shoulder_pan"] == pytest.approx(position + 1.0)  # one step ahead, never behind
+
+
+def test_a_joint_pushed_past_the_target_is_pulled_back_to_it_not_beyond():
+    bus = _Bus()
+    assist = LeaderAssist(bus, ["shoulder_pan"], max_speed=60.0)
+    assist.update(10.0, PRESENT, _goal(10.0, joints=["shoulder_pan"]))  # pinned at 0.0
+    assist.update(10.0 + 1 / 60, {"shoulder_pan.pos": 16.0}, _goal(10.0, joints=["shoulder_pan"]))
+    assert bus.goal["shoulder_pan"] == pytest.approx(15.0)
+
+
+def test_a_joint_held_back_lets_the_goal_walk_on():
+    bus = _Bus()
+    assist = LeaderAssist(bus, ["shoulder_pan"], max_speed=60.0)
+    assist.update(10.0, PRESENT, _goal(30.0, joints=["shoulder_pan"]))  # pinned at 0.0
+    # The joint lags (low torque, or the operator resists): the goal does not wait for it.
+    for i in range(1, 11):
+        position = 0.5 * (i - 1)
+        assist.update(10.0 + i / 60, {"shoulder_pan.pos": position}, _goal(30.0, joints=["shoulder_pan"]))
+    assert bus.goal["shoulder_pan"] == pytest.approx(10.0)
+
+
 def test_a_stalled_loop_does_not_jump_the_goal():
     bus = _Bus()
     assist = LeaderAssist(bus, ["shoulder_pan"], max_speed=60.0, timeout_s=5.0)

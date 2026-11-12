@@ -33,7 +33,8 @@ host also binds one PULL socket per arm, on which the follower's `bmh-dagger` se
 the robot holds while the operator lines the leader up with it. The arm joints and the
 gripper (never the head) are then driven toward it with a low torque limit, capped at
 `--assist_max_torque_limit`, and released by themselves 0.3 s after the messages stop
-(see `bmh/dagger/leader_assist.py`). Position streaming is unchanged.
+(see `bmh/dagger/leader_assist.py`), and when the host stops (Ctrl+C or SIGTERM). Position
+streaming is unchanged.
 
     python so_leader_host.py ... --left_feedback_port 5556 --right_feedback_port 5558
 """
@@ -42,6 +43,8 @@ import argparse
 import contextlib
 import json
 import logging
+import signal
+import threading
 import time
 from dataclasses import dataclass
 from typing import Any
@@ -112,6 +115,13 @@ def create_assist(leader, name: str, max_torque_limit: int) -> LeaderAssist:
     return LeaderAssist(leader.bus, joints, max_torque_limit, name=f"{name} leader")
 
 
+def _stop_on_sigterm(signum, frame) -> None:
+    """SIGTERM ends the host like Ctrl+C: through the `finally` that releases the assist."""
+    # Only once: a second SIGTERM must not cut that cleanup short (SIGKILL still ends it).
+    signal.signal(signal.SIGTERM, signal.SIG_IGN)
+    raise KeyboardInterrupt
+
+
 def create_leader(port: str, arm_id: str, with_head: bool = False):
     """Create and connect an SOLeader arm."""
     from lerobot.teleoperators.so_leader import SOLeader, SOLeaderTeleopConfig
@@ -178,6 +188,12 @@ def main():
         parser.error("At least one of --left_port or --right_port must be specified")
     if not 1 <= args.assist_max_torque_limit <= TORQUE_LIMIT_MAX:
         parser.error(f"--assist_max_torque_limit must be in [1, {TORQUE_LIMIT_MAX}]")
+
+    # The app stops the host with SIGTERM. Python's default ends the process on the spot,
+    # without the `finally` below, and an engaged assist would keep its torque. Handlers can
+    # only be set from the main thread; tests run `main()` in a thread.
+    if threading.current_thread() is threading.main_thread():
+        signal.signal(signal.SIGTERM, _stop_on_sigterm)
 
     zmq_context = zmq.Context()
     arms: list[_Arm] = []

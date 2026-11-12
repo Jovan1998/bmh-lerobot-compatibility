@@ -20,7 +20,9 @@ enforced, not by the sender:
   is, so no joint jumps and the inrush currents do not add up on the leader's small supply.
   This happens across ticks: the position stream never stalls.
 - The goal walks toward the target at ``max_speed`` per second (degrees; percent for the
-  gripper), so a far target is approached slowly instead of with a jump.
+  gripper), so a far target is approached slowly instead of with a jump. A joint the operator
+  moves ahead of the goal sets the goal's start, so the assist never pulls against a hand
+  that is faster than it.
 - Without a message for ``timeout_s`` (the follower process died, the network dropped) the
   torque goes off by itself: the leader can never stay stiff.
 - A bus error releases, and goals are ignored until a ``release`` message or a pause in the
@@ -253,7 +255,7 @@ class LeaderAssist:
         if not self._engaged:
             return
         self._enable_next(now, present)
-        self._track(now)
+        self._track(now, present)
 
     def _engage(self, limit: int, now: float) -> None:
         if self._restore is None:
@@ -292,7 +294,7 @@ class LeaderAssist:
         self._goal[motor] = float(position)
         self._last_enable_at = now
 
-    def _track(self, now: float) -> None:
+    def _track(self, now: float, present: Mapping[str, float] | None) -> None:
         dt = min(max(now - self._last_track_at, 0.0), _MAX_TICK_S)
         self._last_track_at = now
         if not self._enabled:
@@ -300,7 +302,13 @@ class LeaderAssist:
         step = self._max_speed * dt
         for motor in self._enabled:
             target = self._target.get(motor)
-            if target is not None:
-                current = self._goal[motor]
-                self._goal[motor] = current + min(max(target - current, -step), step)
+            if target is None:
+                continue
+            current = self._goal[motor]
+            position = None if present is None else present.get(f"{motor}.pos")
+            if position is not None and (position - current) * (target - current) > 0:
+                # The operator moved the joint ahead of the goal, maybe past the target: step
+                # on from where it is, so the joint is never pulled back to a lagging goal.
+                current = position
+            self._goal[motor] = current + min(max(target - current, -step), step)
         self._bus.sync_write("Goal_Position", {motor: self._goal[motor] for motor in self._enabled})

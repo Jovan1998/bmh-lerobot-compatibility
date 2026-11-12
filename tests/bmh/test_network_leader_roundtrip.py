@@ -7,7 +7,9 @@ assist, driven by the host's `LeaderAssist` on the arm's bus.
 """
 
 import json
+import signal
 import socket
+import subprocess
 import sys
 import threading
 import time
@@ -303,6 +305,78 @@ def test_host_releases_on_shutdown():
     # The host thread ended (KeyboardInterrupt) while the assist was on.
     assert not bus.torque_on
     net.disconnect()
+
+
+# A host process with a fake leader whose assist is always asked to pull; the bus prints
+# its torque calls. Signal handlers belong to a process' main thread, hence a subprocess.
+_SIGTERM_HOST = """
+from unittest.mock import patch
+
+from bmh.dagger.leader_assist import AssistGoal
+from bmh.scripts import so_leader_host
+
+
+class Bus:
+    motors = dict.fromkeys(["shoulder_pan", "gripper"])
+
+    def read(self, data_name, motor, *, normalize=True):
+        return 1000
+
+    def write(self, data_name, motor, value, *, normalize=True):
+        pass
+
+    def sync_write(self, data_name, values):
+        pass
+
+    def enable_torque(self, motor):
+        print("on", motor, flush=True)
+
+    def disable_torque(self, motors):
+        print("off", *motors, flush=True)
+
+
+class Leader:
+    bus = Bus()
+
+    def get_action(self):
+        return {"shoulder_pan.pos": 0.0, "gripper.pos": 0.0}
+
+    def disconnect(self):
+        print("disconnected", flush=True)
+
+
+goal = AssistGoal({"shoulder_pan": 1.0, "gripper": 1.0}, 100)
+with (
+    patch.object(so_leader_host, "create_leader", return_value=Leader()),
+    patch.object(so_leader_host, "receive_feedback", return_value=goal),
+):
+    so_leader_host.main()
+"""
+
+
+def test_sigterm_releases_the_assist_before_the_host_exits():
+    """The app stops the leader stream with SIGTERM, which must not skip the release."""
+    argv = ["--left_port", "/dev/fake", "--left_zmq_port", str(_free_port())]
+    argv += ["--left_feedback_port", str(_free_port()), "--fps", "200"]
+    proc = subprocess.Popen(
+        [sys.executable, "-c", _SIGTERM_HOST, *argv],
+        stdout=subprocess.PIPE,
+        stderr=subprocess.DEVNULL,
+        text=True,
+    )
+    lines: list[str] = []
+    reader = threading.Thread(target=lambda: lines.extend(line.strip() for line in proc.stdout), daemon=True)
+    reader.start()
+    try:
+        _wait_for(lambda: "on shoulder_pan" in lines, "the assist never engaged", timeout_s=30.0)
+        proc.send_signal(signal.SIGTERM)
+        assert proc.wait(timeout=5) == 0
+    finally:
+        if proc.poll() is None:
+            proc.kill()
+    reader.join(timeout=5)
+    assert "off shoulder_pan gripper" in lines
+    assert lines.index("off shoulder_pan gripper") < lines.index("disconnected")
 
 
 def test_send_feedback_without_a_feedback_port_keeps_upstream_behaviour():
