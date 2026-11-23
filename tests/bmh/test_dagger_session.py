@@ -72,6 +72,15 @@ class _Bus:
             if key.startswith(self._prefix)
         }
 
+    def sync_write(self, data_name: str, values: dict[str, float], num_retry: int = 0) -> None:
+        self._robot.bus_calls.append((self._prefix, "sync_write", data_name))
+
+    def disable_torque(self, motors=None, num_retry: int = 0) -> None:
+        self._robot.bus_calls.append((self._prefix, "disable_torque"))
+
+    def enable_torque(self, motors=None, num_retry: int = 0) -> None:
+        self._robot.bus_calls.append((self._prefix, "enable_torque"))
+
 
 class _Robot:
     """A `bi_so_follower` stand-in without cameras: it is wherever it was last told to be."""
@@ -89,6 +98,7 @@ class _Robot:
         self.is_connected = False
         self.disconnected = 0
         self.fail_on_send = fail_on_send
+        self.bus_calls: list[tuple] = []
         self.left_arm = SimpleNamespace(bus=_Bus(self, "left_"))
         self.right_arm = SimpleNamespace(bus=_Bus(self, "right_"))
 
@@ -237,6 +247,8 @@ class _Rig:
         self.stop = False
         self.now = 100.0
         self.next_id = 0
+        self.relaxed = 0
+        self.stiffened = 0
         self.session = DaggerSession(
             self.robot,
             self.leader,
@@ -245,6 +257,8 @@ class _Rig:
             self.cfg,
             read_commands=self._drain,
             emit=self.lines.append,
+            relax=self._relax,
+            stiffen=self._stiffen,
             stop_requested=lambda: self.stop,
         )
         self.session.start(dict(START), self.now)
@@ -252,6 +266,14 @@ class _Rig:
     def _drain(self) -> list:
         items, self.pending = self.pending, []
         return items
+
+    def _relax(self) -> None:
+        self.relaxed += 1
+
+    def _stiffen(self) -> dict[str, float]:
+        """Torque on where the arms are: wherever the test moved `robot.pose` "by hand"."""
+        self.stiffened += 1
+        return dict(self.robot.pose)
 
     def cmd(self, cmd: str, **fields) -> int:
         self.next_id += 1
@@ -497,6 +519,118 @@ def test_pause_mid_ramp_holds_where_the_ramp_was(rig):
     rig.tick(3)
     assert rig.robot.sent[-3:] == [where] * 3
     assert len(rig.session.history) == 1
+
+
+# --------------------------------------------------------------------------- head jitter
+
+HEAD = ["left_head_pan.pos", "left_head_tilt.pos"]
+ARMS = [key for key in JOINTS if key not in HEAD]
+
+
+def test_jitter_ramps_only_the_head_from_the_hold_pose_and_pauses(rig):
+    rig.policy_run(5)
+    sent = len(rig.robot.sent)
+    assert rig.do("jitter", pose={HEAD[0]: 110.0, HEAD[1]: 95.0, "not_a_joint.pos": 1.0})["ok"]
+    assert rig.session.phase == "jittering"
+    assert rig.robot.sent[sent] == _pose(105.0)  # the first ramp tick is the hold pose
+    rig.tick(28)  # 29 ticks: just short of 1 s at 30 Hz
+    assert rig.session.phase == "jittering"
+    rig.tick(3)
+    assert rig.session.phase == "paused"
+    ramp = rig.robot.sent[sent:]
+    assert all(action[key] == 105.0 for action in ramp for key in ARMS)  # the arms hold
+    pans = [action[HEAD[0]] for action in ramp]
+    assert all(b >= a for a, b in zip(pans, pans[1:], strict=False))
+    assert ramp[-1][HEAD[0]] == pytest.approx(110.0) and ramp[-1][HEAD[1]] == pytest.approx(95.0)
+    assert "not_a_joint.pos" not in ramp[-1]
+    assert rig.session.hold == ramp[-1]
+    assert rig.phases()[-3:] == ["paused", "jittering", "paused"]
+
+
+def test_jitter_ramps_over_jitter_ramp_s(tmp_path):
+    rig = _Rig(tmp_path, jitter_ramp_s=0.5)
+    rig.do("jitter", pose={HEAD[0]: 20.0})
+    rig.tick(16)
+    assert rig.session.phase == "paused"
+
+
+def test_after_a_jitter_the_history_keeps_its_frames_and_steps_back_with_the_arms_only(rig):
+    rig.policy_run(10)  # history: start, 101 .. 110
+    rig.do("jitter", pose={HEAD[0]: 50.0, HEAD[1]: 60.0})
+    rig.tick(35)
+    assert rig.session.phase == "paused"
+    history = rig.session.history
+    assert len(history) == 11
+    head = rig.session.hold[HEAD[0]], rig.session.hold[HEAD[1]]
+    assert head == pytest.approx((50.0, 60.0))
+    assert all((history.at(c)[HEAD[0]], history.at(c)[HEAD[1]]) == head for c in range(11))
+
+    sent = len(rig.robot.sent)
+    rig.do("step", cursor=3)
+    rig.tick(5)
+    steps = rig.robot.sent[sent:]
+    assert [a[ARMS[0]] for a in steps[:3]] == [109.0, 108.0, 107.0]
+    assert all((a[HEAD[0]], a[HEAD[1]]) == head for a in steps)
+
+
+def test_jitter_after_a_saved_take(rig):
+    _start_take(rig, _pose(105.0))
+    rig.tick(20)
+    rig.do("save")
+    rig.tick(2)
+    assert rig.do("jitter", pose={HEAD[0]: 100.0, HEAD[1]: 110.0})["ok"]
+    rig.tick(35)
+    assert rig.phases()[-5:] == ["recording", "saving", "paused", "jittering", "paused"]
+    assert rig.recorder.episodes == 1
+
+
+def test_jitter_with_no_joint_of_this_robot_is_refused(rig):
+    assert rig.do("jitter", pose={"other.pos": 1.0}) == {
+        "id": rig.next_id,
+        "ok": False,
+        "error": "the pose names no joint of this robot",
+    }
+    assert rig.session.phase == "paused"
+
+
+# --------------------------------------------------------------------------- relax / hold
+
+
+def test_relax_turns_the_torque_off_and_sends_nothing(rig):
+    rig.policy_run(5)
+    sent = len(rig.robot.sent)
+    assert rig.do("relax")["ok"]
+    assert rig.relaxed == 1 and rig.stiffened == 0
+    assert rig.session.phase == "relaxed"
+    rig.tick(10)
+    assert len(rig.robot.sent) == sent  # not even on the relax tick
+    status = rig.statuses()[-1]
+    assert status["phase"] == "relaxed"
+    assert "hold" not in status
+
+
+def test_hold_stiffens_where_the_arms_are_and_restarts_the_history(rig):
+    rig.policy_run(5)
+    rig.do("relax")
+    rig.tick(5)
+    rig.robot.pose = _pose(50.0)  # moved by hand
+    assert rig.do("hold")["ok"]
+    assert (rig.relaxed, rig.stiffened) == (1, 1)
+    assert rig.session.phase == "paused"
+    assert len(rig.session.history) == 1 and rig.session.cursor == 0
+    assert rig.session.hold == _pose(50.0)
+    rig.tick(3)
+    assert rig.robot.sent[-4:] == [_pose(50.0)] * 4  # the hold tick holds too
+    assert rig.statuses()[-1]["hold"][JOINTS[0]] == 50.0
+    assert rig.phases()[-3:] == ["paused", "relaxed", "paused"]
+
+
+def test_finish_while_relaxed_ends_the_loop(rig):
+    rig.do("relax")
+    rig.cmd("finish")
+    assert rig.tick() is False
+    assert rig.statuses()[-1]["phase"] == "finishing"
+    assert rig.stiffened == 0
 
 
 # --------------------------------------------------------------------------- aligning
@@ -943,6 +1077,18 @@ def test_finish_while_settling_writes_nothing(settle_rig):
         (["align", "record"], "step", {"cursor": 1}, "not paused"),
         (["align", "record"], "record", {}, "not aligning"),
         (["align", "record"], "cancel", {}, "nothing to cancel"),
+        (["policy", "run"], "jitter", {"pose": {"left_head_pan.pos": 1.0}}, "not paused"),
+        (["policy", "run"], "relax", {}, "not paused"),
+        (["align"], "jitter", {"pose": {"left_head_pan.pos": 1.0}}, "not paused"),
+        (["align"], "relax", {}, "not paused"),
+        ([], "hold", {}, "not relaxed"),
+        (["relax"], "run", {}, "not paused"),
+        (["relax"], "step", {"cursor": 0}, "not paused"),
+        (["relax"], "home", {"pose": {JOINTS[0]: 0.0}}, "not paused"),
+        (["relax"], "align", {"task": "x"}, "not paused or running"),
+        (["relax"], "jitter", {"pose": {"left_head_pan.pos": 1.0}}, "not paused"),
+        (["relax"], "relax", {}, "not paused"),
+        (["relax"], "pause", {}, "nothing to pause"),
     ],
 )
 def test_a_command_in_the_wrong_phase_is_refused_not_queued(rig, setup, cmd, fields, error):
@@ -1249,6 +1395,27 @@ def test_a_hardware_error_while_the_assist_pulls_releases_the_leader(tmp_path):
     assert code == 1
     assert any(f[0] == "goal" for f in leader.feedback)
     assert leader.feedback[-1] == ("release",) and leader.disconnected == 1
+
+
+def test_relax_and_hold_reach_both_buses(tmp_path):
+    robot = _Robot()
+    steps = {5: _cmd(1, "relax"), 10: _cmd(2, "hold"), 15: None}
+    code, lines, leader, meta = _run(tmp_path, robot, steps)
+    assert code == 0
+    acks = [json.loads(line[len(ACK_PREFIX) :]) for line in lines if line.startswith(ACK_PREFIX)]
+    assert acks == [{"id": 1, "ok": True}, {"id": 2, "ok": True}]
+    assert robot.bus_calls == [
+        ("left_", "disable_torque"),
+        ("right_", "disable_torque"),
+        # Each bus's goal is pinned to where it is before the torque comes back on.
+        ("left_", "sync_write", "Goal_Position"),
+        ("left_", "enable_torque"),
+        ("right_", "sync_write", "Goal_Position"),
+        ("right_", "enable_torque"),
+    ]
+    assert json.loads(lines[-1][len(STATUS_PREFIX) :])["phase"] == "finishing"
+    assert (robot.disconnected, leader.disconnected) == (1, 1)
+    assert meta.total_episodes == 0
 
 
 def test_a_failed_connect_reports_the_error_and_leaves_nothing_connected(tmp_path):

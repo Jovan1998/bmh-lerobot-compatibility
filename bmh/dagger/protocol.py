@@ -19,10 +19,18 @@
     {"id": 10, "cmd": "discard"}
     {"id": 11, "cmd": "finish"}
     {"id": 12, "cmd": "assist", "assist": true, "assist_torque_pct": 15}
+    {"id": 13, "cmd": "jitter", "pose": {"left_head_pan.pos": 3.2, "left_head_tilt.pos": -11.5}}
+    {"id": 14, "cmd": "relax"}
+    {"id": 15, "cmd": "hold"}
 
 ``assist`` switches the leader assist (the leader arms pull lightly toward the pose the
 robot holds) on or off, or changes its torque, during a take-over; ``align`` sets it at the
 start of one.
+
+``jitter`` ramps the joints it names (the head) from the hold pose to ``pose`` while
+paused; the rest of the robot holds. ``relax`` turns the torque off on every motor while
+paused, so the arms can be moved by hand. ``hold`` turns it back on where the arms are
+now and pauses there.
 
 stdin rather than a polled file (the policy client's control file) because these are
 events, not a desired state: two of them inside one tick must both arrive, in order. The
@@ -72,6 +80,8 @@ Phase = Literal[
     "settling",
     "recording",
     "saving",
+    "jittering",
+    "relaxed",
     "finishing",
 ]
 PolicyState = Literal["none", "connecting", "ready", "error"]
@@ -181,7 +191,45 @@ class Finish:
     id: int
 
 
-Command = Policy | Run | Pause | Step | Home | Align | Assist | Record | Cancel | Save | Discard | Finish
+@dataclass(frozen=True)
+class Jitter:
+    """Ramp the head to this pose."""
+
+    id: int
+    pose: Mapping[str, float]
+
+
+@dataclass(frozen=True)
+class Relax:
+    """Turn the torque off on every motor."""
+
+    id: int
+
+
+@dataclass(frozen=True)
+class Hold:
+    """Turn the torque back on where the arms are now."""
+
+    id: int
+
+
+Command = (
+    Policy
+    | Run
+    | Pause
+    | Step
+    | Home
+    | Align
+    | Assist
+    | Record
+    | Cancel
+    | Save
+    | Discard
+    | Finish
+    | Jitter
+    | Relax
+    | Hold
+)
 
 
 @dataclass(frozen=True)
@@ -197,7 +245,7 @@ class Invalid:
     id: int | None = None
 
 
-_PLAIN: dict[str, type[Run | Pause | Record | Cancel | Save | Discard | Finish]] = {
+_PLAIN: dict[str, type[Run | Pause | Record | Cancel | Save | Discard | Finish | Relax | Hold]] = {
     "run": Run,
     "pause": Pause,
     "record": Record,
@@ -205,6 +253,8 @@ _PLAIN: dict[str, type[Run | Pause | Record | Cancel | Save | Discard | Finish]]
     "save": Save,
     "discard": Discard,
     "finish": Finish,
+    "relax": Relax,
+    "hold": Hold,
 }
 
 
@@ -299,6 +349,8 @@ def parse_command(line: str) -> Command:
         return Step(command_id, cursor)
     if cmd == "home":
         return Home(command_id, _pose(data.get("pose")))
+    if cmd == "jitter":
+        return Jitter(command_id, _pose(data.get("pose")))
     if cmd == "align":
         return Align(
             id=command_id,

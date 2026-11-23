@@ -342,6 +342,7 @@ it unchanged:
 | `takeover_blend_s` | 1.0 | Shortest fade of the leader / follower offset when the arms connect. A larger gap stretches it (45 deg/s at most). |
 | `takeover_settle_s` | 3.0 | The follower follows the leader for this long before the take's first frame is written. 0 writes from the connection on. |
 | `home_ramp_s` | 2.5 | Duration of the Home ramp. |
+| `jitter_ramp_s` | 1.0 | Duration of the head's move to its next jitter pose (`jitter`). |
 | `probe_timeout_ms` / `timeout_ms` | 5000 / 15000 | Policy server timeouts, as for `bmh-policy-client`. |
 
 **Phases.**
@@ -349,7 +350,7 @@ it unchanged:
 | Phase | Robot | Leaves on |
 | --- | --- | --- |
 | `connecting` | not connected yet | both sides connected: `paused` (prints `DAGGER_READY`) |
-| `paused` | holds `history[cursor]` | `run`, `step`, `home`, `align`, `finish` |
+| `paused` | holds `history[cursor]` | `run`, `step`, `home`, `align`, `jitter`, `relax`, `finish` |
 | `running` | policy chunks through look-ahead and smoothing | `pause`, `align`; a policy error: `paused` |
 | `stepping` | one history frame per tick toward the cursor | arrival: `paused`; `pause`, `run`, `step`, `home`, `align` |
 | `homing` | smoothstep ramp to the Home pose | arrival: `paused` (the history restarts there); `pause` |
@@ -357,6 +358,8 @@ it unchanged:
 | `settling` | follows the leader (blended in), writes nothing | `takeover_settle_s` later: `recording`; `cancel`: `paused` (holds where the leader took it) |
 | `recording` | follows the leader, writes frames | `save` / `discard`, or `dataset.episode_time_s` reached: `saving` |
 | `saving` | servos keep their last goal (the loop blocks in `save_episode`) | done: `paused` |
+| `jittering` | smoothstep ramp of the joints `jitter` names (the head); the rest holds | arrival: `paused` (the history keeps its frames) |
+| `relaxed` | torque off on every motor, head included; nothing is sent | `hold`: `paused` (the history restarts there) |
 | `finishing` | `dataset.finalize()`, disconnect | exit 0 |
 
 **Commands**, one JSON object per line on stdin, each with an integer `id`:
@@ -374,6 +377,9 @@ it unchanged:
 {"id": 10, "cmd": "discard"}
 {"id": 11, "cmd": "finish"}
 {"id": 12, "cmd": "assist", "assist": true, "assist_torque_pct": 15}
+{"id": 13, "cmd": "jitter", "pose": {"left_head_pan.pos": 3.2, "left_head_tilt.pos": -11.5}}
+{"id": 14, "cmd": "relax"}
+{"id": 15, "cmd": "hold"}
 ```
 
 stdin, not a polled file like the policy client's control file: these are events, and two of
@@ -384,6 +390,17 @@ queued. `cursor` is "frames back from the newest history frame"; it is absolute,
 walks toward it by one frame per tick, so lost or repeated key events cannot make the robot
 jump. `run` with a policy that had failed asks for it again. `assist` (only while `aligning`)
 switches the leader assist on or off or changes its torque; `align` sets it for the take-over.
+
+**Head jitter and Relax.** The controller-app's DAgger tab uses `jitter` (only while `paused`)
+to move the head to a fresh random pan / tilt offset after every take, saved or discarded. The
+app draws the offset and owns the centre it is drawn around; the process only ramps the joints
+the pose names from the hold pose, over `jitter_ramp_s`, while the arms hold. The reached head
+values are written into every history frame, so stepping back afterwards replays the arms and
+leaves the head where it went. `relax` (only while `paused`) turns the torque off on every motor,
+head included, so the operator can move the arms by hand; nothing is sent while `relaxed`, and
+only `hold` (or the end of the session) leaves it. `hold` pins each bus's goal to where it is,
+turns the torque back on and pauses there; the history restarts at that pose. An older
+`bmh-dagger` answers all three commands with `unknown cmd`.
 
 **Output** the app parses. The `DAGGER_READY`, `BMH_DAGGER`, `BMH_DAGGER_ACK` and `ERROR` lines are
 printed on stdout; `BMH_TARGET` and `BMH_LOOP` are log lines like everything else and go to stderr.
