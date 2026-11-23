@@ -15,11 +15,14 @@ from bmh.dagger.protocol import (
     Discard,
     Eof,
     Finish,
+    Hold,
     Home,
     Invalid,
+    Jitter,
     Pause,
     Policy,
     Record,
+    Relax,
     Run,
     Save,
     StdinReader,
@@ -49,6 +52,8 @@ def _line(**fields) -> str:
         ("save", Save),
         ("discard", Discard),
         ("finish", Finish),
+        ("relax", Relax),
+        ("hold", Hold),
     ],
 )
 def test_plain_commands(cmd, cls):
@@ -87,6 +92,13 @@ def test_step_home_and_align():
     ) == Align(6, "fold", False, True, 20)
 
 
+def test_jitter():
+    pose = {"left_head_pan.pos": 3.2, "left_head_tilt.pos": -11}
+    assert parse_command(_line(id=13, cmd="jitter", pose=pose)) == Jitter(
+        13, {"left_head_pan.pos": 3.2, "left_head_tilt.pos": -11.0}
+    )
+
+
 def test_assist():
     assert parse_command(_line(id=12, cmd="assist", assist=True, assist_torque_pct=15)) == Assist(
         12, True, 15
@@ -118,6 +130,9 @@ def test_assist():
         (_line(id=1, cmd="home", pose={"j": "1"}), "must be a finite number"),
         (_line(id=1, cmd="home", pose={"j": True}), "must be a finite number"),
         ('{"id": 1, "cmd": "home", "pose": {"j": NaN}}', "must be a finite number"),
+        (_line(id=1, cmd="jitter"), "'pose' must be a non-empty object"),
+        (_line(id=1, cmd="jitter", pose={}), "'pose' must be a non-empty object"),
+        (_line(id=1, cmd="jitter", pose={"left_head_pan.pos": "3"}), "must be a finite number"),
         (_line(id=1, cmd="align"), "'task' must be a non-empty string"),
         (_line(id=1, cmd="align", task="  "), "'task' must be a non-empty string"),
         (_line(id=1, cmd="align", task="t", assist_torque_pct=0), "'assist_torque_pct' must be"),
@@ -151,6 +166,7 @@ def test_parse_line_keeps_the_id_of_a_rejected_command():
     assert parse_line("garbage").id is None
     assert parse_line(_line(cmd="run")).id is None
     assert parse_line(_line(id=3, cmd="run")) == Run(3)
+    assert parse_line(_line(id=10, cmd="stiffen")) == Invalid("unknown cmd 'stiffen'", 10)
 
 
 # --------------------------------------------------------------------------- output

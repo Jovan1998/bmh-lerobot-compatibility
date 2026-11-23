@@ -16,7 +16,8 @@ letting go, the operator taking the arms' weight) stays out of the episode.
 Session phases:
 
     connecting  not connected yet                          -> paused (prints DAGGER_READY)
-    paused      holds history[cursor]                      -> run, step, home, align, finish
+    paused      holds history[cursor]                      -> run, step, home, align, jitter,
+                                                              relax, finish
     running     policy chunks (look-ahead, smoothing)      -> pause, align; policy error -> paused
     stepping    one history frame per tick to the cursor   -> arrival -> paused; pause, run, step, home, align
     homing      smoothstep ramp to the Home pose           -> arrival -> paused; pause
@@ -26,6 +27,8 @@ Session phases:
                 nothing yet
     recording   follows the leader, writes                 -> save / discard -> saving
     saving      servos keep their last goal (loop blocked) -> paused
+    jittering   smoothstep ramp of the head to a new pose  -> arrival -> paused
+    relaxed     torque off on every motor, sends nothing   -> hold -> paused
     finishing   dataset.finalize(), disconnect             -> exit 0
 
 The controller-app drives it with JSON lines on stdin and reads `BMH_DAGGER` /
@@ -53,6 +56,16 @@ buffer, one frame per 30 Hz tick. `step` carries an absolute cursor and the loop
 toward it by one frame per tick, so the robot replays its own motion and lost or repeated
 key events cannot make it jump. Running or recording from a rewound cursor drops the
 frames after it.
+
+Head jitter: the controller-app sends `jitter` with a head pose after every take (it draws
+the random offset and owns the centre it is drawn around). The head ramps there over
+`jitter_ramp_s` while the arms hold, and the reached head values are written into every
+history frame, so stepping back afterwards replays the arms and leaves the head.
+
+Relax: `relax` turns the torque off on every motor (head included) so the operator can
+move the arms by hand; nothing is sent while relaxed. Only `hold` (or the end of the
+session) leaves it: the torque comes back on where the arms are, and the history restarts
+at that pose, because the frames before no longer lead to it.
 
 The JSON config mirrors `bmh-record`'s (`robot`, `teleop` and `dataset` are the same
 blocks):
@@ -94,12 +107,15 @@ from bmh.dagger.protocol import (
     Discard,
     Eof,
     Finish,
+    Hold,
     Home,
     Invalid,
+    Jitter,
     Pause,
     Phase,
     Policy,
     Record,
+    Relax,
     Run,
     Save,
     StdinReader,
@@ -166,6 +182,8 @@ class DaggerConfig:
     # (`settling`); 0 writes from the connection on.
     takeover_settle_s: float = 3.0
     home_ramp_s: float = 2.5
+    # Duration of the head's move to its next jitter pose.
+    jitter_ramp_s: float = 1.0
     # Policy server timeouts, as for `bmh-policy-client`.
     probe_timeout_ms: int = 5000
     timeout_ms: int = 15000
@@ -179,7 +197,7 @@ class DaggerConfig:
             )
         if not 1 <= self.jpeg_quality <= 100:
             raise ValueError(f"jpeg_quality must be in [1, 100], got {self.jpeg_quality}.")
-        for name in ("history_s", "home_ramp_s", "takeover_blend_s"):
+        for name in ("history_s", "home_ramp_s", "jitter_ramp_s", "takeover_blend_s"):
             if not getattr(self, name) > 0:
                 raise ValueError(f"{name} must be > 0, got {getattr(self, name)}.")
         if not self.takeover_settle_s >= 0:
@@ -265,6 +283,8 @@ class DaggerSession:
         *,
         read_commands: Callable[[], list[Command | Eof | Invalid]],
         emit: Callable[[str], None],
+        relax: Callable[[], None],
+        stiffen: Callable[[], dict[str, float]],
         loop_watcher: LoopFileWatcher | None = None,
         stop_requested: Callable[[], bool] = lambda: False,
     ):
@@ -279,6 +299,8 @@ class DaggerSession:
             cfg: The session's configuration.
             read_commands: Returns the commands that arrived since the last call.
             emit: Writes one protocol line.
+            relax: Turns the torque off on every motor.
+            stiffen: Turns it back on where the arms are; returns that pose as an action.
             loop_watcher: Live loop settings, ``None`` for fixed ones.
             stop_requested: Polled every tick; ``True`` finishes the session.
         """
@@ -289,6 +311,8 @@ class DaggerSession:
         self._cfg = cfg
         self._read_commands = read_commands
         self._emit = emit
+        self._relax = relax
+        self._stiffen = stiffen
         self._loop_watcher = loop_watcher
         self._stop_requested = stop_requested
 
@@ -297,6 +321,7 @@ class DaggerSession:
         self._cursor = 0
         self._step_target = 0
         self._home: _HomeRamp | None = None
+        self._jitter: _HomeRamp | None = None
         # The last action sent to the robot (what it holds between ticks).
         self._last_sent: dict[str, float] = {}
 
@@ -405,13 +430,17 @@ class DaggerSession:
             self._tick_stepping()
         elif self.phase == "homing":
             self._tick_homing(now)
+        elif self.phase == "jittering":
+            self._tick_jittering(now)
+        elif self.phase == "relaxed":
+            pass  # torque is off and the arms are in the operator's hands: send nothing
         elif self.phase == "aligning":
             self._tick_aligning(now)
         elif self.phase in ("settling", "recording"):
             self._tick_take(now)
         else:
             self._send(self.hold)
-        if self.phase in ("paused", "stepping", "homing"):
+        if self.phase in ("paused", "stepping", "homing", "jittering", "relaxed"):
             # A target set while the policy does not drive is still probed (its chunk is
             # dropped), so the app sees `ready` or the error before Run.
             self._runner.tick(now)
@@ -482,6 +511,34 @@ class DaggerSession:
                 return "the Home position names no joint of this robot"
             self._home = _HomeRamp(start=self.hold, target=target)
             self.phase = "homing"
+            return None
+        if isinstance(cmd, Jitter):
+            if phase != "paused":
+                return "not paused"
+            target = {key: value for key, value in cmd.pose.items() if key in self._robot.action_features}
+            if not target:
+                return "the pose names no joint of this robot"
+            self._jitter = _HomeRamp(start=self.hold, target=target)
+            self.phase = "jittering"
+            return None
+        if isinstance(cmd, Relax):
+            if phase != "paused":
+                return "not paused"
+            self._relax()
+            self.phase = "relaxed"
+            logger.info("Motors relaxed (torque off)")
+            return None
+        if isinstance(cmd, Hold):
+            if phase != "relaxed":
+                return "not relaxed"
+            pose = self._stiffen()
+            # The arms were moved by hand: the old frames no longer lead to where they are.
+            self._history.clear()
+            self._history.push(pose)
+            self._cursor = 0
+            self._last_sent = pose
+            self.phase = "paused"
+            logger.info("Motors stiffened, holding the current pose")
             return None
         if isinstance(cmd, Align):
             if phase not in ("paused", "running", "stepping"):
@@ -569,6 +626,23 @@ class DaggerSession:
         if alpha >= 1.0:
             logger.info("Home position reached")
             self._end_home()
+            self.phase = "paused"
+
+    def _tick_jittering(self, now: float) -> None:
+        ramp = self._jitter
+        if ramp is None:
+            self.phase = "paused"
+            return
+        if ramp.t0 is None:
+            ramp.t0 = now
+        alpha = smoothstep(min(1.0, (now - ramp.t0) / self._cfg.jitter_ramp_s))
+        # The keys the target does not list (the arms) keep their start values: they hold.
+        action = ramp_pose(ramp.start, ramp.target, alpha)
+        self._send(action)
+        if alpha >= 1.0:
+            # The history keeps its frames; the head stays where it went when stepping back.
+            self._history.overlay({key: action[key] for key in ramp.target if key in action})
+            self._jitter = None
             self.phase = "paused"
 
     def _end_home(self) -> None:
@@ -813,6 +887,8 @@ def run_session(
         _connect_policy,
         _initial_loop_settings,
         _present_pose,
+        _relax_motors,
+        _stiffen_motors,
     )
     from lerobot.datasets import VideoEncodingManager
 
@@ -855,6 +931,8 @@ def run_session(
                     cfg,
                     read_commands=reader.drain,
                     emit=emit,
+                    relax=lambda: _relax_motors(robot),
+                    stiffen=lambda: _stiffen_motors(robot),
                     loop_watcher=loop_watcher,
                     stop_requested=stop_requested,
                 )

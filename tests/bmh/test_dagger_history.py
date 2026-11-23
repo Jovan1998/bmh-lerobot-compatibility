@@ -55,6 +55,15 @@ def test_frames_are_copies():
     assert history.at(0) == {"j": 1.0}
 
 
+def test_overlay_writes_the_given_keys_into_every_frame():
+    history = ActionHistory(10)
+    for i in range(4):
+        history.push({"arm": float(i), "head": float(-i)})
+    history.overlay({"head": 7.5, "other": 1.0})
+    assert len(history) == 4
+    assert [history.at(c) for c in range(4)] == [{"arm": float(3 - c), "head": 7.5} for c in range(4)]
+
+
 def test_clear_and_bad_size():
     history = _filled(3)
     history.clear()

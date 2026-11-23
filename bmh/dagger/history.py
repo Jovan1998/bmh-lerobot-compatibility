@@ -57,6 +57,15 @@ class ActionHistory:
         for _ in range(cursor):
             self._frames.pop()
 
+    def overlay(self, values: Mapping[str, float]) -> None:
+        """Write ``values`` into every frame (only keys a frame already has); length unchanged.
+
+        Used after a head move: stepping back then replays the arms and leaves the head
+        where it was moved to.
+        """
+        for frame in self._frames:
+            frame.update({key: float(value) for key, value in values.items() if key in frame})
+
     def clear(self) -> None:
         """Forget every frame."""
         self._frames.clear()
