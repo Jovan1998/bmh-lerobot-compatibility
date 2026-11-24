@@ -89,9 +89,11 @@ lerobot-record \\
 ```
 """
 
+import json
 import logging
 import time
 from dataclasses import asdict, dataclass
+from pathlib import Path
 from pprint import pformat
 
 from lerobot.cameras import CameraConfig  # noqa: F401
@@ -181,6 +183,10 @@ class RecordConfig:
     # multiple of it: a frame is recorded on every `control_fps // dataset.fps`-th command, so
     # e.g. 60 drives the arms at 60 Hz while the dataset and its videos stay at 30 fps.
     control_fps: int | None = None
+    # BMH: path of a JSON file `{"task": "..."}`. When set, the task of each episode is read from
+    # it at episode start (so the controller-app can change the prompt mid-session), and
+    # `dataset.single_task` is the fallback. Each read is logged as `BMH_RECORD_TASK {json}`.
+    task_file: str | None = None
     # Display all cameras on screen
     display_data: bool = False
     # Visualization backend used when display_data is True: "rerun" or "foxglove".
@@ -451,6 +457,29 @@ def record_loop(
         timestamp = time.perf_counter() - start_episode_t
 
 
+def _read_task_file(path: Path) -> str | None:
+    """BMH: the stripped `task` of the JSON object in `path`, or `None` if there is none.
+
+    A missing file is silent (the app has not written one); anything else unusable logs a
+    warning, and the caller keeps the task it had.
+    """
+    try:
+        data = json.loads(path.read_text(encoding="utf-8"))
+    except FileNotFoundError:
+        return None
+    except (OSError, ValueError) as e:
+        logging.warning("task_file %s is unreadable, keeping the previous task: %s", path, e)
+        return None
+    if not isinstance(data, dict):
+        logging.warning("task_file %s is not a JSON object, keeping the previous task", path)
+        return None
+    task = data.get("task")
+    if not isinstance(task, str) or not task.strip():
+        logging.warning("task_file %s has no non-empty 'task' string, keeping the previous task", path)
+        return None
+    return task.strip()
+
+
 @parser.wrap()
 def record(
     cfg: RecordConfig,
@@ -577,8 +606,15 @@ def record(
 
         with VideoEncodingManager(dataset):
             recorded_episodes = 0
+            single_task = cfg.dataset.single_task
             while recorded_episodes < cfg.dataset.num_episodes and not events["stop_recording"]:
                 episode_index = dataset.num_episodes
+                # BMH: latch this episode's task (a re-record `continue`s here and re-reads it).
+                if cfg.task_file is not None:
+                    single_task = _read_task_file(Path(cfg.task_file).expanduser()) or single_task
+                    logging.info(
+                        "BMH_RECORD_TASK %s", json.dumps({"episode": episode_index, "task": single_task})
+                    )
                 start_episode(robot)
                 log_say(f"Recording episode {episode_index}", cfg.play_sounds)
                 # BMH: a "next episode" key/signal that landed while no loop was running
@@ -594,7 +630,7 @@ def record(
                     teleop=teleop,
                     dataset=dataset,
                     control_time_s=cfg.dataset.episode_time_s,
-                    single_task=cfg.dataset.single_task,
+                    single_task=single_task,
                     display_data=cfg.display_data,
                     display_mode=cfg.display_mode,
                     display_compressed_images=display_compressed_images,
@@ -618,7 +654,7 @@ def record(
                         robot_observation_processor=robot_observation_processor,
                         teleop=teleop,
                         control_time_s=cfg.dataset.reset_time_s,
-                        single_task=cfg.dataset.single_task,
+                        single_task=single_task,
                         display_data=cfg.display_data,
                         display_mode=cfg.display_mode,
                         display_compressed_images=display_compressed_images,
