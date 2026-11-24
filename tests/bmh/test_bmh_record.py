@@ -77,6 +77,8 @@ CONFIG = {
     },
     # Arms commanded at 60 Hz while the dataset stays at 30 fps.
     "control_fps": 60,
+    # The controller-app's prompt file, re-read at every episode start.
+    "task_file": "/home/pi/.cache/bmh-101/recording-task.json",
     "resume": False,
     "play_sounds": False,
 }
@@ -115,6 +117,7 @@ def test_load_record_config_decodes_registry_types(config_path):
     assert cfg.dataset.fps == 30
     assert cfg.control_fps == 60
     assert cfg.control_multiplier == 2
+    assert cfg.task_file == "/home/pi/.cache/bmh-101/recording-task.json"
 
     assert cfg.dataset.repo_id == "local/my-set"
     assert cfg.dataset.single_task == "Place the toast"

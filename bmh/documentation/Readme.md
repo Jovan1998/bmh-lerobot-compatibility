@@ -134,6 +134,20 @@ it (the controller-app does): at 60 Hz the follower sometimes asks just before t
 message lands, and the default 15 ms wait per arm could then make a recorded frame late. On a
 timeout the tick resends the last leader position.
 
+`task_file` (BMH extra, CLI `--task_file=<path>`, default `None` = off) lets the prompt change
+mid-session. It names a JSON file `{"task": "Put the cube in the bowl"}` that `record()` reads at
+the start of every episode (a re-recorded episode reads it again); the episode is saved with that
+task, and a change while an episode runs applies from the next one. A missing file, or one without
+a non-empty `task` string, keeps the previous task (`dataset.single_task` at first). Each read logs
+one line the controller-app parses to show which prompt the episode is saved with:
+
+```
+BMH_RECORD_TASK {"episode": 3, "task": "Put the cube in the bowl"}
+```
+
+The controller-app writes `~/.cache/bmh-101/recording-task.json` at Start and on every prompt
+change (atomic tmp + rename).
+
 ## Teleop group locks (BMH extra)
 
 `bi_so_network_leader` can **freeze the left arm, the right arm and the head independently**

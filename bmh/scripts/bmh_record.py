@@ -22,6 +22,8 @@ the camera dicts on the `lerobot-record` command line:
                 "right_arm_config": {"port": "/dev/ttyACM0", "cameras": {...}}},
       "teleop": {"type": "bi_so_network_leader", "left_arm_config": {...}, "right_arm_config": {...}},
       "dataset": {"repo_id": "local/my-set", "root": "/path/to/staging", "single_task": "...", ...},
+      "control_fps": 60,
+      "task_file": "~/.cache/bmh-101/recording-task.json",
       "resume": false,
       "play_sounds": false
     }
@@ -59,6 +61,7 @@ def load_record_config(path: Path | str) -> Any:
 
 
 def main(argv: list[str] | None = None) -> None:
+    """`bmh-record --config <file.json>`: decode the config and run the unmodified `record()`."""
     parser = argparse.ArgumentParser(
         prog="bmh-record",
         description="Run lerobot-record from a JSON config file (skips the slow draccus CLI parse).",

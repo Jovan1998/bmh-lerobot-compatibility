@@ -55,6 +55,9 @@ by itself 0.3 s after the messages stop. See
   config instead of CLI flags, skipping draccus' ~5.5 s argparse build on the Pi. Used by the
   controller-app for every recording session. Config layout and example:
   [`../documentation/Readme.md`](../documentation/Readme.md#fast-startup-bmh-extras).
+  `task_file` (BMH extra) points at a `{"task": "..."}` JSON file that is re-read at every
+  episode start, so the app can change the prompt mid-session; each read logs
+  `BMH_RECORD_TASK {"episode": i, "task": "..."}`.
 - `bmh_policy_client.py` — `bmh-policy-client`: policy client for any BMH policy server, GR00T or SmolVLA (see its module docstring). `bmh_groot_client.py` / `bmh-groot-client` remain as aliases for one release.
 - `bmh_dagger.py` — `bmh-dagger --config <file.json>`: DAgger recording. A policy runs, the
   operator pauses / rewinds / takes over with the leader, and only the correction is recorded.
